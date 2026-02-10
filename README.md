@@ -76,7 +76,7 @@ tvc-rocket-trajectory-optimization/
 python scripts/tvc_traj_opt_gui.py
 ```
 
-![TVC Rocket Trajectory Optimization GUI](assets/images/gui_v1.png)
+![TVC Rocket Trajectory Optimization GUI](/assets/images/gui_v1.png)
 
 The GUI allows you to:
 - Set waypoints with positions, yaw angles, and arrival times

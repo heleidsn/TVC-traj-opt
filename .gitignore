@@ -27,6 +27,7 @@ results/logs/*
 # Data
 *.npz
 *.png
+!assets/images/*.png
 *.pdf
 *.jpg
 *.jpeg
