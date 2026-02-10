@@ -1,0 +1,5 @@
+numpy>=1.20.0
+matplotlib>=3.3.0
+crocoddyl>=1.0.0
+PyQt5>=5.15.0
+pyyaml>=5.4.0

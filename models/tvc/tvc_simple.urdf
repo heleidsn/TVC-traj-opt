@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TVC (Thrust Vector Control) Rocket URDF Model
+     Extracted from SDF model parameters -->
+<robot name="tvc_rocket">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.6" />
+      <inertia
+        ixx="0.042"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.042"
+        iyz="0.0"
+        izz="0.0001" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.052" length="1.0" />
+      </geometry>
+      <material name="body_material">
+        <color rgba="0.2 0.2 0.2 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.052" length="1.0" />
+      </geometry>
+    </collision>
+  </link>
+</robot>

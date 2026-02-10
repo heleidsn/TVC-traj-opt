@@ -1,0 +1,152 @@
+<?xml version="1.0"?>
+<robot name="TVC_min">
+
+  <!-- =========================
+       Base link (main rigid body)
+       ========================= -->
+  <link name="base_link">
+    <inertial>
+      <!-- NOTE: URDF惯量默认在link坐标系下 -->
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.6"/>
+      <inertia
+        ixx="0.042" ixy="0.0" ixz="0.0"
+        iyy="0.042" iyz="0.0"
+        izz="0.0001"/>
+    </inertial>
+
+    <!-- 可选：仅用于可视化（对优化无影响） -->
+    <visual>
+      <origin xyz="0 0 0.5" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.052" length="1.0"/>
+      </geometry>
+      <material name="gray">
+        <color rgba="0.4 0.4 0.4 1"/>
+      </material>
+    </visual>
+  </link>
+
+  <!-- =========================
+       Gimbal mount (fixed to base)
+       ========================= -->
+  <link name="gimbal_mount">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.005"/>
+      <inertia
+        ixx="1e-5" ixy="0.0" ixz="0.0"
+        iyy="1e-5" iyz="0.0"
+        izz="1e-5"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.08 0.08 0.04"/>
+      </geometry>
+      <material name="darkgray">
+        <color rgba="0.3 0.3 0.3 1"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="base_to_gimbal_mount" type="fixed">
+    <parent link="base_link"/>
+    <child link="gimbal_mount"/>
+    <!-- 你SDF里gimbal_mount pose=0 0 0.2525，但那是模型在世界的摆放/展示用。
+         如果你希望几何位置一致，可把 xyz 改成 0 0 0.2525 -->
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- =========================
+       Servo 0: roll joint
+       ========================= -->
+  <link name="servo0_roll">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.003"/>
+      <inertia
+        ixx="1e-5" ixy="0.0" ixz="0.0"
+        iyy="1e-5" iyz="0.0"
+        izz="1e-5"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.02 0.06 0.03"/>
+      </geometry>
+      <material name="red">
+        <color rgba="0.9 0.3 0.3 1"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="servo0_roll_joint" type="revolute">
+    <parent link="gimbal_mount"/>
+    <child link="servo0_roll"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.0" upper="1.0" effort="100.0" velocity="50.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <!-- =========================
+       Servo 1: pitch joint
+       ========================= -->
+  <link name="servo1_pitch">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.003"/>
+      <inertia
+        ixx="1e-5" ixy="0.0" ixz="0.0"
+        iyy="1e-5" iyz="0.0"
+        izz="1e-5"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.06 0.02 0.03"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0.3 0.9 0.3 1"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="servo1_pitch_joint" type="revolute">
+    <parent link="servo0_roll"/>
+    <child link="servo1_pitch"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <!-- 这里严格按你SDF：0 -1 0 -->
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.0" upper="1.0" effort="100.0" velocity="50.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <!-- =========================
+       Optional: nozzle/motor frame (fixed)
+       用来放“推力作用点/方向”的frame，方便你在动力学里施加wrench
+       ========================= -->
+  <link name="nozzle_frame">
+    <!-- 这个link可以没有inertial；为了兼容性给一个极小值 -->
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="1e-6"/>
+      <inertia
+        ixx="1e-9" ixy="0.0" ixz="0.0"
+        iyy="1e-9" iyz="0.0"
+        izz="1e-9"/>
+    </inertial>
+  </link>
+
+  <joint name="pitch_to_nozzle" type="fixed">
+    <parent link="servo1_pitch"/>
+    <child link="nozzle_frame"/>
+    <!-- 如果推力点相对servo1_pitch有偏置，把xyz改掉（比如沿z方向） -->
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>

@@ -1,0 +1,819 @@
+<?xml version="1.0"?>
+<sdf version="1.11">
+  <model name="TVC">
+  <!-- <pose> 2 0 0 0 0 -1.57</pose> -->
+    <link name="base_link">
+      <pose>0 0 0.7725 0 0 0</pose>
+      <inertial>
+        <mass>0.6</mass>
+        <pose>0 0 0 0 0 0</pose>
+        <inertia>
+          <ixx>0.042</ixx>
+          <iyy>0.042</iyy>
+          <izz>0.0001</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="body_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.052</radius>
+            <length>1.0</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+          <specular>0.1 0.1 0.1 1</specular>
+        </material>
+      </visual>
+
+      <collision name="body_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.052</radius>
+            <length>1.0</length>
+          </cylinder>
+        </geometry>
+      </collision>
+
+      <sensor name="imu_sensor" type="imu">
+        <always_on>1</always_on>
+        <update_rate>250</update_rate>
+        <pose>0 0 0 0 0 0</pose>
+        <visualize>1</visualize>
+        <imu>
+          <angular_velocity>
+            <x>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>0.0001</stddev>
+                <dynamic_bias_stddev>1e-05</dynamic_bias_stddev>
+                <dynamic_bias_correlation_time>1000</dynamic_bias_correlation_time>
+              </noise>
+            </x>
+            <y>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>0.0001</stddev>
+                <dynamic_bias_stddev>1e-05</dynamic_bias_stddev>
+                <dynamic_bias_correlation_time>1000</dynamic_bias_correlation_time>
+              </noise>
+            </y>
+            <z>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>0.00001</stddev>
+                <dynamic_bias_stddev>1e-05</dynamic_bias_stddev>
+                <dynamic_bias_correlation_time>1000</dynamic_bias_correlation_time>
+              </noise>
+            </z>
+          </angular_velocity>
+          <linear_acceleration>
+            <x>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>0.001</stddev>
+                <dynamic_bias_stddev>0.001</dynamic_bias_stddev>
+                <dynamic_bias_correlation_time>300</dynamic_bias_correlation_time>
+              </noise>
+            </x>
+            <y>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>0.001</stddev>
+                <dynamic_bias_stddev>0.001</dynamic_bias_stddev>
+                <dynamic_bias_correlation_time>300</dynamic_bias_correlation_time>
+              </noise>
+            </y>
+            <z>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>0.0001</stddev>
+                <dynamic_bias_stddev>0.0001</dynamic_bias_stddev>
+                <dynamic_bias_correlation_time>300</dynamic_bias_correlation_time>
+              </noise>
+            </z>
+          </linear_acceleration>
+        </imu>
+      </sensor>
+
+      <sensor name="air_pressure_sensor" type="air_pressure">
+        <always_on>1</always_on>
+        <update_rate>50</update_rate>
+        <air_pressure>
+          <pressure>
+            <noise type="gaussian">
+              <mean>0</mean>
+              <stddev>0.01</stddev>
+            </noise>
+          </pressure>
+        </air_pressure>
+      </sensor>
+
+      <sensor name="navsat_sensor" type="navsat">
+        <always_on>1</always_on>
+        <update_rate>30</update_rate>
+      </sensor>
+
+    </link>
+
+    <link name="top_cone">
+      <pose>0 0 1.3225 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-5</ixx>
+          <iyy>1e-5</iyy>
+          <izz>1e-5</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="top_cone_visual">
+        <geometry>
+          <cone>
+            <radius>0.052</radius>
+            <length>0.1</length>
+          </cone>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+
+      <collision name="top_cone_collision">
+        <geometry>
+          <cone>
+            <radius>0.052</radius>
+            <length>0.1</length>
+          </cone>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="gimbal_mount">
+      <pose>0 0 0.2525 0 0 0</pose>
+      <inertial>
+        <mass>0.005</mass>
+        <inertia>
+          <ixx>1e-5</ixx>
+          <iyy>1e-5</iyy>
+          <izz>1e-5</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="gimbal_mount_visual">
+        <geometry>
+          <box>
+            <size>0.08 0.08 0.04</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.3 0.3 0.3 1</diffuse>
+        </material>
+      </visual>
+
+      <collision name="gimbal_mount_collision">
+        <geometry>
+          <box>
+            <size>0.08 0.08 0.04</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="servo0_roll">
+      <pose>0 0 0.1675 0 0 0</pose>
+      <inertial>
+        <mass>0.003</mass>
+        <inertia>
+          <ixx>1e-5</ixx>
+          <iyy>1e-5</iyy>
+          <izz>1e-5</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="servo0_roll_visual">
+        <geometry>
+          <box>
+            <size>0.02 0.06 0.03</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.8 0.2 0.2 1</ambient>
+          <diffuse>0.9 0.3 0.3 1</diffuse>
+        </material>
+      </visual>
+
+      <collision name="servo0_roll_collision">
+        <geometry>
+          <box>
+            <size>0.02 0.06 0.03</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="servo1_pitch">
+      <pose>0 0 0.1675 0 0 0</pose>
+      <inertial>
+        <mass>0.003</mass>
+        <inertia>
+          <ixx>1e-5</ixx>
+          <iyy>1e-5</iyy>
+          <izz>1e-5</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="servo1_pitch_visual">
+        <geometry>
+          <box>
+            <size>0.06 0.02 0.03</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.8 0.2 1</ambient>
+          <diffuse>0.3 0.9 0.3 1</diffuse>
+        </material>
+      </visual>
+
+      <collision name="servo1_pitch_collision">
+        <geometry>
+          <box>
+            <size>0.06 0.02 0.03</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="motor_housing">
+      <pose>0 0 0.1675 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-5</ixx>
+          <iyy>1e-5</iyy>
+          <izz>1e-5</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="motor_housing_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.008</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <collision name="motor_housing_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.008</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="prop_upper">
+      <pose>0 0 0.1875 0 0 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-5</ixx>
+          <iyy>1e-4</iyy>
+          <izz>1e-4</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="prop_upper_visual">
+        <geometry>
+          <box>
+            <size>0.2 0.02 0.002</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.8 1</ambient>
+          <diffuse>0.2 0.2 0.9 1</diffuse>
+        </material>
+      </visual>
+
+      <collision name="prop_upper_collision">
+        <geometry>
+          <box>
+            <size>0.2 0.02 0.002</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="prop_lower">
+      <pose>0 0 0.1475 0 0 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-5</ixx>
+          <iyy>1e-4</iyy>
+          <izz>1e-4</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <visual name="prop_lower_visual">
+        <geometry>
+          <box>
+            <size>0.2 0.02 0.002</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.8 0.1 0.1 1</ambient>
+          <diffuse>0.9 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <collision name="prop_lower_collision">
+        <geometry>
+          <box>
+            <size>0.2 0.02 0.002</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="landing_leg_1">
+      <pose>0.18 0 0.1509 0 -0.78539816339 0</pose>
+      <inertial>
+        <mass>0.005</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="leg_1_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+      <collision name="leg_1_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="landing_leg_2">
+      <pose>0 0.18 0.1509 0.78539816339 0 0</pose>
+      <inertial>
+        <mass>0.005</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="leg_2_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+      <collision name="leg_2_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="landing_leg_3">
+      <pose>-0.18 0 0.1509 0 0.78539816339 0</pose>
+      <inertial>
+        <mass>0.005</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="leg_3_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0 0 1</ambient>
+          <diffuse>0.8 0 0 1</diffuse>
+        </material>
+      </visual>
+      <collision name="leg_3_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="landing_leg_4">
+      <pose>0 -0.18 0.1509 -0.78539816339 0 0</pose>
+      <inertial>
+        <mass>0.005</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="leg_4_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+      <collision name="leg_4_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.005</radius>
+            <length>0.4</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <!-- Landing leg bases -->
+    <link name="landing_base_1">
+      <pose>0.315 0 0.0075 0 0 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="base_1_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+      <collision name="base_1_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="landing_base_2">
+      <pose>0 0.315 0.0075 0 0 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="base_2_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+      <collision name="base_2_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="landing_base_3">
+      <pose>-0.315 0 0.0075 0 0 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="base_3_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+      <collision name="base_3_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="landing_base_4">
+      <pose>0 -0.315 0.0075 0 0 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <visual name="base_4_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.4 0.4 0.4 1</diffuse>
+        </material>
+      </visual>
+      <collision name="base_4_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.015</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="base_to_gimbal_mount" type="fixed">
+      <parent>base_link</parent>
+      <child>gimbal_mount</child>
+    </joint>
+
+    <joint name="top_cone_to_base" type="fixed">
+      <parent>base_link</parent>
+      <child>top_cone</child>
+    </joint>
+
+    <joint name="leg_1_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>landing_leg_1</child>
+    </joint>
+    <joint name="leg_2_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>landing_leg_2</child>
+    </joint>
+    <joint name="leg_3_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>landing_leg_3</child>
+    </joint>
+    <joint name="leg_4_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>landing_leg_4</child>
+    </joint>
+
+    <!-- Joints connecting legs to their bases -->
+    <joint name="leg_1_to_base_1" type="fixed">
+      <parent>landing_leg_1</parent>
+      <child>landing_base_1</child>
+    </joint>
+    <joint name="leg_2_to_base_2" type="fixed">
+      <parent>landing_leg_2</parent>
+      <child>landing_base_2</child>
+    </joint>
+    <joint name="leg_3_to_base_3" type="fixed">
+      <parent>landing_leg_3</parent>
+      <child>landing_base_3</child>
+    </joint>
+    <joint name="leg_4_to_base_4" type="fixed">
+      <parent>landing_leg_4</parent>
+      <child>landing_base_4</child>
+    </joint>
+
+    <joint name="servo0_roll_joint" type="revolute">
+      <parent>gimbal_mount</parent>
+      <child>servo0_roll</child>
+      <!-- <pose>0 0 0.1675 0 0 0</pose> -->
+      <axis>
+        <xyz>
+        1 0 0
+        </xyz>
+        <limit>
+          <lower>-1</lower>
+          <upper>1</upper>
+          <!-- <effort>1.0</effort>
+          <velocity>10.0</velocity> -->
+        </limit>
+        <!-- <dynamics>
+          <damping>0.09</damping>
+          <friction>0.001</friction>
+        </dynamics> -->
+      </axis>
+    </joint>
+
+    <joint name="servo1_pitch_joint" type="revolute">
+      <parent>servo0_roll</parent>
+      <child>servo1_pitch</child>
+      <!-- <pose>0 0 0.1675 0 0 0</pose> -->
+      <axis>
+        <xyz>
+        0 -1 0
+        </xyz>
+        <limit>
+          <lower>-1</lower>
+          <upper>1</upper>
+          <!-- <effort>1.0</effort>
+          <velocity>10.0</velocity> -->
+        </limit>
+        <!-- <dynamics>
+          <damping>0.09</damping>
+          <friction>0.001</friction>
+        </dynamics> -->
+      </axis>
+    </joint>
+
+    <joint name="pitch_to_motor" type="fixed">
+      <parent>servo1_pitch</parent>
+      <child>motor_housing</child>
+    </joint>
+
+    <joint name="motor1_joint" type="revolute">
+      <parent>motor_housing</parent>
+      <child>prop_upper</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <!-- <lower>-1e16</lower>
+          <upper>1e16</upper> -->
+          <!-- <effort>1.0</effort> -->
+          <!-- <velocity>4000.0</velocity> -->
+        </limit>
+        <dynamics>
+          <damping>0.001</damping>
+          <friction>0.0001</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <joint name="motor2_joint" type="revolute">
+      <parent>motor_housing</parent>
+      <child>prop_lower</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <!-- <lower>-1e16</lower>
+          <upper>1e16</upper> -->
+          <!-- <effort>1.0</effort> -->
+          <!-- <velocity>4000.0</velocity> -->
+        </limit>
+        <dynamics>
+          <damping>0.001</damping>
+          <friction>0.0001</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <plugin filename="gz-sim-multicopter-motor-model-system"
+            name="gz::sim::systems::MulticopterMotorModel">
+      <jointName>motor1_joint</jointName>
+      <linkName>prop_upper</linkName>
+      <turningDirection>ccw</turningDirection>
+      <timeConstantUp>0.0125</timeConstantUp>
+      <timeConstantDown>0.025</timeConstantDown>
+      <maxRotVelocity>1400</maxRotVelocity>
+      <motorConstant>0.0000048449</motorConstant>
+      <momentConstant>0.1</momentConstant>
+      <commandSubTopic>command/motor_speed</commandSubTopic>
+      <motorNumber>0</motorNumber>
+      <rotorDragCoefficient>0.0000000806428</rotorDragCoefficient>
+      <rollingMomentCoefficient>1e-06</rollingMomentCoefficient>
+      <rotorVelocitySlowdownSim>20</rotorVelocitySlowdownSim>
+      <motorType>velocity</motorType>
+    </plugin>
+
+    <plugin filename="gz-sim-multicopter-motor-model-system"
+            name="gz::sim::systems::MulticopterMotorModel">
+      <jointName>motor2_joint</jointName>
+      <linkName>prop_lower</linkName>
+      <turningDirection>cw</turningDirection>
+      <timeConstantUp>0.0125</timeConstantUp>
+      <timeConstantDown>0.025</timeConstantDown>
+      <maxRotVelocity>1400</maxRotVelocity>
+      <motorConstant>0.0000048449</motorConstant>
+      <momentConstant>0.1</momentConstant>
+      <commandSubTopic>command/motor_speed</commandSubTopic>
+      <motorNumber>1</motorNumber>
+      <rotorDragCoefficient>0.0000000806428</rotorDragCoefficient>
+      <rollingMomentCoefficient>1e-06</rollingMomentCoefficient>
+      <rotorVelocitySlowdownSim>20</rotorVelocitySlowdownSim>
+      <motorType>velocity</motorType>
+    </plugin>
+
+    <plugin filename="gz-sim-joint-position-controller-system"
+            name="gz::sim::systems::JointPositionController">
+      <joint_name>servo1_pitch_joint</joint_name>
+      <sub_topic>servo_1</sub_topic>
+      <p_gain>1</p_gain>
+      </plugin>
+
+    <plugin filename="gz-sim-joint-position-controller-system"
+            name="gz::sim::systems::JointPositionController">
+      <joint_name>servo0_roll_joint</joint_name>
+      <sub_topic>servo_0</sub_topic>
+      <p_gain>1</p_gain>
+      </plugin>
+
+    <plugin filename="libgz-sim-pose-publisher-system.so"
+            name="gz::sim::systems::PosePublisher">
+      <publish_link_pose>true</publish_link_pose>
+      <publish_collision_pose>false</publish_collision_pose>
+      <publish_visual_pose>false</publish_visual_pose>
+      <use_pose_vector_msg>true</use_pose_vector_msg>
+      <static_publisher>true</static_publisher>
+      <static_update_frequency>10</static_update_frequency>
+    </plugin>
+
+  </model>
+</sdf>
