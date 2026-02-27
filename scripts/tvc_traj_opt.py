@@ -1,7 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-TVC Rocket Trajectory Optimization using Crocoddyl
+TVC Rocket Trajectory Optimization using Crocoddyl (Method 1: Custom calcDiff)
+
+This is Method 1: Custom implementation with numerical differentiation in calcDiff.
+This method is slower but provides full control over the implementation.
+
+Method 2 (fast, using Pinocchio + Crocoddyl standard approach) is in tvc_traj_opt_pinocchio.py
 
 Usage:
     python -u tvc_traj_opt.py
