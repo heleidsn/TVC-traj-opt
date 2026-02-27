@@ -22,6 +22,7 @@ Note: Need to activate conda environment first
 
 import sys
 import os
+import time
 
 # Ensure tvc_traj_opt module can be imported
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,7 +40,7 @@ try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                  QHBoxLayout, QPushButton, QLabel, QLineEdit, 
                                  QGroupBox, QGridLayout, QTextEdit, QTabWidget,
-                                 QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar)
+                                 QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox)
     from PyQt5.QtCore import QThread, pyqtSignal, Qt
     from PyQt5.QtGui import QFont
     QT_AVAILABLE = True
@@ -51,7 +52,7 @@ except ImportError:
         from PySide2.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                       QHBoxLayout, QPushButton, QLabel, QLineEdit, 
                                       QGroupBox, QGridLayout, QTextEdit, QTabWidget,
-                                      QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar)
+                                      QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox)
         from PySide2.QtCore import QThread, Signal as pyqtSignal, Qt
         from PySide2.QtGui import QFont
         QT_AVAILABLE = True
@@ -76,6 +77,8 @@ from mpl_toolkits.mplot3d import Axes3D
 import crocoddyl
 # Import TVC model (from same directory)
 from tvc_traj_opt import TVCRocketActionModel, plot_trajectory
+from tvc_traj_opt_pinocchio import (solve_with_pinocchio_waypoints, solve_with_pinocchio_waypoints_unified,
+                                    convert_pinocchio_state_to_method1)
 
 
 class OptimizationThread(QThread):
@@ -83,7 +86,7 @@ class OptimizationThread(QThread):
     # Signal definitions
     iteration_update = pyqtSignal(int, float, float, int)  # iteration number, cost, stop, segment_index
     state_update = pyqtSignal(list, list)  # xs, us
-    finished = pyqtSignal(list, list, list)  # xs, us, all_loggers (list of loggers)
+    finished = pyqtSignal(list, list, list, dict)  # xs, us, all_loggers, timing_info
     error = pyqtSignal(str)
     
     def __init__(self, params):
@@ -98,11 +101,15 @@ class OptimizationThread(QThread):
             dt = self.params['dt']
             max_iter = self.params['max_iter']
             weights = self.params['weights']
+            terminal_weights = self.params.get('terminal_weights', None)
             bounds = self.params['bounds']
             m = self.params['m']
             I = self.params['I']
             r_thrust = self.params['r_thrust']
             waypoints = self.params.get('waypoints', [])
+            method = self.params.get('method', 0)  # 0=Method1, 1=Method2 FDDP, 2=Method3 BoxFDDP
+            use_box_solver = (method == 2)  # BoxFDDP uses native control bounds
+            unified = self.params.get('unified', False)  # Merge all segments into one problem
             
             # Check if we have waypoints with times
             if len(waypoints) < 2:
@@ -136,11 +143,77 @@ class OptimizationThread(QThread):
             
             uref = np.array([0.0, 0.0, m*9.81, 0.0])
             
+            # Check which method to use
+            if method >= 1:  # Method 2: Pinocchio (FDDP or BoxFDDP)
+                # Use Pinocchio-based optimization
+                def callback_func(solver, seg_idx, current_xs, current_us, completed_xs, completed_us):
+                    """Callback for real-time updates in Pinocchio method"""
+                    if self.running:
+                        # Emit iteration update
+                        self.iteration_update.emit(solver.iter, solver.cost, solver.stop, seg_idx)
+                        
+                        # Update state display periodically
+                        if solver.iter % 5 == 0:
+                            # Combine with completed segments
+                            combined_xs = []
+                            combined_us = []
+                            
+                            # Add all completed segments
+                            for i, (seg_xs, seg_us) in enumerate(zip(completed_xs, completed_us)):
+                                if i == 0:
+                                    combined_xs.extend(seg_xs)
+                                    combined_us.extend(seg_us)
+                                else:
+                                    combined_xs.extend(seg_xs[1:])
+                                    combined_us.extend(seg_us)
+                            
+                            # Add current segment
+                            if len(combined_xs) > 0:
+                                if seg_idx > 0:
+                                    combined_xs.extend(current_xs[1:])
+                                else:
+                                    combined_xs.extend(current_xs)
+                            else:
+                                combined_xs.extend(current_xs)
+                            combined_us.extend(current_us)
+                            
+                            if len(combined_xs) > 0:
+                                self.state_update.emit(combined_xs, combined_us)
+                
+                # Use Pinocchio method (FDDP or BoxFDDP), segmented or unified
+                solver_fn = solve_with_pinocchio_waypoints_unified if unified else solve_with_pinocchio_waypoints
+                t0 = time.perf_counter()
+                combined_xs, combined_us, all_loggers = solver_fn(
+                    dt=dt,
+                    waypoints=waypoints,
+                    m=m,
+                    I=I,
+                    r_thrust=r_thrust,
+                    weights=weights,
+                    terminal_weights=terminal_weights,
+                    bounds=bounds,
+                    max_iter=max_iter,
+                    use_box_solver=use_box_solver,
+                    callback=callback_func,
+                    running_flag=lambda: self.running
+                )
+                total_time = time.perf_counter() - t0
+                total_iters = sum(len(logger.costs) for logger in all_loggers) if all_loggers else 0
+                avg_time_per_iter = total_time / total_iters if total_iters > 0 else 0.0
+                method_name = "Method 3 (BoxFDDP)" if use_box_solver else "Method 2 (FDDP)"
+                timing_info = {"total_time": total_time, "total_iters": total_iters,
+                              "avg_time_per_iter": avg_time_per_iter, "method": method_name}
+                if self.running:
+                    self.finished.emit(combined_xs, combined_us, all_loggers, timing_info)
+                return
+            
+            # Method 1: Custom calcDiff (original implementation)
             # Store all segments' trajectories
             all_xs = []
             all_us = []
             all_loggers = []
-            cumulative_time = 0.0
+            t0_method1 = time.perf_counter()
+            total_iters_method1 = 0
             
             # Custom callback for real-time updates
             class RealTimeCallback(crocoddyl.CallbackAbstract):
@@ -252,15 +325,14 @@ class OptimizationThread(QThread):
                                              weights=weights,
                                              bounds=bounds)
                 
-                # Terminal model with higher weights for waypoint precision
-                terminal_weights = {**weights, 
-                                   "p": 200.0, "v": 50.0, 
-                                   "R": 200.0, "w": 20.0,
-                                   "u": 0.0, "du": 0.0}
+                # Terminal model with weights from GUI (or fallback to defaults)
+                tw = terminal_weights if terminal_weights else {
+                    "p": 200.0, "v": 50.0, "R": 200.0, "w": 20.0, "u": 0.0, "du": 0.0
+                }
                 terminal = TVCRocketActionModel(dt, m, I, r_thrust,
                                               tvc_order="pitch_roll",
                                               x_goal=xg_seg, u_ref=uref,
-                                              weights=terminal_weights,
+                                              weights=tw,
                                               bounds=bounds)
                 
                 # Create problem for this segment
@@ -282,6 +354,7 @@ class OptimizationThread(QThread):
                 # Solve this segment
                 try:
                     solver.solve(xs_init, us_init, max_iter, False)
+                    total_iters_method1 += solver.iter
                     print(f"  Segment {seg_idx + 1} solved: cost={solver.cost:.6e}, iter={solver.iter}")
                 except Exception as e:
                     error_msg = f"Error solving segment {seg_idx + 1}: {str(e)}"
@@ -340,8 +413,11 @@ class OptimizationThread(QThread):
                 
                 print(f"Combined trajectory: {len(combined_xs)} states, {len(combined_us)} controls")
                 
-                # Emit all loggers for multi-segment cost plotting
-                self.finished.emit(combined_xs, combined_us, all_loggers)
+                total_time_method1 = time.perf_counter() - t0_method1
+                avg_time_per_iter = total_time_method1 / total_iters_method1 if total_iters_method1 > 0 else 0.0
+                timing_info = {"total_time": total_time_method1, "total_iters": total_iters_method1,
+                              "avg_time_per_iter": avg_time_per_iter, "method": "Method 1 (Custom calcDiff)"}
+                self.finished.emit(combined_xs, combined_us, all_loggers, timing_info)
                 
         except Exception as e:
             import traceback
@@ -550,24 +626,22 @@ class MainWindow(QMainWindow):
         self.wp_time.setMaximumHeight(25)
         self.wp_time.setMaximumWidth(80)
         
-        # First row: X, Y, Z
+        # Two pairs per row (4 grid cols)
         current_wp_layout.addWidget(QLabel('X (m):'), 0, 0)
         current_wp_layout.addWidget(self.wp_x, 0, 1)
         current_wp_layout.addWidget(QLabel('Y (m):'), 0, 2)
         current_wp_layout.addWidget(self.wp_y, 0, 3)
-        current_wp_layout.addWidget(QLabel('Z (m):'), 0, 4)
-        current_wp_layout.addWidget(self.wp_z, 0, 5)
-        
-        # Second row: Yaw, Arrival Time and Update button
-        current_wp_layout.addWidget(QLabel('Yaw (°):'), 1, 0)
-        current_wp_layout.addWidget(self.wp_yaw, 1, 1)
-        current_wp_layout.addWidget(QLabel('Arrival Time (s):'), 1, 2)
-        current_wp_layout.addWidget(self.wp_time, 1, 3)
+        current_wp_layout.addWidget(QLabel('Z (m):'), 1, 0)
+        current_wp_layout.addWidget(self.wp_z, 1, 1)
+        current_wp_layout.addWidget(QLabel('Yaw (°):'), 1, 2)
+        current_wp_layout.addWidget(self.wp_yaw, 1, 3)
+        current_wp_layout.addWidget(QLabel('Arrival Time (s):'), 2, 0)
+        current_wp_layout.addWidget(self.wp_time, 2, 1)
         
         self.update_waypoint_btn = QPushButton('Update Selected')
         self.update_waypoint_btn.clicked.connect(self.update_waypoint)
         self.update_waypoint_btn.setMaximumHeight(30)
-        current_wp_layout.addWidget(self.update_waypoint_btn, 1, 4, 1, 2)
+        current_wp_layout.addWidget(self.update_waypoint_btn, 2, 2, 1, 2)
         
         current_wp_group.setLayout(current_wp_layout)
         waypoint_layout.addWidget(current_wp_group)
@@ -586,6 +660,31 @@ class MainWindow(QMainWindow):
             [4.0, 0.0, 0.0, 0.0, 10.0]      # Waypoint 2 at t=10s, yaw=0°
         ]
         self.update_waypoint_list()
+        
+        # Optimization method selection
+        method_group = QGroupBox('Optimization Method')
+        method_layout = QHBoxLayout()
+        method_layout.setSpacing(3)
+        
+        self.method_combo = QComboBox()
+        self.method_combo.addItem('Method 1: Custom calcDiff (Slower, Numerical)')
+        self.method_combo.addItem('Method 2: Pinocchio + FDDP (Penalty constraints)')
+        self.method_combo.addItem('Method 3: Pinocchio + BoxFDDP (Native control bounds)')
+        self.method_combo.setCurrentIndex(0)  # Default to Method 1
+        method_layout.addWidget(QLabel('Method:'))
+        method_layout.addWidget(self.method_combo)
+        self.method_combo.currentIndexChanged.connect(self.on_method_changed)
+        
+        self.unified_checkbox = QCheckBox('Unified (merge all segments)')
+        self.unified_checkbox.setToolTip('Merge all waypoint segments into one optimization problem (Method 2/3 only)')
+        self.unified_checkbox.setChecked(False)
+        self.unified_checkbox.setEnabled(False)  # Enabled only when Method 2/3 selected
+        method_layout.addWidget(self.unified_checkbox)
+        self.method_combo.currentIndexChanged.connect(self._update_unified_checkbox_state)
+        
+        method_group.setLayout(method_layout)
+        layout.addWidget(method_group)
+        self._update_unified_checkbox_state(self.method_combo.currentIndex())
         
         # Optimization parameters
         opt_group = QGroupBox('Optimization Parameters')
@@ -612,19 +711,29 @@ class MainWindow(QMainWindow):
         self.max_iter_spin.setMaximumHeight(25)
         self.max_iter_spin.setMaximumWidth(100)
         
-        # Arrange in one row to save space
+        # Two pairs per row (4 grid cols)
         opt_layout.addWidget(QLabel('Time Step (s):'), 0, 0)
         opt_layout.addWidget(self.dt_spin, 0, 1)
         opt_layout.addWidget(QLabel('Time Steps:'), 0, 2)
         opt_layout.addWidget(self.N_spin, 0, 3)
-        opt_layout.addWidget(QLabel('Max Iter:'), 0, 4)
-        opt_layout.addWidget(self.max_iter_spin, 0, 5)
+        opt_layout.addWidget(QLabel('Max Iter:'), 1, 0)
+        opt_layout.addWidget(self.max_iter_spin, 1, 1)
         
         opt_group.setLayout(opt_layout)
-        layout.addWidget(opt_group)
         
-        # Cost weights - use 2 columns to save vertical space
-        cost_group = QGroupBox('Cost Weights')
+        # Tab widget for parameters
+        params_tabs = QTabWidget()
+        
+        # Tab 1: Optimization Parameters
+        opt_tab = QWidget()
+        opt_tab_layout = QVBoxLayout()
+        opt_tab_layout.addWidget(opt_group)
+        opt_tab_layout.addStretch()
+        opt_tab.setLayout(opt_tab_layout)
+        params_tabs.addTab(opt_tab, 'Optimization')
+        
+        # Running cost weights
+        cost_group = QGroupBox('Running Cost')
         cost_layout = QGridLayout()
         cost_layout.setSpacing(3)  # Reduce spacing
         
@@ -685,29 +794,96 @@ class MainWindow(QMainWindow):
         self.k_state_bound.setMaximumHeight(25)
         self.k_state_bound.setMaximumWidth(100)
         
-        # Arrange in 3 rows to accommodate all weights
-        # First row: Position, Velocity, Attitude
+        # Two pairs per row (4 grid cols)
         cost_layout.addWidget(QLabel('Position (p):'), 0, 0)
         cost_layout.addWidget(self.w_p, 0, 1)
         cost_layout.addWidget(QLabel('Velocity (v):'), 0, 2)
         cost_layout.addWidget(self.w_v, 0, 3)
-        cost_layout.addWidget(QLabel('Attitude (R):'), 0, 4)
-        cost_layout.addWidget(self.w_R, 0, 5)
-        # Second row: Ang Vel, Control, Ctrl Chg
-        cost_layout.addWidget(QLabel('Ang Vel (w):'), 1, 0)
-        cost_layout.addWidget(self.w_w, 1, 1)
-        cost_layout.addWidget(QLabel('Control (u):'), 1, 2)
-        cost_layout.addWidget(self.w_u, 1, 3)
-        cost_layout.addWidget(QLabel('Ctrl Chg (du):'), 1, 4)
-        cost_layout.addWidget(self.w_du, 1, 5)
-        # Third row: Constraint penalty coefficients
-        cost_layout.addWidget(QLabel('Ctrl Bound (k_bound):'), 2, 0)
-        cost_layout.addWidget(self.k_bound, 2, 1)
-        cost_layout.addWidget(QLabel('State Bound (k_sb):'), 2, 2)
-        cost_layout.addWidget(self.k_state_bound, 2, 3)
+        cost_layout.addWidget(QLabel('Attitude (R):'), 1, 0)
+        cost_layout.addWidget(self.w_R, 1, 1)
+        cost_layout.addWidget(QLabel('Ang Vel (w):'), 1, 2)
+        cost_layout.addWidget(self.w_w, 1, 3)
+        cost_layout.addWidget(QLabel('Control (u):'), 2, 0)
+        cost_layout.addWidget(self.w_u, 2, 1)
+        cost_layout.addWidget(QLabel('Ctrl Chg (du):'), 2, 2)
+        cost_layout.addWidget(self.w_du, 2, 3)
+        cost_layout.addWidget(QLabel('Ctrl Bound (k_bound):'), 3, 0)
+        cost_layout.addWidget(self.k_bound, 3, 1)
+        cost_layout.addWidget(QLabel('State Bound (k_sb):'), 3, 2)
+        cost_layout.addWidget(self.k_state_bound, 3, 3)
         
         cost_group.setLayout(cost_layout)
-        layout.addWidget(cost_group)
+        
+        # Terminal cost weights - applied at waypoint arrival
+        terminal_cost_group = QGroupBox('Terminal Cost')
+        terminal_cost_layout = QGridLayout()
+        terminal_cost_layout.setSpacing(3)
+        
+        self.w_p_term = QDoubleSpinBox()
+        self.w_p_term.setRange(0, 10000)
+        self.w_p_term.setValue(200.0)
+        self.w_p_term.setDecimals(1)
+        self.w_p_term.setMaximumHeight(25)
+        self.w_p_term.setMaximumWidth(100)
+        
+        self.w_v_term = QDoubleSpinBox()
+        self.w_v_term.setRange(0, 10000)
+        self.w_v_term.setValue(50.0)
+        self.w_v_term.setDecimals(1)
+        self.w_v_term.setMaximumHeight(25)
+        self.w_v_term.setMaximumWidth(100)
+        
+        self.w_R_term = QDoubleSpinBox()
+        self.w_R_term.setRange(0, 10000)
+        self.w_R_term.setValue(200.0)
+        self.w_R_term.setDecimals(1)
+        self.w_R_term.setMaximumHeight(25)
+        self.w_R_term.setMaximumWidth(100)
+        
+        self.w_w_term = QDoubleSpinBox()
+        self.w_w_term.setRange(0, 10000)
+        self.w_w_term.setValue(20.0)
+        self.w_w_term.setDecimals(1)
+        self.w_w_term.setMaximumHeight(25)
+        self.w_w_term.setMaximumWidth(100)
+        
+        self.w_u_term = QDoubleSpinBox()
+        self.w_u_term.setRange(0, 10)
+        self.w_u_term.setValue(0.0)
+        self.w_u_term.setDecimals(2)
+        self.w_u_term.setMaximumHeight(25)
+        self.w_u_term.setMaximumWidth(100)
+        
+        self.w_du_term = QDoubleSpinBox()
+        self.w_du_term.setRange(0, 10)
+        self.w_du_term.setValue(0.0)
+        self.w_du_term.setDecimals(2)
+        self.w_du_term.setMaximumHeight(25)
+        self.w_du_term.setMaximumWidth(100)
+        
+        terminal_cost_layout.addWidget(QLabel('Position (p):'), 0, 0)
+        terminal_cost_layout.addWidget(self.w_p_term, 0, 1)
+        terminal_cost_layout.addWidget(QLabel('Velocity (v):'), 0, 2)
+        terminal_cost_layout.addWidget(self.w_v_term, 0, 3)
+        terminal_cost_layout.addWidget(QLabel('Attitude (R):'), 1, 0)
+        terminal_cost_layout.addWidget(self.w_R_term, 1, 1)
+        terminal_cost_layout.addWidget(QLabel('Ang Vel (w):'), 1, 2)
+        terminal_cost_layout.addWidget(self.w_w_term, 1, 3)
+        terminal_cost_layout.addWidget(QLabel('Control (u):'), 2, 0)
+        terminal_cost_layout.addWidget(self.w_u_term, 2, 1)
+        terminal_cost_layout.addWidget(QLabel('Ctrl Chg (du):'), 2, 2)
+        terminal_cost_layout.addWidget(self.w_du_term, 2, 3)
+        
+        terminal_cost_group.setLayout(terminal_cost_layout)
+        
+        # Tab 2: Cost Weights
+        cost_tab = QWidget()
+        cost_tab_layout = QVBoxLayout()
+        cost_tab_layout.addWidget(cost_group)
+        cost_tab_layout.addWidget(terminal_cost_group)
+        cost_tab_layout.addStretch()
+        cost_tab.setLayout(cost_tab_layout)
+        params_tabs.addTab(cost_tab, 'Cost Weights')
         
         # Control constraints
         bounds_group = QGroupBox('Control Constraints')
@@ -742,18 +918,25 @@ class MainWindow(QMainWindow):
         self.tau_yaw_max.setMaximumWidth(100)
         
         bounds_layout.setSpacing(3)  # Reduce spacing
-        # Arrange in one row to save space
-        bounds_layout.addWidget(QLabel('Pitch Max (°):'), 0, 0)
+        # Two pairs per row (4 grid cols)
+        bounds_layout.addWidget(QLabel('TVC Pitch (°):'), 0, 0)
         bounds_layout.addWidget(self.th_p_max, 0, 1)
-        bounds_layout.addWidget(QLabel('Roll Max (°):'), 0, 2)
+        bounds_layout.addWidget(QLabel('TVC Roll (°):'), 0, 2)
         bounds_layout.addWidget(self.th_r_max, 0, 3)
-        bounds_layout.addWidget(QLabel('Max Thrust (N):'), 0, 4)
-        bounds_layout.addWidget(self.T_max, 0, 5)
-        bounds_layout.addWidget(QLabel('Yaw Torque Max (N·m):'), 0, 6)
-        bounds_layout.addWidget(self.tau_yaw_max, 0, 7)
+        bounds_layout.addWidget(QLabel('Thrust (N):'), 1, 0)
+        bounds_layout.addWidget(self.T_max, 1, 1)
+        bounds_layout.addWidget(QLabel('Yaw (N·m):'), 1, 2)
+        bounds_layout.addWidget(self.tau_yaw_max, 1, 3)
         
         bounds_group.setLayout(bounds_layout)
-        layout.addWidget(bounds_group)
+        
+        # Tab 3: Control Constraints
+        bounds_tab = QWidget()
+        bounds_tab_layout = QVBoxLayout()
+        bounds_tab_layout.addWidget(bounds_group)
+        bounds_tab_layout.addStretch()
+        bounds_tab.setLayout(bounds_tab_layout)
+        params_tabs.addTab(bounds_tab, 'Control Constraints')
         
         # State constraints
         state_constraints_group = QGroupBox('State Constraints')
@@ -805,24 +988,29 @@ class MainWindow(QMainWindow):
         self.w_max.setMaximumHeight(25)
         self.w_max.setMaximumWidth(100)
         
-        # Arrange in 2 rows
-        # First row: Horizontal Velocity, Vertical Velocity, Roll, Pitch
-        state_constraints_layout.addWidget(QLabel('Max V_xy (m/s):'), 0, 0)
+        # Two pairs per row (4 grid cols)
+        state_constraints_layout.addWidget(QLabel('V_xy (m/s):'), 0, 0)
         state_constraints_layout.addWidget(self.v_horizontal_max, 0, 1)
-        state_constraints_layout.addWidget(QLabel('Max V_z (m/s):'), 0, 2)
+        state_constraints_layout.addWidget(QLabel('V_z (m/s):'), 0, 2)
         state_constraints_layout.addWidget(self.v_vertical_max, 0, 3)
-        state_constraints_layout.addWidget(QLabel('Max Roll (°):'), 0, 4)
-        state_constraints_layout.addWidget(self.roll_max, 0, 5)
-        # Second row: Pitch, Yaw, Angular Velocity
-        state_constraints_layout.addWidget(QLabel('Max Pitch (°):'), 1, 0)
-        state_constraints_layout.addWidget(self.pitch_max, 1, 1)
-        state_constraints_layout.addWidget(QLabel('Max Yaw (°):'), 1, 2)
-        state_constraints_layout.addWidget(self.yaw_max, 1, 3)
-        state_constraints_layout.addWidget(QLabel('Max Ang Vel (rad/s):'), 1, 4)
-        state_constraints_layout.addWidget(self.w_max, 1, 5)
+        state_constraints_layout.addWidget(QLabel('Roll (°):'), 1, 0)
+        state_constraints_layout.addWidget(self.roll_max, 1, 1)
+        state_constraints_layout.addWidget(QLabel('Pitch (°):'), 1, 2)
+        state_constraints_layout.addWidget(self.pitch_max, 1, 3)
+        state_constraints_layout.addWidget(QLabel('Yaw (°):'), 2, 0)
+        state_constraints_layout.addWidget(self.yaw_max, 2, 1)
+        state_constraints_layout.addWidget(QLabel('Ang Vel (rad/s):'), 2, 2)
+        state_constraints_layout.addWidget(self.w_max, 2, 3)
         
         state_constraints_group.setLayout(state_constraints_layout)
-        layout.addWidget(state_constraints_group)
+        
+        # Tab 4: State Constraints
+        state_tab = QWidget()
+        state_tab_layout = QVBoxLayout()
+        state_tab_layout.addWidget(state_constraints_group)
+        state_tab_layout.addStretch()
+        state_tab.setLayout(state_tab_layout)
+        params_tabs.addTab(state_tab, 'State Constraints')
         
         # Physical parameters
         physics_group = QGroupBox('Physical Parameters')
@@ -841,21 +1029,21 @@ class MainWindow(QMainWindow):
         self.Ixx = QDoubleSpinBox()
         self.Ixx.setRange(0.0001, 1.0)
         self.Ixx.setValue(0.02)
-        self.Ixx.setDecimals(4)
+        self.Ixx.setDecimals(2)
         self.Ixx.setMaximumHeight(25)
         self.Ixx.setMaximumWidth(100)
         
         self.Iyy = QDoubleSpinBox()
         self.Iyy.setRange(0.0001, 1.0)
         self.Iyy.setValue(0.02)
-        self.Iyy.setDecimals(4)
+        self.Iyy.setDecimals(2)
         self.Iyy.setMaximumHeight(25)
         self.Iyy.setMaximumWidth(100)
         
         self.Izz = QDoubleSpinBox()
         self.Izz.setRange(0.0001, 1.0)
         self.Izz.setValue(0.01)
-        self.Izz.setDecimals(4)
+        self.Izz.setDecimals(2)
         self.Izz.setMaximumHeight(25)
         self.Izz.setMaximumWidth(100)
         
@@ -863,40 +1051,79 @@ class MainWindow(QMainWindow):
         self.r_thrust_x = QDoubleSpinBox()
         self.r_thrust_x.setRange(-1.0, 1.0)
         self.r_thrust_x.setValue(0.0)
-        self.r_thrust_x.setDecimals(3)
+        self.r_thrust_x.setDecimals(2)
         self.r_thrust_x.setMaximumHeight(25)
         self.r_thrust_x.setMaximumWidth(100)
         
         self.r_thrust_y = QDoubleSpinBox()
         self.r_thrust_y.setRange(-1.0, 1.0)
         self.r_thrust_y.setValue(0.0)
-        self.r_thrust_y.setDecimals(3)
+        self.r_thrust_y.setDecimals(2)
         self.r_thrust_y.setMaximumHeight(25)
         self.r_thrust_y.setMaximumWidth(100)
         
         self.r_thrust_z = QDoubleSpinBox()
         self.r_thrust_z.setRange(-1.0, 1.0)
         self.r_thrust_z.setValue(-0.2)
-        self.r_thrust_z.setDecimals(3)
+        self.r_thrust_z.setDecimals(2)
         self.r_thrust_z.setMaximumHeight(25)
         self.r_thrust_z.setMaximumWidth(100)
         
-        # Arrange in 2 rows
-        # First row: Mass and Thrust Z
+        # Two pairs per row (4 grid cols)
         physics_layout.addWidget(QLabel('Mass (kg):'), 0, 0)
         physics_layout.addWidget(self.mass, 0, 1)
-        physics_layout.addWidget(QLabel('Thrust Pos Z (m):'), 0, 2)
-        physics_layout.addWidget(self.r_thrust_z, 0, 3)
-        # Second row: Moment of inertia (Ixx, Iyy, Izz)
-        physics_layout.addWidget(QLabel('Ixx (kg·m²):'), 1, 0)
-        physics_layout.addWidget(self.Ixx, 1, 1)
-        physics_layout.addWidget(QLabel('Iyy (kg·m²):'), 1, 2)
-        physics_layout.addWidget(self.Iyy, 1, 3)
-        physics_layout.addWidget(QLabel('Izz (kg·m²):'), 1, 4)
-        physics_layout.addWidget(self.Izz, 1, 5)
+        physics_layout.addWidget(QLabel('Ixx (kg·m²):'), 0, 2)
+        physics_layout.addWidget(self.Ixx, 0, 3)
+        physics_layout.addWidget(QLabel('Iyy (kg·m²):'), 1, 0)
+        physics_layout.addWidget(self.Iyy, 1, 1)
+        physics_layout.addWidget(QLabel('Izz (kg·m²):'), 1, 2)
+        physics_layout.addWidget(self.Izz, 1, 3)
+        physics_layout.addWidget(QLabel('Thrust X (m):'), 2, 0)
+        physics_layout.addWidget(self.r_thrust_x, 2, 1)
+        physics_layout.addWidget(QLabel('Thrust Y (m):'), 2, 2)
+        physics_layout.addWidget(self.r_thrust_y, 2, 3)
+        physics_layout.addWidget(QLabel('Thrust Z (m):'), 3, 0)
+        physics_layout.addWidget(self.r_thrust_z, 3, 1)
         
         physics_group.setLayout(physics_layout)
-        layout.addWidget(physics_group)
+        
+        # Tab 5: Physical Parameters
+        physics_tab = QWidget()
+        physics_tab_layout = QVBoxLayout()
+        physics_tab_layout.addWidget(physics_group)
+        physics_tab_layout.addStretch()
+        physics_tab.setLayout(physics_tab_layout)
+        params_tabs.addTab(physics_tab, 'Physical')
+        
+        layout.addWidget(params_tabs)
+        
+        # Default parameters per method (state/control constraints equal across all methods)
+        self.DEFAULT_PARAMS = {
+            0: {  # Method 1: Custom calcDiff
+                "w_p": 1.0, "w_v": 0.2, "w_R": 0.5, "w_w": 0.1,
+                "w_u": 0.5, "w_du": 0.5,
+                "k_bound": 200.0, "k_state_bound": 200.0,
+                "th_p_max": 10.0, "th_r_max": 10.0, "T_max": 25.0, "tau_yaw_max": 1.0,
+                "v_horizontal_max": 1.0, "v_vertical_max": 3.0,
+                "roll_max": 10.0, "pitch_max": 10.0, "yaw_max": 180.0, "w_max": 2.0,
+            },
+            1: {  # Method 2: FDDP - higher w_R to suppress yaw drift (Pinocchio cost structure)
+                "w_p": 1.0, "w_v": 0.2, "w_R": 2.0, "w_w": 0.1,
+                "w_u": 0.5, "w_du": 0.5,
+                "k_bound": 200.0, "k_state_bound": 200.0,
+                "th_p_max": 10.0, "th_r_max": 10.0, "T_max": 25.0, "tau_yaw_max": 1.0,
+                "v_horizontal_max": 1.0, "v_vertical_max": 3.0,
+                "roll_max": 10.0, "pitch_max": 10.0, "yaw_max": 30.0, "w_max": 2.0,
+            },
+            2: {  # Method 3: BoxFDDP - higher w_R to suppress yaw drift
+                "w_p": 1.0, "w_v": 0.2, "w_R": 2.0, "w_w": 0.1,
+                "w_u": 0.5, "w_du": 0.5,
+                "k_bound": 200.0, "k_state_bound": 200.0,
+                "th_p_max": 10.0, "th_r_max": 10.0, "T_max": 25.0, "tau_yaw_max": 1.0,
+                "v_horizontal_max": 1.0, "v_vertical_max": 3.0,
+                "roll_max": 10.0, "pitch_max": 10.0, "yaw_max": 30.0, "w_max": 2.0,
+            },
+        }
         
         # Control buttons - arrange in one row
         button_layout = QHBoxLayout()
@@ -912,6 +1139,10 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_optimization)
         button_layout.addWidget(self.stop_btn)
+        self.show_plot_checkbox = QCheckBox('Show full trajectory plot when done')
+        self.show_plot_checkbox.setChecked(False)
+        self.show_plot_checkbox.setToolTip('If checked, a detailed trajectory plot window will open after optimization completes')
+        button_layout.addWidget(self.show_plot_checkbox)
         layout.addLayout(button_layout)
         
         # Progress bar
@@ -1048,6 +1279,36 @@ class MainWindow(QMainWindow):
         z = np.sin(yaw_rad / 2.0)
         return np.array([w, 0.0, 0.0, z])
     
+    def _update_unified_checkbox_state(self, index):
+        """Enable unified checkbox only for Method 2/3"""
+        self.unified_checkbox.setEnabled(index >= 1)
+        if index == 0:
+            self.unified_checkbox.setChecked(False)
+    
+    def on_method_changed(self, index):
+        """Load parameter defaults when optimization method changes"""
+        params = self.DEFAULT_PARAMS.get(index, self.DEFAULT_PARAMS[0])
+        self.w_p.setValue(params["w_p"])
+        self.w_v.setValue(params["w_v"])
+        self.w_R.setValue(params["w_R"])
+        self.w_w.setValue(params["w_w"])
+        self.w_u.setValue(params["w_u"])
+        self.w_du.setValue(params["w_du"])
+        self.k_bound.setValue(params["k_bound"])
+        self.k_state_bound.setValue(params["k_state_bound"])
+        self.th_p_max.setValue(params["th_p_max"])
+        self.th_r_max.setValue(params["th_r_max"])
+        self.T_max.setValue(params["T_max"])
+        self.tau_yaw_max.setValue(params["tau_yaw_max"])
+        self.v_horizontal_max.setValue(params["v_horizontal_max"])
+        self.v_vertical_max.setValue(params["v_vertical_max"])
+        self.roll_max.setValue(params["roll_max"])
+        self.pitch_max.setValue(params["pitch_max"])
+        self.yaw_max.setValue(params["yaw_max"])
+        self.w_max.setValue(params["w_max"])
+        method_names = ["Method 1 (Custom calcDiff)", "Method 2 (FDDP)", "Method 3 (BoxFDDP)"]
+        self.status_text.append(f"Parameters loaded for {method_names[index]}")
+    
     def update_waypoint_list(self):
         """Update waypoint list display"""
         self.waypoint_list.clear()
@@ -1161,7 +1422,7 @@ class MainWindow(QMainWindow):
             xg[2] = self.xg_z.value()
             xg[6:10] = np.array([1., 0., 0., 0.])  # Target quaternion (default)
         
-        # Cost weights
+        # Cost weights (running cost)
         weights = {
             "p": self.w_p.value(),
             "v": self.w_v.value(),
@@ -1169,6 +1430,16 @@ class MainWindow(QMainWindow):
             "w": self.w_w.value(),
             "u": self.w_u.value(),
             "du": self.w_du.value()
+        }
+        
+        # Terminal cost weights
+        terminal_weights = {
+            "p": self.w_p_term.value(),
+            "v": self.w_v_term.value(),
+            "R": self.w_R_term.value(),
+            "w": self.w_w_term.value(),
+            "u": self.w_u_term.value(),
+            "du": self.w_du_term.value()
         }
         
         # Control constraints - convert degrees to radians for optimization
@@ -1203,11 +1474,14 @@ class MainWindow(QMainWindow):
             'x0': x0,
             'xg': xg,
             'weights': weights,
+            'terminal_weights': terminal_weights,
             'bounds': bounds,
             'm': m,
             'I': I,
             'r_thrust': r_thrust,
-            'waypoints': self.waypoints.copy()  # Include waypoints for plotting
+            'waypoints': self.waypoints.copy(),  # Include waypoints for plotting
+            'method': self.method_combo.currentIndex(),  # 0=Method1, 1=Method2 FDDP, 2=Method3 BoxFDDP
+            'unified': self.unified_checkbox.isChecked()  # Merge all segments (Method 2/3 only)
         }
     
     def start_optimization(self):
@@ -1611,12 +1885,23 @@ class MainWindow(QMainWindow):
         
         self.canvas.draw()
     
-    def optimization_finished(self, xs, us, all_loggers):
+    def optimization_finished(self, xs, us, all_loggers, timing_info=None):
         """Optimization finished"""
         self.status_text.append('Optimization completed!')
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress.setValue(self.progress.maximum())
+        
+        # Show timing: average time per iteration
+        if timing_info:
+            avg_ms = timing_info.get("avg_time_per_iter", 0) * 1000
+            total_time = timing_info.get("total_time", 0)
+            total_iters = timing_info.get("total_iters", 0)
+            method_name = timing_info.get("method", "")
+            self.status_text.append(f'{method_name}')
+            self.status_text.append(f'Total time: {total_time:.3f}s, Total iterations: {total_iters}')
+            self.status_text.append(f'Average time per iteration: {avg_ms:.2f} ms')
+            print(f"[{method_name}] Total: {total_time:.3f}s, Iters: {total_iters}, Avg/iter: {avg_ms:.2f} ms")
         
         # Show final results from all segments
         if all_loggers and len(all_loggers) > 0:
@@ -1626,7 +1911,8 @@ class MainWindow(QMainWindow):
                     final_cost = logger.costs[-1]
                     total_iterations += len(logger.costs)
                     self.status_text.append(f'Segment {i+1} Final Cost: {final_cost:.6e}')
-            self.status_text.append(f'Total Iterations: {total_iterations}')
+            if not timing_info:
+                self.status_text.append(f'Total Iterations: {total_iterations}')
         
         # Update cost plot with all segments using different colors
         self.ax_cost.clear()
@@ -1668,12 +1954,8 @@ class MainWindow(QMainWindow):
         # Update final state
         self.update_state(xs, us)
         
-        # Ask if show full trajectory plot
-        reply = QMessageBox.question(self, 'Optimization Complete', 
-                                    'Optimization completed! Show full trajectory plot?',
-                                    QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            # Use first logger for compatibility with plot_trajectory
+        # Show full trajectory plot only if checkbox is checked
+        if self.show_plot_checkbox.isChecked():
             main_logger = all_loggers[0] if all_loggers and len(all_loggers) > 0 else None
             self.show_full_trajectory(xs, us, main_logger)
     
