@@ -75,10 +75,18 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.mplot3d import Axes3D
 import crocoddyl
-# Import TVC model (from same directory)
+# Import TVC model and common utils (from same directory)
 from tvc_traj_opt import TVCRocketActionModel, plot_trajectory
+from tvc_common import quat_to_euler, yaw_to_quaternion, SEGMENT_COLORS, segment_boundaries_from_waypoints
 from tvc_traj_opt_pinocchio import (solve_with_pinocchio_waypoints, solve_with_pinocchio_waypoints_unified,
                                     convert_pinocchio_state_to_method1)
+try:
+    from tvc_traj_opt_acados import (solve_with_acados_waypoints, solve_with_acados_waypoints_unified,
+                                     ACADOS_AVAILABLE)
+except ImportError:
+    solve_with_acados_waypoints = None
+    solve_with_acados_waypoints_unified = None
+    ACADOS_AVAILABLE = False
 
 
 class OptimizationThread(QThread):
@@ -107,9 +115,60 @@ class OptimizationThread(QThread):
             I = self.params['I']
             r_thrust = self.params['r_thrust']
             waypoints = self.params.get('waypoints', [])
-            method = self.params.get('method', 0)  # 0=Method1, 1=Method2 FDDP, 2=Method3 BoxFDDP
+            method = self.params.get('method', 0)  # 0=Method1, 1=Method2 FDDP, 2=Method3 BoxFDDP, 3=Method4 Acados
             use_box_solver = (method == 2)  # BoxFDDP uses native control bounds
             unified = self.params.get('unified', False)  # Merge all segments into one problem
+            
+            # Method 4: Acados (native constraints)
+            if method == 3:
+                if not ACADOS_AVAILABLE:
+                    self.error.emit("Acados not available. Install: pip install casadi; build acados from source.")
+                    return
+                def callback_acados(solver, seg_idx, current_xs, current_us, completed_xs, completed_us):
+                    if self.running and current_xs:
+                        # Same as Pinocchio: send completed segments + current, show full trajectory
+                        combined_xs, combined_us = [], []
+                        for i, (seg_xs, seg_us) in enumerate(zip(completed_xs, completed_us)):
+                            if i == 0:
+                                combined_xs.extend(seg_xs)
+                                combined_us.extend(seg_us)
+                            else:
+                                combined_xs.extend(seg_xs[1:])
+                                combined_us.extend(seg_us)
+                        if len(combined_xs) > 0 and seg_idx > 0:
+                            combined_xs.extend(current_xs[1:])
+                        else:
+                            combined_xs.extend(current_xs)
+                        combined_us.extend(current_us)
+                        self.state_update.emit(combined_xs, combined_us)
+                def iteration_callback_acados(iter, cost, stop, seg_idx):
+                    if self.running:
+                        self.iteration_update.emit(iter, cost, stop, seg_idx)
+                # When multi-waypoint and need waypoint terminal cost: use segment mode (terminal cost at each segment end)
+                use_segment_for_waypoints = (
+                    len(waypoints) > 2 and unified and
+                    weights.get("waypoint_terminal_cost", True)
+                )
+                if use_segment_for_waypoints:
+                    unified = False  # Switch to segment mode for terminal cost at each intermediate point
+                solver_fn = solve_with_acados_waypoints_unified if unified else solve_with_acados_waypoints
+                t0 = time.perf_counter()
+                combined_xs, combined_us, all_loggers = solver_fn(
+                    dt=dt, waypoints=waypoints, m=m, I=I, r_thrust=r_thrust,
+                    weights=weights, terminal_weights=terminal_weights, bounds=bounds,
+                    max_iter=max_iter, use_box_solver=False, callback=callback_acados,
+                    running_flag=lambda: self.running,
+                    iteration_callback=iteration_callback_acados,
+                    verbose_solve=True  # For store_iterates and cost curve plotting
+                )
+                total_time = time.perf_counter() - t0
+                total_iters = sum(len(logger.costs) for logger in all_loggers) if all_loggers else 0
+                timing_info = {"total_time": total_time, "total_iters": total_iters,
+                              "avg_time_per_iter": total_time / total_iters if total_iters > 0 else 0.0,
+                              "method": "Method 4 (Acados)"}
+                if self.running:
+                    self.finished.emit(combined_xs, combined_us, all_loggers, timing_info)
+                return
             
             # Check if we have waypoints with times
             if len(waypoints) < 2:
@@ -670,13 +729,14 @@ class MainWindow(QMainWindow):
         self.method_combo.addItem('Method 1: Custom calcDiff (Slower, Numerical)')
         self.method_combo.addItem('Method 2: Pinocchio + FDDP (Penalty constraints)')
         self.method_combo.addItem('Method 3: Pinocchio + BoxFDDP (Native control bounds)')
+        self.method_combo.addItem('Method 4: Acados (Native constraints)')
         self.method_combo.setCurrentIndex(0)  # Default to Method 1
         method_layout.addWidget(QLabel('Method:'))
         method_layout.addWidget(self.method_combo)
         self.method_combo.currentIndexChanged.connect(self.on_method_changed)
         
         self.unified_checkbox = QCheckBox('Unified (merge all segments)')
-        self.unified_checkbox.setToolTip('Merge all waypoint segments into one optimization problem (Method 2/3 only)')
+        self.unified_checkbox.setToolTip('Merge all waypoint segments into one optimization problem (Method 2/3/4)')
         self.unified_checkbox.setChecked(False)
         self.unified_checkbox.setEnabled(False)  # Enabled only when Method 2/3 selected
         method_layout.addWidget(self.unified_checkbox)
@@ -758,6 +818,14 @@ class MainWindow(QMainWindow):
         self.w_R.setMaximumHeight(25)
         self.w_R.setMaximumWidth(100)
         
+        self.w_yaw = QDoubleSpinBox()
+        self.w_yaw.setRange(0, 1000)
+        self.w_yaw.setValue(0.5)
+        self.w_yaw.setDecimals(3)
+        self.w_yaw.setMaximumHeight(25)
+        self.w_yaw.setMaximumWidth(100)
+        self.w_yaw.setToolTip('Separate weight for yaw (default same as Attitude R)')
+        
         self.w_w = QDoubleSpinBox()
         self.w_w.setRange(0, 1000)
         self.w_w.setValue(0.1)
@@ -774,7 +842,7 @@ class MainWindow(QMainWindow):
         
         self.w_du = QDoubleSpinBox()
         self.w_du.setRange(0, 1)
-        self.w_du.setValue(0.05)
+        self.w_du.setValue(0.1)  # Default: enable control rate penalty
         self.w_du.setDecimals(3)
         self.w_du.setMaximumHeight(25)
         self.w_du.setMaximumWidth(100)
@@ -789,7 +857,7 @@ class MainWindow(QMainWindow):
         
         self.k_state_bound = QDoubleSpinBox()
         self.k_state_bound.setRange(0, 10000)
-        self.k_state_bound.setValue(200.0)
+        self.k_state_bound.setValue(20.0)  # Lower default to avoid constraint gradient dominating position cost
         self.k_state_bound.setDecimals(1)
         self.k_state_bound.setMaximumHeight(25)
         self.k_state_bound.setMaximumWidth(100)
@@ -801,16 +869,22 @@ class MainWindow(QMainWindow):
         cost_layout.addWidget(self.w_v, 0, 3)
         cost_layout.addWidget(QLabel('Attitude (R):'), 1, 0)
         cost_layout.addWidget(self.w_R, 1, 1)
-        cost_layout.addWidget(QLabel('Ang Vel (w):'), 1, 2)
-        cost_layout.addWidget(self.w_w, 1, 3)
-        cost_layout.addWidget(QLabel('Control (u):'), 2, 0)
-        cost_layout.addWidget(self.w_u, 2, 1)
-        cost_layout.addWidget(QLabel('Ctrl Chg (du):'), 2, 2)
-        cost_layout.addWidget(self.w_du, 2, 3)
-        cost_layout.addWidget(QLabel('Ctrl Bound (k_bound):'), 3, 0)
-        cost_layout.addWidget(self.k_bound, 3, 1)
-        cost_layout.addWidget(QLabel('State Bound (k_sb):'), 3, 2)
-        cost_layout.addWidget(self.k_state_bound, 3, 3)
+        cost_layout.addWidget(QLabel('Yaw:'), 1, 2)
+        cost_layout.addWidget(self.w_yaw, 1, 3)
+        cost_layout.addWidget(QLabel('Ang Vel (w):'), 2, 0)
+        cost_layout.addWidget(self.w_w, 2, 1)
+        cost_layout.addWidget(QLabel('Control (u):'), 3, 0)
+        cost_layout.addWidget(self.w_u, 3, 1)
+        cost_layout.addWidget(QLabel('Ctrl Chg (du):'), 3, 2)
+        cost_layout.addWidget(self.w_du, 3, 3)
+        cost_layout.addWidget(QLabel('Ctrl Bound (k_bound):'), 4, 0)
+        cost_layout.addWidget(self.k_bound, 4, 1)
+        cost_layout.addWidget(QLabel('State Bound (k_sb):'), 4, 2)
+        cost_layout.addWidget(self.k_state_bound, 4, 3)
+        self.schedule_ref_checkbox = QCheckBox('On-time arrival (schedule_ref)')
+        self.schedule_ref_checkbox.setChecked(True)
+        self.schedule_ref_checkbox.setToolTip('Checked: time-interpolated ref for on-time arrival; unchecked: constant goal ref, may arrive early')
+        cost_layout.addWidget(self.schedule_ref_checkbox, 5, 0, 1, 4)
         
         cost_group.setLayout(cost_layout)
         
@@ -840,6 +914,14 @@ class MainWindow(QMainWindow):
         self.w_R_term.setMaximumHeight(25)
         self.w_R_term.setMaximumWidth(100)
         
+        self.w_yaw_term = QDoubleSpinBox()
+        self.w_yaw_term.setRange(0, 10000)
+        self.w_yaw_term.setValue(200.0)
+        self.w_yaw_term.setDecimals(1)
+        self.w_yaw_term.setMaximumHeight(25)
+        self.w_yaw_term.setMaximumWidth(100)
+        self.w_yaw_term.setToolTip('Terminal yaw weight')
+        
         self.w_w_term = QDoubleSpinBox()
         self.w_w_term.setRange(0, 10000)
         self.w_w_term.setValue(20.0)
@@ -867,12 +949,31 @@ class MainWindow(QMainWindow):
         terminal_cost_layout.addWidget(self.w_v_term, 0, 3)
         terminal_cost_layout.addWidget(QLabel('Attitude (R):'), 1, 0)
         terminal_cost_layout.addWidget(self.w_R_term, 1, 1)
-        terminal_cost_layout.addWidget(QLabel('Ang Vel (w):'), 1, 2)
-        terminal_cost_layout.addWidget(self.w_w_term, 1, 3)
-        terminal_cost_layout.addWidget(QLabel('Control (u):'), 2, 0)
-        terminal_cost_layout.addWidget(self.w_u_term, 2, 1)
-        terminal_cost_layout.addWidget(QLabel('Ctrl Chg (du):'), 2, 2)
-        terminal_cost_layout.addWidget(self.w_du_term, 2, 3)
+        terminal_cost_layout.addWidget(QLabel('Yaw:'), 1, 2)
+        terminal_cost_layout.addWidget(self.w_yaw_term, 1, 3)
+        terminal_cost_layout.addWidget(QLabel('Ang Vel (w):'), 2, 0)
+        terminal_cost_layout.addWidget(self.w_w_term, 2, 1)
+        terminal_cost_layout.addWidget(QLabel('Control (u):'), 3, 0)
+        terminal_cost_layout.addWidget(self.w_u_term, 3, 1)
+        terminal_cost_layout.addWidget(QLabel('Ctrl Chg (du):'), 3, 2)
+        terminal_cost_layout.addWidget(self.w_du_term, 3, 3)
+        terminal_cost_layout.addWidget(QLabel('Terminal Scale:'), 4, 0)
+        self.terminal_scale_spin = QDoubleSpinBox()
+        self.terminal_scale_spin.setRange(1, 10000)
+        self.terminal_scale_spin.setValue(100.0)
+        self.terminal_scale_spin.setDecimals(0)
+        self.terminal_scale_spin.setMaximumHeight(25)
+        self.terminal_scale_spin.setMaximumWidth(100)
+        self.terminal_scale_spin.setToolTip('Scale up terminal cost weights for target achievement. Rule: >> N to dominate running cost. Acados recommends 100~1000')
+        terminal_cost_layout.addWidget(self.terminal_scale_spin, 4, 1)
+        self.terminal_constraint_checkbox = QCheckBox('Terminal position equality (p_N=p_g)')
+        self.terminal_constraint_checkbox.setChecked(False)
+        self.terminal_constraint_checkbox.setToolTip('Enforce exact terminal position. May cause infeasibility, use with caution')
+        terminal_cost_layout.addWidget(self.terminal_constraint_checkbox, 4, 2, 1, 2)
+        self.waypoint_terminal_checkbox = QCheckBox('Waypoint terminal cost (segment mode for multi-WP)')
+        self.waypoint_terminal_checkbox.setChecked(True)
+        self.waypoint_terminal_checkbox.setToolTip('Checked: terminal cost at each intermediate waypoint for arrival. Acados uses segment mode')
+        terminal_cost_layout.addWidget(self.waypoint_terminal_checkbox, 5, 0, 1, 4)
         
         terminal_cost_group.setLayout(terminal_cost_layout)
         
@@ -1100,27 +1201,36 @@ class MainWindow(QMainWindow):
         # Default parameters per method (state/control constraints equal across all methods)
         self.DEFAULT_PARAMS = {
             0: {  # Method 1: Custom calcDiff
-                "w_p": 1.0, "w_v": 0.2, "w_R": 0.5, "w_w": 0.1,
+                "w_p": 1.0, "w_v": 0.2, "w_R": 0.5, "w_yaw": 0.5, "w_w": 0.1,
                 "w_u": 0.5, "w_du": 0.5,
                 "k_bound": 200.0, "k_state_bound": 200.0,
                 "th_p_max": 10.0, "th_r_max": 10.0, "T_max": 25.0, "tau_yaw_max": 1.0,
                 "v_horizontal_max": 1.0, "v_vertical_max": 3.0,
                 "roll_max": 10.0, "pitch_max": 10.0, "yaw_max": 180.0, "w_max": 2.0,
             },
-            1: {  # Method 2: FDDP - higher w_R to suppress yaw drift (Pinocchio cost structure)
-                "w_p": 1.0, "w_v": 0.2, "w_R": 2.0, "w_w": 0.1,
+            1: {  # Method 2: FDDP - higher w_R and w_yaw to suppress yaw drift (Pinocchio cost structure)
+                "w_p": 1.0, "w_v": 0.2, "w_R": 2.0, "w_yaw": 2.0, "w_w": 0.1,
                 "w_u": 0.5, "w_du": 0.5,
                 "k_bound": 200.0, "k_state_bound": 200.0,
                 "th_p_max": 10.0, "th_r_max": 10.0, "T_max": 25.0, "tau_yaw_max": 1.0,
                 "v_horizontal_max": 1.0, "v_vertical_max": 3.0,
                 "roll_max": 10.0, "pitch_max": 10.0, "yaw_max": 30.0, "w_max": 2.0,
             },
-            2: {  # Method 3: BoxFDDP - higher w_R to suppress yaw drift
-                "w_p": 1.0, "w_v": 0.2, "w_R": 2.0, "w_w": 0.1,
+            2: {  # Method 3: BoxFDDP - higher w_R and w_yaw to suppress yaw drift
+                "w_p": 1.0, "w_v": 0.2, "w_R": 2.0, "w_yaw": 2.0, "w_w": 0.1,
                 "w_u": 0.5, "w_du": 0.5,
                 "k_bound": 200.0, "k_state_bound": 200.0,
                 "th_p_max": 10.0, "th_r_max": 10.0, "T_max": 25.0, "tau_yaw_max": 1.0,
                 "v_horizontal_max": 1.0, "v_vertical_max": 3.0,
+                "roll_max": 10.0, "pitch_max": 10.0, "yaw_max": 30.0, "w_max": 2.0,
+            },
+            3: {  # Method 4: Acados - native constraints
+                "w_p": 1.0, "w_v": 0.2, "w_R": 0.5, "w_yaw": 0.5, "w_w": 0.1,
+                "w_u": 0.5, "w_du": 0.5, "schedule_ref": True,
+                "terminal_scale": 100.0, "terminal_constraint": False, "waypoint_terminal_cost": True,
+                "k_bound": 200.0, "k_state_bound": 20.0,
+                "th_p_max": 10.0, "th_r_max": 10.0, "T_max": 25.0, "tau_yaw_max": 1.0,
+                "v_horizontal_max": 2.5, "v_vertical_max": 2.0,
                 "roll_max": 10.0, "pitch_max": 10.0, "yaw_max": 30.0, "w_max": 2.0,
             },
         }
@@ -1263,21 +1373,12 @@ class MainWindow(QMainWindow):
         return panel
     
     def quat_to_euler(self, q):
-        """Convert quaternion to Euler angles (ZYX order)"""
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        roll = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
-        pitch = np.arcsin(2*(w*y - z*x))
-        yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
-        return np.array([roll, pitch, yaw])
+        """Convert quaternion to Euler angles (ZYX order), q=[w,x,y,z]"""
+        return quat_to_euler(q, format='wxyz')
     
     def yaw_to_quaternion(self, yaw_deg):
-        """Convert yaw angle (in degrees) to quaternion [w, x, y, z]
-        Assumes roll=0, pitch=0, only yaw rotation
-        """
-        yaw_rad = np.radians(yaw_deg)
-        w = np.cos(yaw_rad / 2.0)
-        z = np.sin(yaw_rad / 2.0)
-        return np.array([w, 0.0, 0.0, z])
+        """Convert yaw angle (degrees) to quaternion [w, x, y, z], roll=0, pitch=0"""
+        return yaw_to_quaternion(yaw_deg)
     
     def _update_unified_checkbox_state(self, index):
         """Enable unified checkbox only for Method 2/3"""
@@ -1291,6 +1392,7 @@ class MainWindow(QMainWindow):
         self.w_p.setValue(params["w_p"])
         self.w_v.setValue(params["w_v"])
         self.w_R.setValue(params["w_R"])
+        self.w_yaw.setValue(params.get("w_yaw", params["w_R"]))
         self.w_w.setValue(params["w_w"])
         self.w_u.setValue(params["w_u"])
         self.w_du.setValue(params["w_du"])
@@ -1306,8 +1408,16 @@ class MainWindow(QMainWindow):
         self.pitch_max.setValue(params["pitch_max"])
         self.yaw_max.setValue(params["yaw_max"])
         self.w_max.setValue(params["w_max"])
-        method_names = ["Method 1 (Custom calcDiff)", "Method 2 (FDDP)", "Method 3 (BoxFDDP)"]
-        self.status_text.append(f"Parameters loaded for {method_names[index]}")
+        if "schedule_ref" in params:
+            self.schedule_ref_checkbox.setChecked(params["schedule_ref"])
+        if "terminal_scale" in params:
+            self.terminal_scale_spin.setValue(params["terminal_scale"])
+        if "terminal_constraint" in params:
+            self.terminal_constraint_checkbox.setChecked(params["terminal_constraint"])
+        if "waypoint_terminal_cost" in params:
+            self.waypoint_terminal_checkbox.setChecked(params["waypoint_terminal_cost"])
+        method_names = ["Method 1 (Custom calcDiff)", "Method 2 (FDDP)", "Method 3 (BoxFDDP)", "Method 4 (Acados)"]
+        self.status_text.append(f"Parameters loaded for {method_names[index] if index < len(method_names) else 'Unknown'}")
     
     def update_waypoint_list(self):
         """Update waypoint list display"""
@@ -1427,9 +1537,14 @@ class MainWindow(QMainWindow):
             "p": self.w_p.value(),
             "v": self.w_v.value(),
             "R": self.w_R.value(),
+            "yaw": self.w_yaw.value(),
             "w": self.w_w.value(),
             "u": self.w_u.value(),
-            "du": self.w_du.value()
+            "du": self.w_du.value(),
+            "schedule_ref": self.schedule_ref_checkbox.isChecked(),
+            "terminal_scale": self.terminal_scale_spin.value(),
+            "terminal_constraint": self.terminal_constraint_checkbox.isChecked(),
+            "waypoint_terminal_cost": self.waypoint_terminal_checkbox.isChecked()
         }
         
         # Terminal cost weights
@@ -1437,6 +1552,7 @@ class MainWindow(QMainWindow):
             "p": self.w_p_term.value(),
             "v": self.w_v_term.value(),
             "R": self.w_R_term.value(),
+            "yaw": self.w_yaw_term.value(),
             "w": self.w_w_term.value(),
             "u": self.w_u_term.value(),
             "du": self.w_du_term.value()
@@ -1459,7 +1575,8 @@ class MainWindow(QMainWindow):
             "state_pitch_max": np.radians(self.pitch_max.value()),
             "state_yaw_max": np.radians(self.yaw_max.value()),
             "state_w_max": self.w_max.value(),
-            "state_k_state_bound": self.k_state_bound.value()  # State constraint penalty coefficient
+            "state_k_state_bound": self.k_state_bound.value(),  # State constraint penalty coefficient
+            "state_constraint_lxx_scale": 0.0,  # 0=Method1 style (recommended), state constraint not in Lxx
         }
         
         # Physical parameters - from GUI settings
@@ -1558,6 +1675,9 @@ class MainWindow(QMainWindow):
         
         # Start optimization
         self.status_text.append('Starting optimization...')
+        if (params.get('method') == 3 and len(params.get('waypoints', [])) > 2 and
+                params.get('unified') and params.get('weights', {}).get('waypoint_terminal_cost', True)):
+            self.status_text.append('(Multi-WP + waypoint terminal cost: using segment mode)')
         self.opt_thread.start()
     
     def stop_optimization(self):
@@ -1661,13 +1781,32 @@ class MainWindow(QMainWindow):
         # Get waypoints for plotting
         waypoints = self.waypoints if hasattr(self, 'waypoints') else None
         
-        # 1. 3D position trajectory
+        # 1. 3D position trajectory (per-segment coloring for multi-segment)
         self.ax_3d.clear()
-        self.ax_3d.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
-                        'b-', linewidth=2, label='Trajectory')
-        self.ax_3d.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
+        boundaries = [min(b, len(positions) - 1) for b in segment_boundaries_from_waypoints(waypoints or [], dt)]
+        if boundaries:
+            idx = 0
+            for i, end_idx in enumerate(boundaries):
+                if idx <= end_idx:
+                    seg_pos = positions[idx:end_idx + 1]
+                    c = SEGMENT_COLORS[i % len(SEGMENT_COLORS)]
+                    self.ax_3d.plot(seg_pos[:, 0], seg_pos[:, 1], seg_pos[:, 2],
+                                    color=c, linewidth=2.5, label=f'Segment {i + 1}')
+                    if idx < end_idx:
+                        self.ax_3d.scatter(seg_pos[-1, 0], seg_pos[-1, 1], seg_pos[-1, 2],
+                                           color=c, s=60, marker='o', edgecolors='black', linewidths=1, zorder=5)
+                idx = end_idx
+            if idx < len(positions) - 1:
+                seg_pos = positions[idx:]
+                c = SEGMENT_COLORS[len(boundaries) % len(SEGMENT_COLORS)]
+                self.ax_3d.plot(seg_pos[:, 0], seg_pos[:, 1], seg_pos[:, 2],
+                                color=c, linewidth=2.5, label=f'Segment {len(boundaries) + 1}')
+        else:
+            self.ax_3d.plot(positions[:, 0], positions[:, 1], positions[:, 2],
+                         'b-', linewidth=2, label='Trajectory')
+        self.ax_3d.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
                           color='green', s=100, marker='o', label='Start')
-        self.ax_3d.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
+        self.ax_3d.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2],
                           color='red', s=100, marker='*', label='End')
         # Plot waypoints with smaller markers and numbered labels
         if waypoints is not None and len(waypoints) > 0:

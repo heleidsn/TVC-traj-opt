@@ -21,61 +21,10 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.gridspec import GridSpec
 import crocoddyl
 
-# -------- quaternion utils --------
-def quat_mul(q1, q2):
-    # q = [w,x,y,z]
-    w1,x1,y1,z1 = q1
-    w2,x2,y2,z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2
-    ])
-
-def quat_conj(q):
-    w,x,y,z = q
-    return np.array([w,-x,-y,-z])
-
-def quat_norm(q):
-    return q / np.linalg.norm(q)
-
-def quat_exp(dtheta):
-    # exp map from so(3) to quaternion, dtheta is 3-vector
-    a = np.linalg.norm(dtheta)
-    if a < 1e-12:
-        return np.array([1.0, 0.5*dtheta[0], 0.5*dtheta[1], 0.5*dtheta[2]])
-    axis = dtheta / a
-    s = np.sin(0.5*a)
-    return np.array([np.cos(0.5*a), axis[0]*s, axis[1]*s, axis[2]*s])
-
-def so3_log_from_quat(q):
-    # q must be unit, returns rotation vector
-    q = quat_norm(q)
-    w, v = q[0], q[1:]
-    nv = np.linalg.norm(v)
-    w = np.clip(w, -1.0, 1.0)
-    if nv < 1e-12:
-        return np.zeros(3)
-    angle = 2.0*np.arctan2(nv, w)
-    return angle * (v / nv)
-
-def R_from_quat(q):
-    # q=[w,x,y,z]
-    w,x,y,z = q
-    return np.array([
-        [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
-    ])
-
-def Rx(a):
-    ca, sa = np.cos(a), np.sin(a)
-    return np.array([[1,0,0],[0,ca,-sa],[0,sa,ca]])
-
-def Ry(a):
-    ca, sa = np.cos(a), np.sin(a)
-    return np.array([[ca,0,sa],[0,1,0],[-sa,0,ca]])
+from tvc_common import (
+    quat_mul, quat_conj, quat_norm, quat_exp, so3_log_from_quat, R_from_quat,
+    Rx, Ry, quat_to_euler, segment_boundaries_from_waypoints, SEGMENT_COLORS,
+)
 
 # -------- Crocoddyl Action Model --------
 class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
@@ -192,9 +141,16 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         x_next[13:17] = u                      # u_prev <- u
         return x_next
 
-    def _bound_pen(self, val, lb, ub, k):
-        if val < lb: return k*(lb - val)**2
-        if val > ub: return k*(val - ub)**2
+    def _bound_pen(self, val, lb, ub, k, alpha=5.0):
+        """Smooth boundary penalty (C∞) using soft-plus² for optimization stability"""
+        if val < lb:
+            z = lb - val
+            sp = np.logaddexp(0, alpha * z) / alpha
+            return k * sp * sp
+        if val > ub:
+            z = val - ub
+            sp = np.logaddexp(0, alpha * z) / alpha
+            return k * sp * sp
         return 0.0
     
     def _quat_to_euler(self, q):
@@ -246,7 +202,8 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         # State constraints
         kSB = self.state_b["k_state_bound"]
         # Velocity constraints (horizontal and vertical)
-        v_horizontal = np.sqrt(v[0]**2 + v[1]**2)  # Horizontal velocity magnitude
+        _eps_vh = 1e-8
+        v_horizontal = np.sqrt(v[0]**2 + v[1]**2 + _eps_vh**2)  # Smooth, no singularity at origin
         v_vertical = abs(v[2])  # Vertical velocity magnitude
         cost += self._bound_pen(v_horizontal, 0.0, self.state_b["v_horizontal_max"], kSB)
         cost += self._bound_pen(v_vertical, 0.0, self.state_b["v_vertical_max"], kSB)
@@ -486,7 +443,7 @@ def solve_once(dt=0.02, N=100, max_iter=100):
 
 # xs, us = solve_once()
 
-def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
+def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None, segment_boundaries=None):
     """
     Plot trajectory optimization results - all states, controls and cost on one page
     
@@ -496,7 +453,8 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
         dt: Time step
         logger: Callback logger (optional, for plotting convergence curve)
         x_goal: Target state (optional)
-        waypoints: List of waypoint positions (optional, for plotting waypoints)
+        waypoints: List of waypoint positions (optional). If [x,y,z,yaw,time], segments are colored.
+        segment_boundaries: Optional [end_idx_seg1, end_idx_seg2, ...] to override segment coloring.
     """
     # Convert to numpy arrays
     xs_array = np.array(xs)
@@ -518,16 +476,8 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
     T = us_array[:, 2]     # thrust
     tau_yaw = us_array[:, 3]  # yaw torque
     
-    # Convert quaternion to Euler angles (for display)
-    def quat_to_euler(q):
-        """Convert quaternion to Euler angles (ZYX order)"""
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        roll = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
-        pitch = np.arcsin(2*(w*y - z*x))
-        yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
-        return np.array([roll, pitch, yaw])
-    
-    euler_angles = np.array([quat_to_euler(q) for q in quaternions])
+    # Convert quaternion to Euler angles (for display), Method 1 uses wxyz
+    euler_angles = np.array([quat_to_euler(q, format='wxyz') for q in quaternions])
     
     # Create figure - use GridSpec for flexible layout, all content on one page
     # Layout: 4 rows x 4 columns, 16 subplot positions
@@ -539,10 +489,31 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
     # First row: 3D trajectory and convergence curve
     # 1. 3D position trajectory (occupies 2 positions)
     ax1 = fig.add_subplot(gs[0, 0:2], projection='3d')
-    ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Trajectory')
-    ax1.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
+    boundaries = segment_boundaries if segment_boundaries is not None else (
+        segment_boundaries_from_waypoints(waypoints, dt) if waypoints else [])
+    if boundaries:
+        idx = 0
+        for i, end_idx in enumerate(boundaries):
+            end_idx = min(end_idx, len(positions) - 1)
+            if idx <= end_idx:
+                seg_pos = positions[idx:end_idx + 1]
+                c = SEGMENT_COLORS[i % len(SEGMENT_COLORS)]
+                ax1.plot(seg_pos[:, 0], seg_pos[:, 1], seg_pos[:, 2],
+                         color=c, linewidth=2.5, label=f'Segment {i + 1}')
+                if idx < end_idx:
+                    ax1.scatter(seg_pos[-1, 0], seg_pos[-1, 1], seg_pos[-1, 2],
+                                color=c, s=60, marker='o', edgecolors='black', linewidths=1, zorder=5)
+            idx = end_idx
+        if idx < len(positions) - 1:
+            seg_pos = positions[idx:]
+            c = SEGMENT_COLORS[len(boundaries) % len(SEGMENT_COLORS)]
+            ax1.plot(seg_pos[:, 0], seg_pos[:, 1], seg_pos[:, 2],
+                     color=c, linewidth=2.5, label=f'Segment {len(boundaries) + 1}')
+    else:
+        ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Trajectory')
+    ax1.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
                 color='green', s=100, marker='o', label='Start')
-    ax1.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
+    ax1.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2],
                 color='red', s=100, marker='*', label='End')
     
     # Collect all points for unified scaling

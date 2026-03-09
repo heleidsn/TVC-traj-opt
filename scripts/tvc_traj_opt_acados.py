@@ -239,7 +239,8 @@ def waypoint_to_acados_state(wp, uref=None):
 
 
 def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_weights=None,
-                     code_export_dir=None, json_file=None, nlp_solver_max_iter=100, qp_solver=None):
+                     code_export_dir=None, json_file=None, nlp_solver_max_iter=100, qp_solver=None,
+                     verbose_solve=False):
     """Build Acados OCP for one segment"""
     ocp = AcadosOcp()
     ocp.model = model
@@ -265,15 +266,18 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
     w_p = weights.get("p", 1.0)
     w_v = weights.get("v", 0.2)
     w_R = weights.get("R", 0.5)
+    w_roll = weights.get("roll", w_R)   # phi
+    w_pitch = weights.get("pitch", w_R) # theta
+    w_yaw = weights.get("yaw", w_R)     # psi
     w_w = weights.get("w", 0.1)  # angular velocity
     w_u = weights.get("u", 1e-3)
-    w_du = weights.get("du", 0.0)  # control rate penalty; 0=关闭, >0=启用
+    w_du = weights.get("du", 0.0)  # control rate penalty; 0=disabled, >0=enabled
     
     Q = np.diag([
-        w_p, w_p, w_p,           # position
-        w_R, w_R, w_R,           # euler
-        w_v, w_v, w_v,           # velocity
-        w_w, w_w, w_w            # angular velocity
+        w_p, w_p, w_p,                    # position
+        w_roll, w_pitch, w_yaw,           # euler: phi, theta, psi
+        w_v, w_v, w_v,                    # velocity
+        w_w, w_w, w_w                     # angular velocity
     ])
     R_mat = w_u * np.eye(nu)
     
@@ -301,16 +305,32 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
         ocp.cost.W = np.block([[Q, np.zeros((nx, nu))], [np.zeros((nu, nx)), R_mat]])
     
     tw = terminal_weights or weights
+    tw_R = tw.get("R", 200)
+    tw_roll = tw.get("roll", tw_R)
+    tw_pitch = tw.get("pitch", tw_R)
+    tw_yaw = tw.get("yaw", tw_R)
+    # terminal_scale: scale up terminal weights so terminal cost dominates N-step running cost
+    # Rule of thumb: w_term >> N*w_run, else optimizer trades off and terminal error remains
+    terminal_scale = weights.get("terminal_scale", 1.0)
     Qe = np.diag([
-        tw.get("p", 200), tw.get("p", 200), tw.get("p", 200),
-        tw.get("R", 200), tw.get("R", 200), tw.get("R", 200),
-        tw.get("v", 50), tw.get("v", 50), tw.get("v", 50),
+        tw.get("p", 200) * terminal_scale, tw.get("p", 200) * terminal_scale, tw.get("p", 200) * terminal_scale,
+        tw_roll, tw_pitch, tw_yaw,
+        tw.get("v", 50) * terminal_scale, tw.get("v", 50) * terminal_scale, tw.get("v", 50) * terminal_scale,
         tw.get("w", 20), tw.get("w", 20), tw.get("w", 20)
     ])
     ocp.cost.cost_type_e = 'NONLINEAR_LS'
     ocp.cost.yref_e = np.asarray(xg).flatten()[:12]
     ocp.model.cost_y_expr_e = model.x[:12]  # terminal cost only on physical state
     ocp.cost.W_e = Qe
+    
+    # terminal_constraint: equality constraint p_N = p_g (may cause infeasibility)
+    use_terminal_constraint = weights.get("terminal_constraint", False)
+    if use_terminal_constraint:
+        xg_arr = np.asarray(xg).flatten()[:12]
+        # position equality: p_N = p_g
+        ocp.model.con_h_expr_e = model.x[0:3] - ca.DM(xg_arr[0:3])
+        ocp.constraints.lh_e = np.zeros(3)
+        ocp.constraints.uh_e = np.zeros(3)
     
     # Control bounds
     b = bounds or {}
@@ -341,21 +361,21 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
     v_vertical = ca.fabs(vz)
     w_mag = ca.sqrt(wx**2 + wy**2 + wz**2 + 1e-12)
     
-    # 速度 + 欧拉角 + 角速度模长
+    # velocity + euler angles + angular velocity magnitude
     ocp.model.con_h_expr = ca.vertcat(
-        v_horizontal, v_vertical,      # 速度约束
-        phi, theta, psi,               # 欧拉角约束 |phi|<=roll_max 等
-        w_mag                          # 角速度模长 ||w||<=w_max
+        v_horizontal, v_vertical,      # velocity bounds
+        phi, theta, psi,               # euler bounds |phi|<=roll_max etc
+        w_mag                          # ||w||<=w_max
     )
     ocp.constraints.lh = np.array([
-        0.0, 0.0,                     # v_h, v_v 下界
-        -roll_max, -pitch_max, -yaw_max,  # phi, theta, psi 下界
-        0.0                           # w_mag 下界
+        0.0, 0.0,                     # v_h, v_v lower
+        -roll_max, -pitch_max, -yaw_max,  # phi, theta, psi lower
+        0.0                           # w_mag lower
     ])
     ocp.constraints.uh = np.array([
-        v_h_max, v_v_max,             # v_h, v_v 上界
-        roll_max, pitch_max, yaw_max, # phi, theta, psi 上界
-        w_max                         # w_mag 上界
+        v_h_max, v_v_max,             # v_h, v_v upper
+        roll_max, pitch_max, yaw_max, # phi, theta, psi upper
+        w_max                         # w_mag upper
     ])
     
     # x0: augment with u_prev=uref when using control rate
@@ -364,7 +384,7 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
         x0_arr = np.concatenate([x0_arr, np.asarray(uref).flatten()[:4]])
     ocp.constraints.x0 = x0_arr
     
-    # 当 model 有参数 p（control rate 用 1/dt）时，必须设置 parameter_values，否则 make_consistent 报错
+    # When model has param p (control rate 1/dt), must set parameter_values for make_consistent
     if use_control_rate:
         ocp.parameter_values = np.array([N / Tf], dtype=float)
     
@@ -372,15 +392,16 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
     ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
     ocp.solver_options.integrator_type = 'ERK'
     ocp.solver_options.nlp_solver_type = 'SQP'
-    ocp.solver_options.print_level = 1
+    ocp.solver_options.print_level = 2 if verbose_solve else 0  # 2: print cost during solve
+    ocp.solver_options.store_iterates = verbose_solve  # for cost convergence plot
     ocp.solver_options.nlp_solver_max_iter = int(nlp_solver_max_iter)
     
     return ocp
 
 
 def _clear_acados_module_cache(code_export_dir):
-    """清理 Acados 生成的 solver 模块缓存，避免第二段加载第一段错误维度的 solver"""
-    # 只删除 c_generated_code 下的模块，不删除 acados_template
+    """Clear Acados solver module cache to avoid segment 2 loading wrong solver from segment 1"""
+    # Only remove c_generated_code modules, not acados_template
     to_remove = [k for k in list(sys.modules.keys())
                  if ('c_generated_code' in k or 'tvc_seg' in k) and 'acados_template' not in k]
     for k in to_remove:
@@ -390,7 +411,7 @@ def _clear_acados_module_cache(code_export_dir):
 
 def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, max_iter=100,
                                 use_box_solver=False, callback=None, running_flag=None,
-                                terminal_weights=None, iteration_callback=None):
+                                terminal_weights=None, iteration_callback=None, verbose_solve=False):
     """
     Solve trajectory optimization with waypoints using Acados.
     
@@ -439,12 +460,12 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         N = max(10, int(duration / dt))
         Tf = duration
         
-        # 每段使用唯一目录和 model 名，避免 Acados 模块缓存导致下一段复用错误 solver (acados#905)
+        # Unique dir/model per segment to avoid Acados module cache reusing wrong solver (acados#905)
         code_export_dir = os.path.join(base_export, f"tvc_seg{seg_idx}_N{N}")
         json_file = f"tvc_rocket_seg{seg_idx}.json"
         model_name = f"tvc_rocket_seg{seg_idx}"
         
-        # 第二段及以后：清理模块缓存，增加 SQP 迭代数
+        # Segment 2+: clear module cache, increase SQP iterations
         if seg_idx > 0:
             _clear_acados_module_cache(code_export_dir)
             nlp_max_iter = max(200, max_iter * 2)
@@ -457,9 +478,10 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         model = export_tvc_ode_model(m, I, r_thrust, model_name=model_name, use_control_rate=use_control_rate)
         ocp = build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_weights,
                                code_export_dir=code_export_dir, json_file=json_file,
-                               nlp_solver_max_iter=nlp_max_iter, qp_solver=qp_solver)
+                               nlp_solver_max_iter=nlp_max_iter, qp_solver=qp_solver,
+                               verbose_solve=verbose_solve)
         
-        # 扩展 x0/xg 为 16 维（含 u_prev）用于 control rate 模型；x0 已为 16 维时（来自上一段）保持不变
+        # Extend x0/xg to 16-dim (with u_prev) for control rate model; keep x0 if already 16-dim from prev segment
         x0_arr = np.asarray(x0).flatten()
         xg_arr = np.asarray(xg).flatten()
         x0_seg = np.concatenate([x0_arr[:12], uref]) if use_control_rate and len(x0_arr) == 12 else x0_arr
@@ -486,13 +508,27 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         # Set initial state
         solver.set(0, "x", x0_seg)
         
-        # 设置 control rate 模型的参数 p（每步 1/dt）
+        # Set control rate model param p (1/dt per step)
         if use_control_rate:
             p_val = np.array([N / Tf])
             for i in range(N):
                 solver.set(i, "p", p_val)
         
-        # 设置轨迹初始猜测（线性插值 x0->xg）
+        # schedule_ref=True: time-scheduled ref for on-time arrival; False: constant goal ref (may arrive early)
+        use_schedule_ref = weights.get("schedule_ref", True)
+        if use_schedule_ref:
+            x0_12 = np.asarray(x0_seg).flatten()[:12]
+            xg_12 = np.asarray(xg_seg).flatten()[:12]
+            for i in range(N):
+                alpha = float(i) / N
+                x_ref = (1 - alpha) * x0_12 + alpha * xg_12
+                if use_control_rate:
+                    yref = np.concatenate([x_ref, uref, uref, np.zeros(4)])
+                else:
+                    yref = np.concatenate([x_ref, uref])
+                solver.set(i, "yref", yref)
+        
+        # Initial guess: linear interpolation x0->xg
         uref_arr = np.array(uref)
         for i in range(1, N + 1):
             alpha = float(i) / N
@@ -501,39 +537,57 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         for i in range(N):
             solver.set(i, "u", uref_arr)
         
-        # Acados 无逐迭代回调，在求解前发出 iter=0
+        # Acados has no per-iteration callback; emit iter=0 before solve
         if iteration_callback is not None:
             iteration_callback(0, 0.0, 0.0, seg_idx)
         
         status = solver.solve()
         if status != 0 and seg_idx > 0:
-            # ACADOS_MINSTEP(4) 常见于段2：QP 步长过小，但解通常仍可用
-            print(f"  [提示] 段{seg_idx+1} Acados status={status}，解可能为部分收敛（若轨迹合理可忽略）")
+            # ACADOS_MINSTEP(4) common in segment 2: QP step too small, but solution often still usable
+            print(f"  [Note] Segment {seg_idx+1} Acados status={status}, solution may be partial (ignore if trajectory OK)")
         
-        # 求解后发出最终迭代数和代价
+        # After solve: print iteration stats and final cost
         cost_val = solver.get_cost()
         try:
             sqp_iter = solver.get_stats("sqp_iter")
         except Exception:
             sqp_iter = 1
+        if verbose_solve:
+            solver.print_statistics()
+            print(f"  Segment {seg_idx+1} final: cost={cost_val:.6e}, SQP iter={sqp_iter}")
+            sys.stdout.flush()
         if iteration_callback is not None:
             iteration_callback(int(sqp_iter), float(cost_val), 0.0, seg_idx)
         
-        # Simple logger for GUI compatibility
+        # Extract cost from store_iterates for convergence plot
+        costs_list = []
+        if verbose_solve:
+            try:
+                for k in range(sqp_iter + 1):
+                    it = solver.get_iterate(k)
+                    solver.set_iterate(it)
+                    costs_list.append(float(solver.get_cost()))
+                solver.set_iterate(solver.get_iterate(-1))  # restore final solution
+            except Exception:
+                costs_list = [cost_val] if cost_val is not None else [0.0]
+        if not costs_list:
+            costs_list = [cost_val] if cost_val is not None else [0.0]
+        
+        # Simple logger for GUI compatibility (costs_list for convergence plot)
         class SimpleLogger:
-            def __init__(self, cost_val):
-                self.costs = [cost_val] if cost_val is not None else [0.0]
+            def __init__(self, costs):
+                self.costs = costs if isinstance(costs, (list, tuple)) else [costs] if costs is not None else [0.0]
         
-        all_loggers.append(SimpleLogger(cost_val))
+        all_loggers.append(SimpleLogger(costs_list))
         
-        # 提取解：失败时用初始猜测作为回退，确保每段都有完整轨迹
+        # Extract solution: on failure use initial guess as fallback for complete trajectory
         try:
             seg_xs = [acados_state_to_method1(np.array(solver.get(i, "x"), copy=True)) for i in range(N+1)]
             seg_us = [np.array(solver.get(i, "u"), copy=True) for i in range(N)]
             x0 = np.array(solver.get(N, "x"), copy=True)
         except Exception as e:
             if status != 0:
-                # 求解失败时用线性插值初始猜测构造 seg_xs
+                # On solver failure use linear interpolation guess for seg_xs
                 seg_xs = []
                 for i in range(N + 1):
                     alpha = float(i) / N
@@ -541,7 +595,7 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
                     seg_xs.append(acados_state_to_method1(np.array(x_ac, copy=True)))
                 seg_us = [np.array(uref_arr, copy=True) for _ in range(N)]
                 x0 = np.array(xg_seg, copy=True)
-                print(f"  [回退] 段{seg_idx+1} 使用初始猜测 (solver.get 异常: {e})")
+                print(f"  [Fallback] Segment {seg_idx+1} using initial guess (solver.get error: {e})")
             else:
                 raise
         
@@ -551,7 +605,7 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         all_xs.append(seg_xs)
         all_us.append(seg_us)
         
-        # 显式销毁 solver，避免 Acados 模块缓存导致下一段复用错误维度 (acados#905)
+        # Explicitly destroy solver to avoid Acados module cache reusing wrong dim (acados#905)
         del solver
         gc.collect()
     
@@ -571,10 +625,10 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
 
 def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, bounds, max_iter=100,
                                         use_box_solver=False, callback=None, running_flag=None,
-                                        terminal_weights=None, iteration_callback=None):
+                                        terminal_weights=None, iteration_callback=None, verbose_solve=False):
     """
     Solve with Acados using a single unified problem (all segments merged).
-    每段节点的 cost 目标为对应 waypoint，与 Pinocchio unified 一致，轨迹会经过中间点。
+    Each segment node cost targets corresponding waypoint (same as Pinocchio unified); trajectory passes through intermediate points.
     """
     if not ACADOS_AVAILABLE:
         raise ImportError("Acados not available.")
@@ -590,7 +644,7 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
             raise ValueError(f"Waypoint {i+1} time must be greater than waypoint {i} time")
         durations.append(d)
     
-    # 每段节点数（与 Pinocchio unified 一致）
+    # Nodes per segment (same as Pinocchio unified)
     N_per_seg = [max(10, int(d / dt)) for d in durations]
     N_total = sum(N_per_seg)
     Tf_total = sum(durations)
@@ -599,10 +653,11 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
     xg = waypoint_to_acados_state(waypoints[-1])
     uref = np.array([0.0, 0.0, m*9.81, 0.0])
     
-    # unified 模式需更强 waypoint 跟踪，提高 position 权重
+    # Unified mode needs stronger waypoint tracking (higher position weight)
     use_control_rate = weights.get("du", 0.0) > 0
     model = export_tvc_ode_model(m, I, r_thrust, use_control_rate=use_control_rate)
-    ocp = build_acados_ocp(model, N_total, Tf_total, x0, xg, uref, weights, bounds, dt, terminal_weights)
+    ocp = build_acados_ocp(model, N_total, Tf_total, x0, xg, uref, weights, bounds, dt, terminal_weights,
+                           verbose_solve=verbose_solve)
     
     x0_seg = np.concatenate([np.asarray(x0).flatten()[:12], uref]) if use_control_rate else np.asarray(x0).flatten()
     
@@ -613,13 +668,14 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
     
     solver.set(0, "x", x0_seg)
     
-    # 设置 control rate 模型的参数 p
+    # Set control rate model param p
     if use_control_rate:
         p_val = np.array([N_total / Tf_total])
         for i in range(N_total):
             solver.set(i, "p", p_val)
     
-    # 每段节点使用对应 waypoint 作为 cost 目标，使轨迹经过中间点
+    # schedule_ref=True: time-interpolated ref for on-time arrival; False: constant goal ref (may arrive early)
+    use_schedule_ref = weights.get("schedule_ref", True)
     node_idx = 0
     n_boundary = 8
     for seg_idx in range(len(durations)):
@@ -629,12 +685,16 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
         x_ref_prev = waypoint_to_acados_state(wp_prev)[:12]
         n_seg = N_per_seg[seg_idx]
         for k in range(n_seg):
-            if seg_idx > 0 and k < n_boundary:
-                x_ref = x_ref_prev
-            elif k >= n_seg - n_boundary:
-                x_ref = x_ref_this
+            if use_schedule_ref:
+                alpha = k / max(1, n_seg - 1) if n_seg > 1 else 1.0
+                x_ref = (1 - alpha) * x_ref_prev + alpha * x_ref_this
             else:
-                x_ref = x_ref_this
+                if seg_idx > 0 and k < n_boundary:
+                    x_ref = x_ref_prev
+                elif k >= n_seg - n_boundary:
+                    x_ref = x_ref_this
+                else:
+                    x_ref = x_ref_this
             if use_control_rate:
                 yref = np.concatenate([x_ref, uref, uref, np.zeros(4)])  # 24 dim
             else:
@@ -642,7 +702,7 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
             solver.set(node_idx, "yref", yref)
             node_idx += 1
     
-    # 初始猜测：按段线性插值 wp_i -> wp_{i+1}
+    # Initial guess: linear interpolation wp_i -> wp_{i+1} per segment
     x_prev = x0_seg.copy()
     for seg_idx in range(len(durations)):
         end_wp = waypoints[seg_idx + 1]
@@ -668,14 +728,32 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
         sqp_iter = solver.get_stats("sqp_iter")
     except Exception:
         sqp_iter = 1
+    if verbose_solve:
+        solver.print_statistics()
+        print(f"  Final: cost={cost_val:.6e}, SQP iter={sqp_iter}")
+        sys.stdout.flush()
     if iteration_callback is not None:
         iteration_callback(int(sqp_iter), float(cost_val), 0.0, 0)
     
-    class SimpleLogger:
-        def __init__(self, c):
-            self.costs = [c] if c is not None else [0.0]
+    # Extract cost from store_iterates for convergence plot
+    costs_list = []
+    if verbose_solve:
+        try:
+            for k in range(sqp_iter + 1):
+                it = solver.get_iterate(k)
+                solver.set_iterate(it)
+                costs_list.append(float(solver.get_cost()))
+            solver.set_iterate(solver.get_iterate(-1))  # restore final solution
+        except Exception:
+            costs_list = [cost_val] if cost_val is not None else [0.0]
+    if not costs_list:
+        costs_list = [cost_val] if cost_val is not None else [0.0]
     
-    all_loggers = [SimpleLogger(cost_val)]
+    class SimpleLogger:
+        def __init__(self, costs):
+            self.costs = costs if isinstance(costs, (list, tuple)) else [costs] if costs is not None else [0.0]
+    
+    all_loggers = [SimpleLogger(costs_list)]
     
     combined_xs = [acados_state_to_method1(solver.get(i, "x")) for i in range(N_total+1)]
     combined_us = [np.array(solver.get(i, "u")) for i in range(N_total)]
@@ -686,68 +764,88 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
     return combined_xs, combined_us, all_loggers
 
 
-def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=False):
+def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=False, verbose_solve=True,
+                        waypoint_terminal_cost=True):
     """
-    简单测试：2 个或更多 waypoints 的轨迹优化。
-    支持：开始时间不为 0、单段（2 waypoints）、多段（3+ waypoints）。
-    unified=True 时用单次 OCP 求解全轨迹，可避免分段模式段2 的 ACADOS_MINSTEP。
-    use_control_rate_smooth=True 时增加控制变化率惩罚，使 u 更平滑；False 保持原样。
-    Waypoint 格式: [x, y, z, yaw_deg, time]
+    Simple test: trajectory optimization with 2+ waypoints.
+    Supports: non-zero start time, single segment (2 waypoints), multi-segment (3+ waypoints).
+    unified=True: single OCP for full trajectory, avoids ACADOS_MINSTEP in segment 2.
+    use_control_rate_smooth=True: add control rate penalty for smoother u; False: keep default.
+    Waypoint format: [x, y, z, yaw_deg, time]
     """
     dt = 0.05
-    # 示例：2 waypoints 单段，从 t=3s 开始
+    # Example: 3 waypoints, 2 segments
     waypoints = [
-        [0.0, 0.0, 0.0, 0.0, 0.0],   # 起点
-        [2.0, 0.0, 3.0, 0.0, 10.0],   # 中间点
-        # [4.0, 0.0, 5.0, 0.0, 10.0],  # 终点
+        [0.0, 0.0, 0.0, 0.0, 0.0],   # start
+        [2.0, 1.0, 3.0, 0.0, 5.0],   # intermediate
+        [4.0, 0.0, 1.0, 0.0, 10.0],  # end
     ]
     m = 0.6
     I = np.diag([0.02, 0.02, 0.01])
     r_thrust = np.array([0, 0, -0.2])
-    # 两种模式: du=0 保持原样无控制率惩罚; du>0 增加控制变化率惩罚使 u 更平滑
-    weights = {"p": 1.0, "v": 0.2, "R": 0.5, "w": 0.1, "u": 1.0}
+    # du=0: no control rate penalty; du>0: add control rate penalty for smoother u
+    weights = {"p": 1.0, "v": 0.2, "R": 1.0, 'yaw': 50.0, "w": 0.1, "u": 1.0}
     if use_control_rate_smooth:
         weights["du"] = 100.0
+    # Terminal cost: ensure target achievement
+    weights["schedule_ref"] = True
+    weights["terminal_scale"] = 100.0
+    weights["terminal_constraint"] = False
+    weights["waypoint_terminal_cost"] = waypoint_terminal_cost  # True: use segment mode for multi-WP, terminal cost at intermediate points
+    terminal_weights = {"p": 200.0, "v": 50.0, "R": 200.0, "yaw": 200.0, "w": 20.0}
     bounds = {
-        "th_p": (-0.35, 0.35), "th_r": (-0.35, 0.35),
+        "th_p": (-0.15, 0.15), "th_r": (-0.15, 0.15),
         "T": (0.0, 25.0), "tau_yaw": (-1.0, 1.0),
         "state_v_horizontal_max": 1.0, "state_v_vertical_max": 1.5,
-        "state_roll_max": np.radians(10.0), "state_pitch_max": np.radians(5.0),
+        "state_roll_max": np.radians(5.0), "state_pitch_max": np.radians(5.0),
         "state_yaw_max": np.radians(30.0),
     }
 
     if len(waypoints) < 2:
-        raise ValueError("至少需要 2 个 waypoints (起点和终点)")
+        raise ValueError("Need at least 2 waypoints (start and end)")
     n_seg = len(waypoints) - 1
     print("=" * 50)
-    print(f"Acados 轨迹优化测试 ({len(waypoints)} waypoints, {n_seg} 段)")
+    print(f"Acados trajectory optimization test ({len(waypoints)} waypoints, {n_seg} segments)")
     print("=" * 50)
     for i, wp in enumerate(waypoints):
         t = wp[4] if len(wp) >= 5 else 0.0
         print(f"WP{i}: {wp[:3]} (t={t}s)")
     if len(waypoints) >= 2:
         seg_info = [f"{waypoints[i+1][4]-waypoints[i][4]:.1f}s" for i in range(n_seg)]
-        print(f"dt={dt}s, 各段时长: {seg_info}")
-    if unified:
-        print("模式: unified (单次 OCP)")
+        print(f"dt={dt}s, segment durations: {seg_info}")
+    # When multi-WP and waypoint_terminal_cost: use segment mode for terminal cost at intermediate points
+    use_segment_for_waypoints = (
+        len(waypoints) > 2 and unified and weights.get("waypoint_terminal_cost", True)
+    )
+    if use_segment_for_waypoints:
+        unified = False
+        print("Mode: segment (multi-WP + waypoint terminal cost)")
+    elif unified:
+        print("Mode: unified (single OCP)")
     else:
-        print("模式: 分段 (每段独立 OCP)")
-    print(f"控制率惩罚: {'开启 du=' + str(weights.get('du', 0)) if use_control_rate_smooth else '关闭 (原样)'}")
+        print("Mode: segment (per-segment OCP)")
+    print(f"Control rate penalty: {'enabled du=' + str(weights.get('du', 0)) if use_control_rate_smooth else 'disabled'}")
+    print(f"Ref mode: {'on-time arrival (schedule_ref)' if weights.get('schedule_ref', True) else 'constant goal (may arrive early)'}")
+    print(f"Terminal cost: terminal_weights={terminal_weights}")
+    print(f"Terminal scale: terminal_scale={weights.get('terminal_scale', 1)}, terminal_constraint={weights.get('terminal_constraint', False)}")
+    if verbose_solve:
+        print("Iteration output: enabled (use python -u to avoid output buffering)")
     print("-" * 50)
 
     solver_fn = solve_with_acados_waypoints_unified if unified else solve_with_acados_waypoints
     xs, us, loggers = solver_fn(
         dt=dt, waypoints=waypoints, m=m, I=I, r_thrust=r_thrust,
-        weights=weights, bounds=bounds
+        weights=weights, bounds=bounds, terminal_weights=terminal_weights,
+        verbose_solve=verbose_solve
     )
 
-    print(f"求解完成: {len(xs)} 个状态点, {len(us)} 个控制, {len(loggers)} 段")
-    print(f"起点位置: {xs[0][:3]}")
+    print(f"Solve done: {len(xs)} state points, {len(us)} controls, {len(loggers)} segments")
+    print(f"Start position: {xs[0][:3]}")
     end_wp = waypoints[-1]
-    print(f"终点位置: {xs[-1][:3]} (目标: {end_wp[:3]})")
+    print(f"End position: {xs[-1][:3]} (target: {end_wp[:3]})")
     err_end = np.linalg.norm(np.array(xs[-1][:3]) - np.array(end_wp[:3]))
-    print(f"  与终点误差: {err_end:.4f}m")
-    # 多段时验证中间 waypoint
+    print(f"  End error: {err_end:.4f}m")
+    # Verify intermediate waypoints for multi-segment
     if len(waypoints) >= 3:
         dt = 0.05
         t0 = waypoints[0][4] if len(waypoints[0]) >= 5 else 0.0
@@ -756,10 +854,10 @@ def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=
             if idx < len(xs):
                 at_wp = xs[idx][:3]
                 err = np.linalg.norm(np.array(at_wp) - np.array(waypoints[i][:3]))
-                print(f"  WP{i} 处: {at_wp} | 误差: {err:.4f}m")
+                print(f"  WP{i} at: {at_wp} | error: {err:.4f}m")
     for i, lg in enumerate(loggers):
         if lg and lg.costs:
-            print(f"  段{i+1} 代价: {lg.costs[0]:.6e}")
+            print(f"  Segment {i+1} cost: {lg.costs[0]:.6e}")
     print("=" * 50)
 
     if show_plot:
@@ -768,17 +866,17 @@ def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=
 
 
 def _plot_result(xs, us, waypoints, dt, loggers):
-    """绘制轨迹结果"""
+    """Plot trajectory result"""
     import matplotlib.pyplot as plt
     _script_dir = Path(__file__).resolve().parent
     if str(_script_dir) not in os.environ.get("PYTHONPATH", "").split(os.pathsep):
         import sys
         if _script_dir not in sys.path:
             sys.path.insert(0, str(_script_dir))
-    # 显式计算段边界，确保按段分色
+    # Compute segment boundaries for per-segment coloring
     boundaries = [min(b, len(xs) - 1) for b in segment_boundaries_from_waypoints(waypoints, dt)]
     if boundaries:
-        print(f"  段边界索引: {boundaries} (共 {len(boundaries)} 段)")
+        print(f"  Segment boundary indices: {boundaries} ({len(boundaries)} segments)")
     wp_list = waypoints if waypoints and all(len(wp) >= 5 for wp in waypoints) else [[wp[0], wp[1], wp[2], 0.0, i * dt] for i, wp in enumerate(waypoints)]
 
     try:
@@ -829,10 +927,19 @@ if __name__ == "__main__":
         exit(1)
 
     import argparse
-    parser = argparse.ArgumentParser(description="TVC Acados 轨迹优化测试")
-    parser.add_argument("--no-plot", action="store_true", help="不显示图形")
-    parser.add_argument("--unified", action="store_true", help="使用 unified 模式（单次 OCP，可避免段2 ACADOS_MINSTEP）")
-    parser.add_argument("--smooth", action="store_true", help="增加控制变化率惩罚，使 u 更平滑")
+    parser = argparse.ArgumentParser(description="TVC Acados trajectory optimization test")
+    parser.add_argument("--no-plot", action="store_true", help="Do not show plot")
+    parser.add_argument("--unified", action="store_true", help="Use unified mode (single OCP)")
+    parser.add_argument("--no-waypoint-terminal", action="store_true",
+                        help="Do not enforce waypoint terminal cost. With --unified keeps unified; else multi-WP uses segment mode")
+    parser.add_argument("--smooth", action="store_true", help="Add control rate penalty for smoother u")
+    parser.add_argument("--quiet", action="store_true", help="Do not print SQP iteration stats and cost")
     args = parser.parse_args()
 
-    test_three_waypoints(show_plot=not args.no_plot, unified=True, use_control_rate_smooth=args.smooth)
+    test_three_waypoints(
+        show_plot=not args.no_plot,
+        unified=args.unified,
+        use_control_rate_smooth=args.smooth,
+        verbose_solve=not args.quiet,
+        waypoint_terminal_cost=not args.no_waypoint_terminal,
+    )

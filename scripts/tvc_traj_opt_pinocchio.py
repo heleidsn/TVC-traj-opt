@@ -26,119 +26,104 @@ import pinocchio as pin
 from pathlib import Path
 import time
 
-# Import plotting function and quaternion utilities from method 1
+# Import from tvc_common and tvc_traj_opt
+from tvc_common import quat_mul, quat_to_euler_deg, Rx, Ry
+
 try:
-    from tvc_traj_opt import plot_trajectory, quat_mul
+    from tvc_traj_opt import plot_trajectory
 except ImportError:
-    # If running as module, try relative import
     try:
-        from .tvc_traj_opt import plot_trajectory, quat_mul
+        from .tvc_traj_opt import plot_trajectory
     except ImportError:
-        # Define quat_mul locally if import fails
-        def quat_mul(q1, q2):
-            """Quaternion multiplication"""
-            w1, x1, y1, z1 = q1[3], q1[0], q1[1], q1[2]
-            w2, x2, y2, z2 = q2[3], q2[0], q2[1], q2[2]
-            return np.array([
-                w1*x2 + x1*w2 + y1*z2 - z1*y2,
-                w1*y2 - x1*z2 + y1*w2 + z1*x2,
-                w1*z2 + x1*y2 - y1*x2 + z1*w2,
-                w1*w2 - x1*x2 - y1*y2 - z1*z2
-            ])
-        plot_trajectory = None  # Will be None if not available
+        plot_trajectory = None
 
 
-def plot_debug(xs, us, dt, logger=None, title="TVC Trajectory Debug", save_path=None):
+def plot_debug(xs, us, dt, logger=None, title="TVC Trajectory Debug", save_path=None, waypoints=None):
     """
-    Quick debug plot for trajectory - supports both Pinocchio (13-dim) and Method 1 (17-dim) formats.
+    Plot trajectory using the same plot_trajectory as GUI (from tvc_traj_opt).
+    Supports both Pinocchio (13-dim) and Method 1 (17-dim) formats - converts to Method 1 for plotting.
     
     Args:
         xs: State trajectory (list or array)
         us: Control trajectory (list or array)
         dt: Time step
         logger: CallbackLogger (optional, for cost convergence)
-        title: Figure title
+        title: Figure title (used when plot_trajectory unavailable)
         save_path: If set, save figure to file instead of showing
+        waypoints: List of waypoints [x,y,z,...] for 3D plot (optional)
     """
+    if plot_trajectory is not None:
+        # Use GUI's plot_trajectory - requires Method 1 format (17-dim)
+        xs_m1 = [convert_pinocchio_state_to_method1(x) if len(np.asarray(x).flatten()) == 13 else x for x in xs]
+        fig = plot_trajectory(xs_m1, us, dt, logger=logger, x_goal=None, waypoints=waypoints)
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"Saved plot to {save_path}")
+        else:
+            plt.show()
+        return
+    
+    # Fallback: simple plot when tvc_traj_opt not available
     xs_arr = np.array([np.asarray(x).flatten() for x in xs])
     us_arr = np.array([np.asarray(u).flatten() for u in us])
     if us_arr.ndim == 1:
         us_arr = us_arr.reshape(-1, 4)
     t = np.arange(len(xs)) * dt
     t_u = np.arange(len(us)) * dt
-    
-    # Extract position/velocity: Pinocchio [q(7),v(6)] vs Method1 [p(3),v(3),q(4),w(3),...]
     n = xs_arr.shape[1]
     if n >= 13:
-        pos = xs_arr[:, 0:3]  # x,y,z same in both
-        if n >= 17:  # Method 1: v at 3:6
+        pos = xs_arr[:, 0:3]
+        if n >= 17:
             vel = xs_arr[:, 3:6]
-        else:  # Pinocchio: v at 7:10
+            quat = xs_arr[:, 6:10]
+            angvel = xs_arr[:, 10:13]
+        else:
             vel = xs_arr[:, 7:10]
+            quat = xs_arr[:, 3:7]
+            angvel = xs_arr[:, 10:13]
     else:
-        pos = xs_arr[:, :3]
-        vel = np.zeros((len(xs), 3))
-    
-    # Controls
+        pos, vel = xs_arr[:, :3], np.zeros((len(xs), 3))
+        quat = np.tile([0, 0, 0, 1], (len(xs), 1))
+        angvel = np.zeros((len(xs), 3))
+    quat_format = 'wxyz' if n >= 17 else 'xyzw'
+    euler_deg = np.array([quat_to_euler_deg(quat[i], quat_format) for i in range(len(xs))])
     th_p = us_arr[:, 0] if us_arr.shape[1] >= 1 else np.zeros(len(us))
     th_r = us_arr[:, 1] if us_arr.shape[1] >= 2 else np.zeros(len(us))
     T = us_arr[:, 2] if us_arr.shape[1] >= 3 else np.zeros(len(us))
     tau_yaw = us_arr[:, 3] if us_arr.shape[1] >= 4 else np.zeros(len(us))
-    
-    fig = plt.figure(figsize=(12, 8))
+    fig = plt.figure(figsize=(14, 8))
     fig.suptitle(title, fontsize=12)
-    
-    # 1. 3D trajectory
-    ax1 = fig.add_subplot(2, 3, 1, projection='3d')
+    ax1 = fig.add_subplot(2, 4, 1, projection='3d')
     ax1.plot(pos[:, 0], pos[:, 1], pos[:, 2], 'b-', lw=1.5)
     ax1.scatter(pos[0, 0], pos[0, 1], pos[0, 2], c='g', s=50, marker='o', label='Start')
     ax1.scatter(pos[-1, 0], pos[-1, 1], pos[-1, 2], c='r', s=50, marker='*', label='End')
+    max_range = max(np.ptp(pos[:, 0]) if len(pos) > 0 else 1.0, np.ptp(pos[:, 1]) or 1.0, np.ptp(pos[:, 2]) or 1.0) or 1.0
+    half = max_range / 2.0
+    cx = (pos[:, 0].min() + pos[:, 0].max()) / 2 if len(pos) > 0 else 0.0
+    cy = (pos[:, 1].min() + pos[:, 1].max()) / 2 if len(pos) > 0 else 0.0
+    cz = (pos[:, 2].min() + pos[:, 2].max()) / 2 if len(pos) > 0 else 0.0
+    ax1.set_xlim([cx - half, cx + half])
+    ax1.set_ylim([cy - half, cy + half])
+    ax1.set_zlim([cz - half, cz + half])
     ax1.set_xlabel('x'); ax1.set_ylabel('y'); ax1.set_zlabel('z')
     ax1.set_title('3D Trajectory')
-    
-    # 2. Position vs time
-    ax2 = fig.add_subplot(2, 3, 2)
-    ax2.plot(t, pos[:, 0], 'b-', label='x')
-    ax2.plot(t, pos[:, 1], 'g-', label='y')
-    ax2.plot(t, pos[:, 2], 'r-', label='z')
-    ax2.set_xlabel('t (s)')
-    ax2.set_ylabel('Position (m)')
-    ax2.set_title('Position')
-    ax2.legend(loc='upper right', fontsize=8)
-    ax2.grid(True, alpha=0.3)
-    
-    # 3. Velocity vs time
-    ax3 = fig.add_subplot(2, 3, 3)
-    ax3.plot(t, vel[:, 0], 'b-', label='vx')
-    ax3.plot(t, vel[:, 1], 'g-', label='vy')
-    ax3.plot(t, vel[:, 2], 'r-', label='vz')
-    ax3.set_xlabel('t (s)')
-    ax3.set_ylabel('Velocity (m/s)')
-    ax3.set_title('Velocity')
-    ax3.legend(loc='upper right', fontsize=8)
-    ax3.grid(True, alpha=0.3)
-    
-    # 4. Controls vs time
-    ax4 = fig.add_subplot(2, 3, 4)
-    ax4.plot(t_u, th_p, 'b-', label='th_p')
-    ax4.plot(t_u, th_r, 'g-', label='th_r')
-    ax4.plot(t_u, T, 'r-', label='T')
-    ax4.plot(t_u, tau_yaw, 'm-', label='tau_yaw')
-    ax4.set_xlabel('t (s)')
-    ax4.set_ylabel('Control')
-    ax4.set_title('Controls')
-    ax4.legend(loc='upper right', fontsize=8)
-    ax4.grid(True, alpha=0.3)
-    
-    # 5. Cost convergence (if logger)
+    for ax, data, ylabel, labels in [
+        (fig.add_subplot(2, 4, 2), pos, 'Position (m)', ['x', 'y', 'z']),
+        (fig.add_subplot(2, 4, 3), vel, 'Velocity (m/s)', ['vx', 'vy', 'vz']),
+        (fig.add_subplot(2, 4, 4), euler_deg, 'Euler (deg)', ['Roll', 'Pitch', 'Yaw']),
+        (fig.add_subplot(2, 4, 5), angvel, 'Ang Vel (rad/s)', ['ωx', 'ωy', 'ωz']),
+    ]:
+        for j, lbl in enumerate(labels):
+            ax.plot(t, data[:, j], label=lbl)
+        ax.set_xlabel('t (s)'); ax.set_ylabel(ylabel); ax.legend(loc='upper right', fontsize=8); ax.grid(True, alpha=0.3)
+    ax6 = fig.add_subplot(2, 4, 6)
+    ax6.plot(t_u, th_p, 'b-', label='th_p'); ax6.plot(t_u, th_r, 'g-', label='th_r')
+    ax6.plot(t_u, T, 'r-', label='T'); ax6.plot(t_u, tau_yaw, 'm-', label='tau_yaw')
+    ax6.set_xlabel('t (s)'); ax6.set_ylabel('Control'); ax6.legend(loc='upper right', fontsize=8); ax6.grid(True, alpha=0.3)
     if logger and logger.costs:
-        ax5 = fig.add_subplot(2, 3, 5)
-        ax5.semilogy(logger.costs, 'b-')
-        ax5.set_xlabel('Iteration')
-        ax5.set_ylabel('Cost')
-        ax5.set_title('Cost Convergence')
-        ax5.grid(True, alpha=0.3)
-    
+        ax7 = fig.add_subplot(2, 4, 7)
+        ax7.semilogy(logger.costs, 'b-'); ax7.set_xlabel('Iteration'); ax7.set_ylabel('Cost'); ax7.grid(True, alpha=0.3)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -215,11 +200,13 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
         self.state_b = {
             "v_horizontal_max": 20.0,
             "v_vertical_max": 20.0,
-            "roll_max": np.radians(45.0),
-            "pitch_max": np.radians(45.0),
-            "yaw_max": np.radians(180.0),
+            "roll_max": np.radians(10.0),
+            "pitch_max": np.radians(10.0),
+            "yaw_max": np.radians(30.0),
             "w_max": 2.0,
-            "k_state_bound": 200.0
+            "k_state_bound": 20.0,  # Lower default to avoid constraint gradient dominating position cost
+            # constraint_lxx_scale: state constraint Lxx scale. 0=Method1 style (no Lxx), 1=full Lxx, 0.1=damped
+            "constraint_lxx_scale": 0.0,
         }
         # Allow state bounds to be passed via bounds dict with "state_" prefix
         if bounds is not None:
@@ -241,22 +228,26 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
         """Compute TVC rotation matrix (pitch then roll)"""
         return Ry(th_p) @ Rx(th_r)
     
-    def _bound_pen(self, val, lb, ub, k):
-        """Boundary penalty function"""
+    def _bound_pen(self, val, lb, ub, k, alpha=5.0):
+        """
+        Boundary penalty: val in [lb, ub] is feasible (penalty=0).
+        - val < lb: soft-plus² (smooth, C∞)
+        - val > ub: quadratic (val-ub)². Quadratic penalty gives gradient=0 at bound,
+          allowing optimizer to stay at limit stably rather than being pushed back.
+        """
         if val < lb:
-            return k * (lb - val)**2
+            z = lb - val
+            sp = np.logaddexp(0, alpha * z) / alpha
+            return k * sp * sp
         if val > ub:
-            return k * (val - ub)**2
+            z = val - ub
+            return k * z * z  # Quadratic penalty: gradient continuous at bound
         return 0.0
     
     def _quat_to_euler(self, q):
-        """Convert quaternion to Euler angles (ZYX order)"""
-        # q format: [qx, qy, qz, qw] (Pinocchio format)
-        w, x, y, z = q[3], q[0], q[1], q[2]
-        roll = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
-        pitch = np.arcsin(np.clip(2*(w*y - z*x), -1.0, 1.0))
-        yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
-        return np.array([roll, pitch, yaw])
+        """Convert quaternion to Euler angles (ZYX order), q format: [qx,qy,qz,qw] (Pinocchio)"""
+        from tvc_common import quat_to_euler
+        return quat_to_euler(q, format='xyzw')
     
     def calc(self, data, x, u=None):
         """Compute dynamics and cost"""
@@ -335,26 +326,31 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
             data.cost += self._bound_pen(tau_yaw, *self.b["tau_yaw"], kB)
         
         # State constraints
-        kSB = self.state_b.get("k_state_bound", 200.0)
+        kSB = self.state_b.get("k_state_bound", 20.0)
         v_linear = v[0:3]  # Linear velocity [vx, vy, vz]
         w = v[3:6]        # Angular velocity [wx, wy, wz]
         
         # Velocity constraints (horizontal and vertical)
-        v_horizontal = np.sqrt(v_linear[0]**2 + v_linear[1]**2)
+        # Use sqrt(vx² + vy² + ε²) to avoid singularity at origin (smooth gradient)
+        # Bounds: [-v_max, v_max] (symmetric, min = -max)
+        _eps_vh = 1e-8
+        v_horizontal = np.sqrt(v_linear[0]**2 + v_linear[1]**2 + _eps_vh**2)
         v_vertical = abs(v_linear[2])
-        data.cost += self._bound_pen(v_horizontal, 0.0, self.state_b.get("v_horizontal_max", 20.0), kSB)
-        data.cost += self._bound_pen(v_vertical, 0.0, self.state_b.get("v_vertical_max", 20.0), kSB)
+        v_horizontal_max = self.state_b.get("v_horizontal_max", 20.0)
+        v_vertical_max = self.state_b.get("v_vertical_max", 20.0)
+        data.cost += self._bound_pen(v_horizontal, -v_horizontal_max, v_horizontal_max, kSB)
+        data.cost += self._bound_pen(v_vertical, -v_vertical_max, v_vertical_max, kSB)
         
         # Euler angle constraints
-        q_quat = q[3:7]  # Quaternion [qx, qy, qz, qw]
-        euler = self._quat_to_euler(q_quat)
-        data.cost += self._bound_pen(abs(euler[0]), 0.0, self.state_b.get("roll_max", np.radians(45.0)), kSB)  # Roll
-        data.cost += self._bound_pen(abs(euler[1]), 0.0, self.state_b.get("pitch_max", np.radians(45.0)), kSB)  # Pitch
-        data.cost += self._bound_pen(abs(euler[2]), 0.0, self.state_b.get("yaw_max", np.radians(180.0)), kSB)  # Yaw
+        # q_quat = q[3:7]  # Quaternion [qx, qy, qz, qw]
+        # euler = self._quat_to_euler(q_quat)
+        # data.cost += self._bound_pen(abs(euler[0]), 0.0, self.state_b.get("roll_max", np.radians(45.0)), kSB)  # Roll
+        # data.cost += self._bound_pen(abs(euler[1]), 0.0, self.state_b.get("pitch_max", np.radians(45.0)), kSB)  # Pitch
+        # data.cost += self._bound_pen(abs(euler[2]), 0.0, self.state_b.get("yaw_max", np.radians(180.0)), kSB)  # Yaw
         
-        # Angular velocity magnitude constraint
-        w_mag = np.linalg.norm(w)
-        data.cost += self._bound_pen(w_mag, 0.0, self.state_b.get("w_max", 2.0), kSB)
+        # # Angular velocity magnitude constraint
+        # w_mag = np.linalg.norm(w)
+        # data.cost += self._bound_pen(w_mag, 0.0, self.state_b.get("w_max", 2.0), kSB)
         
     def calcDiff(self, data, x, u=None):
         """Compute analytical Jacobians using Pinocchio's automatic differentiation"""
@@ -460,12 +456,33 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
         self.calc(temp_data, x, u)
         return temp_data.cost
     
-    def _bound_pen_grad(self, val, lb, ub, k):
-        """Gradient of boundary penalty function w.r.t. val"""
+    def _bound_pen_grad(self, val, lb, ub, k, alpha=5.0):
+        """Gradient of boundary penalty w.r.t. val"""
         if val < lb:
-            return -2.0 * k * (lb - val)
+            z = lb - val
+            sp = np.logaddexp(0, alpha * z) / alpha
+            sig = 0.5 * (1.0 + np.tanh(0.5 * alpha * z))  # stable sigmoid
+            return -2.0 * k * sp * sig  # d/d(val) since dz/d(val)=-1
         elif val > ub:
-            return 2.0 * k * (val - ub)
+            z = val - ub
+            return 2.0 * k * z  # Quadratic penalty: d/d(val) k*(val-ub)² = 2k*(val-ub), 0 at bound
+        else:
+            return 0.0
+    
+    def _bound_pen_hess(self, val, lb, ub, k, alpha=5.0):
+        """
+        Second derivative of boundary penalty w.r.t. val (d²p/d(val)²).
+        For Gauss-Newton: Lxx += hess * outer(dz/dx, dz/dx).
+        - val > ub: quadratic penalty d²/d(val)² k*(val-ub)² = 2k
+        - val < lb: soft-plus² Hessian
+        """
+        if val < lb:
+            z = lb - val
+            sp = np.logaddexp(0, alpha * z) / alpha
+            sig = 0.5 * (1.0 + np.tanh(0.5 * alpha * z))
+            return 2.0 * k * (sig * sig + sp * alpha * sig * (1.0 - sig))
+        elif val > ub:
+            return 2.0 * k  # Quadratic penalty Hessian is constant
         else:
             return 0.0
     
@@ -476,7 +493,9 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
         th_p, th_r, T, tau_yaw = u
         
         kB = self.b["k_bound"]
-        kSB = self.state_b["k_state_bound"]
+        kSB = self.state_b.get("k_state_bound", 20.0)
+        # State constraint Lxx scale: 0=Method1 style (no Lxx), 1=full, 0.1=damped. See constraint_lxx_scale
+        lxx_scale = self.state_b.get("constraint_lxx_scale", 0.0)
         
         # Control constraint gradients (same as Method 1)
         th_p_lb, th_p_ub = self.b["th_p"]
@@ -484,12 +503,17 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
         T_lb, T_ub = self.b["T"]
         tau_yaw_lb, tau_yaw_ub = self.b["tau_yaw"]
         
-        # Control gradients: skip when use_box_solver (SolverBoxFDDP handles them natively)
+        # Control gradients + Hessian: skip when use_box_solver (SolverBoxFDDP handles them natively)
         if not self.use_box_solver:
             data.Lu[0] += self._bound_pen_grad(th_p, th_p_lb, th_p_ub, kB)
             data.Lu[1] += self._bound_pen_grad(th_r, th_r_lb, th_r_ub, kB)
             data.Lu[2] += self._bound_pen_grad(T, T_lb, T_ub, kB)
             data.Lu[3] += self._bound_pen_grad(tau_yaw, tau_yaw_lb, tau_yaw_ub, kB)
+            # Luu: Gauss-Newton Hessian for constraint penalties (each control independent)
+            data.Luu[0, 0] += self._bound_pen_hess(th_p, th_p_lb, th_p_ub, kB)
+            data.Luu[1, 1] += self._bound_pen_hess(th_r, th_r_lb, th_r_ub, kB)
+            data.Luu[2, 2] += self._bound_pen_hess(T, T_lb, T_ub, kB)
+            data.Luu[3, 3] += self._bound_pen_hess(tau_yaw, tau_yaw_lb, tau_yaw_ub, kB)
         
         # du cost gradient (same as Method 1): d/du [w_du * ||u - u_prev||^2] = 2*w_du*(u - u_prev)
         w_du = self.weights.get("du", 1e-2)
@@ -501,22 +525,35 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
         v_linear = v[0:3]
         w = v[3:6]
         
-        # Velocity constraints
-        v_horizontal = np.sqrt(v_linear[0]**2 + v_linear[1]**2)
+        # Velocity constraints (same smooth formula as calc: sqrt(vx²+vy²+ε²))
+        _eps_vh = 1e-8
+        v_horizontal = np.sqrt(v_linear[0]**2 + v_linear[1]**2 + _eps_vh**2)
         v_vertical = abs(v_linear[2])
         v_horizontal_max = self.state_b.get("v_horizontal_max", 20.0)
         v_vertical_max = self.state_b.get("v_vertical_max", 20.0)
         
-        # v_horizontal gradient w.r.t. v[0] and v[1]
-        if v_horizontal > 1e-8:  # Avoid division by zero
-            v_h_grad = self._bound_pen_grad(v_horizontal, 0.0, v_horizontal_max, kSB)
-            # Gradient of sqrt(vx^2 + vy^2) w.r.t. vx and vy
-            data.Lx[3] += v_h_grad * v_linear[0] / v_horizontal  # w.r.t. vx
-            data.Lx[4] += v_h_grad * v_linear[1] / v_horizontal  # w.r.t. vy
+        # v_horizontal gradient: d(v_h)/d(vx)=vx/v_h, d(v_h)/d(vy)=vy/v_h (v_h>=ε, no singularity)
+        v_h_grad = self._bound_pen_grad(v_horizontal, -v_horizontal_max, v_horizontal_max, kSB)
+        dvh_dvx = v_linear[0] / v_horizontal
+        dvh_dvy = v_linear[1] / v_horizontal
+        data.Lx[3] += v_h_grad * dvh_dvx  # w.r.t. vx
+        data.Lx[4] += v_h_grad * dvh_dvy  # w.r.t. vy
+        # Lxx: Gauss-Newton Hessian for v_horizontal (indices 3,4 = vx,vy)
+        v_h_hess = self._bound_pen_hess(v_horizontal, -v_horizontal_max, v_horizontal_max, kSB)
+        g_vh = np.zeros(self.state.ndx)
+        g_vh[3], g_vh[4] = dvh_dvx, dvh_dvy
+        data.Lxx += lxx_scale * v_h_hess * np.outer(g_vh, g_vh)
         
         # v_vertical gradient w.r.t. v[2]
-        v_v_grad = self._bound_pen_grad(v_vertical, 0.0, v_vertical_max, kSB)
-        data.Lx[5] += v_v_grad * np.sign(v_linear[2]) if abs(v_linear[2]) > 1e-8 else 0.0
+        v_v_grad = self._bound_pen_grad(v_vertical, -v_vertical_max, v_vertical_max, kSB)
+        sign_vz = np.sign(v_linear[2]) if abs(v_linear[2]) > 1e-8 else 0.0
+        data.Lx[5] += v_v_grad * sign_vz
+        # Lxx: Gauss-Newton Hessian for v_vertical (index 5 = vz)
+        if abs(v_linear[2]) > 1e-8:
+            v_v_hess = self._bound_pen_hess(v_vertical, -v_vertical_max, v_vertical_max, kSB)
+            g_vv = np.zeros(self.state.ndx)
+            g_vv[5] = sign_vz
+            data.Lxx += lxx_scale * v_v_hess * np.outer(g_vv, g_vv)
         
         # Euler angle constraints (need quaternion to euler gradient)
         q_quat = q[3:7]  # [qx, qy, qz, qw]
@@ -531,46 +568,43 @@ class TVCRocketDifferentialActionModel(crocoddyl.DifferentialActionModelAbstract
         eps_euler = 1e-6
         for i, (euler_val, euler_max) in enumerate([(euler[0], roll_max), (euler[1], pitch_max), (euler[2], yaw_max)]):
             euler_grad = self._bound_pen_grad(abs(euler_val), 0.0, euler_max, kSB) * np.sign(euler_val)
+            g_euler = np.zeros(self.state.ndx)  # dz/dx for z=|euler|, used in Lxx = hess * outer(g,g)
             
             # Approximate gradient of euler angle w.r.t. quaternion using numerical differentiation
-            # This is more stable than computing the full analytical gradient
             for j in range(4):  # 4 quaternion components
                 q_pert = q_quat.copy()
                 q_pert[j] += eps_euler
-                # Normalize quaternion
                 q_pert = q_pert / np.linalg.norm(q_pert)
                 euler_pert = self._quat_to_euler(q_pert)
                 deuler_dq = (euler_pert[i] - euler_val) / eps_euler
                 
-                # Map to differential state space (quaternion is at indices 6:9 in differential state)
-                # For StateMultibody, quaternion error is in differential state space
-                if j < 3:  # qx, qy, qz map to differential state indices 6:9
+                if j < 3:
                     data.Lx[6 + j] += euler_grad * deuler_dq
-                else:  # qw maps differently, but for small perturbations this approximation works
-                    # qw is typically handled through normalization, so we distribute the gradient
+                    g_euler[6 + j] += np.sign(euler_val) * deuler_dq  # dz/dx for z=|euler|
+                else:
                     for k in range(3):
                         data.Lx[6 + k] += euler_grad * deuler_dq / 3.0
+                        g_euler[6 + k] += np.sign(euler_val) * deuler_dq / 3.0
+            
+            # Lxx: Gauss-Newton Hessian for Euler constraint (hess = d²p/dz², g = dz/dx)
+            euler_hess = self._bound_pen_hess(abs(euler_val), 0.0, euler_max, kSB)
+            if np.any(g_euler != 0):
+                data.Lxx += lxx_scale * euler_hess * np.outer(g_euler, g_euler)
         
         # Angular velocity magnitude constraint
         w_mag = np.linalg.norm(w)
         w_max = self.state_b.get("w_max", 2.0)
         if w_mag > 1e-8:
             w_mag_grad = self._bound_pen_grad(w_mag, 0.0, w_max, kSB)
-            # Gradient of ||w|| w.r.t. w
-            data.Lx[9] += w_mag_grad * w[0] / w_mag  # w.r.t. wx
-            data.Lx[10] += w_mag_grad * w[1] / w_mag  # w.r.t. wy
-            data.Lx[11] += w_mag_grad * w[2] / w_mag  # w.r.t. wz
-
-
-def Ry(a):
-    """Rotation matrix around y-axis"""
-    ca, sa = np.cos(a), np.sin(a)
-    return np.array([[ca,0,sa],[0,1,0],[-sa,0,ca]])
-
-def Rx(a):
-    """Rotation matrix around x-axis"""
-    ca, sa = np.cos(a), np.sin(a)
-    return np.array([[1,0,0],[0,ca,-sa],[0,sa,ca]])
+            dw_dwx, dw_dwy, dw_dwz = w[0] / w_mag, w[1] / w_mag, w[2] / w_mag
+            data.Lx[9] += w_mag_grad * dw_dwx
+            data.Lx[10] += w_mag_grad * dw_dwy
+            data.Lx[11] += w_mag_grad * dw_dwz
+            # Lxx: Gauss-Newton Hessian for w_mag (indices 9,10,11)
+            w_mag_hess = self._bound_pen_hess(w_mag, 0.0, w_max, kSB)
+            g_w = np.zeros(self.state.ndx)
+            g_w[9], g_w[10], g_w[11] = dw_dwx, dw_dwy, dw_dwz
+            data.Lxx += lxx_scale * w_mag_hess * np.outer(g_w, g_w)
 
 
 class TVCActuationModel(crocoddyl.ActuationModelAbstract):
@@ -610,9 +644,13 @@ def create_tvc_cost_model(state, actuation, x_goal, u_ref, weights, bounds):
     
     # State cost (position, orientation, velocity, angular velocity)
     # Pinocchio diff order: [pos(3), orient_so3(3), lin_vel(3), ang_vel(3)]
+    # orient_so3: [roll, pitch, yaw] in body frame (approx for small angles)
+    R_default = weights.get("R", 0.5)
     state_weights = np.ones(state.ndx)
     state_weights[:3] = weights.get("p", 1.0)   # Position
-    state_weights[3:6] = weights.get("R", 0.5)  # Orientation (so3 error, includes yaw)
+    state_weights[3] = weights.get("roll", R_default)   # Roll (orient_so3[0])
+    state_weights[4] = weights.get("pitch", R_default)   # Pitch (orient_so3[1])
+    state_weights[5] = weights.get("yaw", R_default)    # Yaw (orient_so3[2]) - can override separately
     state_weights[6:9] = weights.get("v", 0.2)  # Linear velocity
     state_weights[9:12] = weights.get("w", 0.1) # Angular velocity
     
@@ -767,8 +805,8 @@ def solve_with_pinocchio(dt=0.02, N=100, max_iter=100, use_box_solver=False):
     
     # Initial configuration: [x, y, z, qx, qy, qz, qw]
     q0 = pin.neutral(robot_model)
-    q0[2] = 0.0  # z = 0
-    q0[6] = 1.0  # qw = 1 (upright orientation)
+    # q0[2] = 0.0  # z = 0
+    # q0[6] = 1.0  # qw = 1 (upright orientation)
     
     # Initial velocity: [vx, vy, vz, wx, wy, wz]
     v0 = np.zeros(robot_model.nv)
@@ -795,17 +833,26 @@ def solve_with_pinocchio(dt=0.02, N=100, max_iter=100, use_box_solver=False):
         "p": 1.0,
         "v": 0.2,
         "R": 0.5,
+        "yaw": 0.5,
         "w": 0.1,
         "u": 1e-3,
         "du": 1e-2
     }
     
-    # Bounds (for reference, constraints handled in cost)
+    # Bounds (control + state constraints)
     bounds = {
         "T": (0.0, 25.0),
         "th_p": (-0.35, 0.35),
         "th_r": (-0.35, 0.35),
-        "tau_yaw": (-1.0, 1.0)
+        "tau_yaw": (-1.0, 1.0),
+        # State constraints (same as GUI defaults)
+        "state_v_horizontal_max": 1.0,
+        "state_v_vertical_max": 3.0,
+        "state_roll_max": np.radians(10.0),
+        "state_pitch_max": np.radians(10.0),
+        "state_yaw_max": np.radians(180.0),
+        "state_w_max": 2.0,
+        "state_k_state_bound": 200.0,
     }
     
     # Create cost model (xg is in configuration space [q, v], dimension 13)
@@ -832,6 +879,7 @@ def solve_with_pinocchio(dt=0.02, N=100, max_iter=100, use_box_solver=False):
         "p": 200.0,
         "v": 50.0,
         "R": 200.0,
+        "yaw": 200.0,
         "w": 20.0,
         "u": 0.0,
         "du": 0.0
@@ -999,7 +1047,7 @@ def solve_with_pinocchio_waypoints(dt, waypoints, m, I, r_thrust, weights, bound
         
         # Terminal cost: use provided terminal_weights or fallback to defaults
         tw = terminal_weights if terminal_weights is not None else {
-            **weights, "p": 200.0, "v": 50.0, "R": 200.0, "w": 20.0, "u": 0.0, "du": 0.0
+            **weights, "p": 200.0, "v": 50.0, "R": 200.0, "yaw": 200.0, "w": 20.0, "u": 0.0, "du": 0.0
         }
         terminal_cost = create_tvc_cost_model(state, actuation, xg_seg, uref, tw, bounds)
         terminal_diff = TVCRocketDifferentialActionModel(
@@ -1350,13 +1398,18 @@ def run_both_methods_simulation(dt=0.05, N=100, max_iter=100, verbose=True):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="TVC trajectory optimization (FDDP / BoxFDDP)")
-    parser.add_argument("--mode", choices=["fddp", "boxfddp", "both"], default="boxfddp",
-                        help="fddp: FDDP only; boxfddp: BoxFDDP only; both: FDDP + BoxFDDP with simulation")
+    parser = argparse.ArgumentParser(description="TVC trajectory optimization (FDDP / BoxFDDP / Waypoints)")
+    parser.add_argument("--mode",
+                        choices=["fddp", "boxfddp", "both", "waypoints", "waypoints_unified"],
+                        default="waypoints",
+                        help="fddp: FDDP only; boxfddp: BoxFDDP only; both: FDDP+BoxFDDP with simulation; "
+                             "waypoints: segmented waypoints; waypoints_unified: unified waypoints")
     parser.add_argument("--no-plot", action="store_true", help="Disable debug plot (plot is on by default)")
-    parser.add_argument("--dt", type=float, default=0.05)
+    parser.add_argument("--dt", type=float, default=0.1)
     parser.add_argument("--N", type=int, default=100)
     parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument("--solver", choices=["fddp", "boxfddp"], default="boxfddp",
+                        help="Solver for waypoints modes (default: boxfddp)")
     args = parser.parse_args()
     
     if args.mode == "both":
@@ -1368,10 +1421,76 @@ if __name__ == "__main__":
                       title="FDDP Trajectory")
             plot_debug(results["boxfddp_xs"], results["boxfddp_us"], args.dt, results["boxfddp_logger"],
                       title="BoxFDDP Trajectory")
+    elif args.mode in ("waypoints", "waypoints_unified"):
+        # Waypoints mode: solve_with_pinocchio_waypoints or solve_with_pinocchio_waypoints_unified
+        m = 0.6
+        I = np.diag([0.02, 0.02, 0.01])
+        r_thrust = np.array([0.0, 0.0, -0.2])
+        weights = {"p": 1.0, "v": 0.2, "R": 0.5, "yaw": 15, "w": 0.1, "u": 1e-3, "du": 1e-2}
+        # terminal_weights = {"p": 200.0, "v": 50.0, "R": 200.0, "yaw": 200.0, "w": 20.0, "u": 0.0, "du": 0.0}
+        terminal_weights = {"p": 0.0, "v": 0.0, "R": 0.0, "yaw": 0.0, "w": 0.0, "u": 0.0, "du": 0.0}
+        # terminal_weights = weights
+        bounds = {
+            "T": (0.0, 25.0),
+            "th_p": (-0.35, 0.35),
+            "th_r": (-0.35, 0.35),
+            "tau_yaw": (-1.0, 1.0),
+            # State constraints (same as GUI defaults)
+            "state_v_horizontal_max": 1,
+            "state_v_vertical_max": 2.0,
+            "state_roll_max": np.radians(10.0),
+            "state_pitch_max": np.radians(10.0),
+            "state_yaw_max": np.radians(30.0),
+            "state_w_max": 2.0,
+            "state_k_state_bound": 20.0,
+            # state_constraint_lxx_scale: 0=Method1 style (recommended), 1=full Lxx, 0.1=damped
+            "state_constraint_lxx_scale": 0,
+        }
+        # Default waypoints: start (0,0,0) at t=0 -> goal (1,0,5) at t=5s
+        waypoints = [
+            [0.0, 0.0, 0.0, 0.0, 0.0],   # [x, y, z, yaw_deg, time]
+            [3.0, 0.0, 0.0, 0.0, 5.0]
+            # [4.0, 0.0, 5.0, 0.0, 10.0]
+        ]
+        use_box = (args.solver == "boxfddp")
+        solver_fn = solve_with_pinocchio_waypoints_unified if args.mode == "waypoints_unified" else solve_with_pinocchio_waypoints
+        t0 = time.perf_counter()
+        xs, us, all_loggers = solver_fn(
+            dt=args.dt,
+            waypoints=waypoints,
+            m=m,
+            I=I,
+            r_thrust=r_thrust,
+            weights=weights,
+            bounds=bounds,
+            max_iter=args.max_iter,
+            use_box_solver=use_box,
+            terminal_weights=terminal_weights
+        )
+        elapsed = time.perf_counter() - t0
+        logger = all_loggers[0] if all_loggers else None
+        total_iters = sum(len(lg.costs) for lg in all_loggers) if all_loggers else 0
+        print("\n" + "="*50)
+        print(f"Solved ({args.mode}, {'BoxFDDP' if use_box else 'FDDP'}). N = {len(us)}, "
+              f"iters = {total_iters}, time = {elapsed:.2f}s")
+        print("x0 =", xs[0][:7], "...")
+        print("xN =", xs[-1][:7], "...")
+        # Simulate to verify (waypoints return Method 1 format; simulate needs Pinocchio)
+        urdf_path = Path(__file__).parent.parent / 'models' / 'tvc' / 'tvc_simple.urdf'
+        robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
+        x0_pin = convert_method1_state_to_pinocchio(xs[0]) if len(xs[0]) == 17 else xs[0]
+        sim_xs = simulate_tvc_trajectory(x0_pin, us, args.dt, robot_model, r_thrust, m=m, I=I)
+        err = np.mean([np.linalg.norm((convert_method1_state_to_pinocchio(a) if len(a) == 17 else a)[:13]
+                                      - np.array(b)[:13])
+                       for a, b in zip(xs, sim_xs[:len(xs)])])
+        print(f"Simulation verification (mean state error): {err:.2e}")
+        if not args.no_plot:
+            wp_list = [[wp[0], wp[1], wp[2]] for wp in waypoints] if waypoints else None
+            plot_debug(xs, us, args.dt, logger, title=f"{args.mode} ({'BoxFDDP' if use_box else 'FDDP'}) Trajectory", waypoints=wp_list)
     else:
-        # Single method: FDDP or BoxFDDP
+        # Single method: FDDP or BoxFDDP (solve_with_pinocchio)
         use_box = (args.mode == "boxfddp")
-        xs, us, logger = solve_with_pinocchio(dt=args.dt, N=args.N, max_iter=args.max_iter, 
+        xs, us, logger = solve_with_pinocchio(dt=args.dt, N=args.N, max_iter=args.max_iter,
                                              use_box_solver=use_box)
         print("\n" + "="*50)
         print(f"Solved ({'BoxFDDP' if use_box else 'FDDP'}). N =", len(us))
@@ -1382,7 +1501,7 @@ if __name__ == "__main__":
         robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
         m, I = 0.6, np.diag([0.02, 0.02, 0.01])
         sim_xs = simulate_tvc_trajectory(xs[0], us, args.dt, robot_model, np.array([0, 0, -0.2]), m=m, I=I)
-        err = np.mean([np.linalg.norm(np.array(a)[:13] - np.array(b)[:13]) 
+        err = np.mean([np.linalg.norm(np.array(a)[:13] - np.array(b)[:13])
                        for a, b in zip(xs, sim_xs[:len(xs)])])
         print(f"Simulation verification (mean state error): {err:.2e}")
         if not args.no_plot:
