@@ -1,0 +1,22 @@
+{
+  "dt": 0.01,
+  "T_end": 20.0,
+  "step_time": 2.0,
+  "step_angle_deg": 10.0,
+  "theta_ref_period": 5.0,
+  "step_omega": 0.5,
+  "step_u": 0.2,
+  "cmd_mode": "angle",
+  "Kp_angle": 2.0,
+  "Kp": 0.25,
+  "Ki": 0.2,
+  "Kd": 0.0,
+  "int_max": 10.0,
+  "tau_act": 0.2,
+  "K_act": 1.0,
+  "theta_gimbal_max_deg": 10.0,
+  "I_roll": 0.02,
+  "F_thrust": 6.0,
+  "L": 0.2,
+  "m": 0.6
+}
