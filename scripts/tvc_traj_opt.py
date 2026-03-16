@@ -443,7 +443,7 @@ def solve_once(dt=0.02, N=100, max_iter=100):
 
 # xs, us = solve_once()
 
-def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None, segment_boundaries=None):
+def plot_trajectory(xs, us, dt, logger=None, all_loggers=None, x_goal=None, waypoints=None, segment_boundaries=None):
     """
     Plot trajectory optimization results - all states, controls and cost on one page
     
@@ -451,7 +451,8 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None, segmen
         xs: State trajectory list
         us: Control input list
         dt: Time step
-        logger: Callback logger (optional, for plotting convergence curve)
+        logger: Single callback logger (optional, for backward compatibility)
+        all_loggers: List of loggers per segment (optional; overrides logger when multi-segment)
         x_goal: Target state (optional)
         waypoints: List of waypoint positions (optional). If [x,y,z,yaw,time], segments are colored.
         segment_boundaries: Optional [end_idx_seg1, end_idx_seg2, ...] to override segment coloring.
@@ -573,21 +574,32 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None, segmen
     
     # 2. Cost convergence curve (occupies 2 positions)
     ax_cost = fig.add_subplot(gs[0, 2:4])
-    if logger is not None and len(logger.costs) > 0:
-        iterations = np.arange(len(logger.costs))
-        ax_cost.semilogy(iterations, logger.costs, 'b-', linewidth=2.5, label='Cost', marker='o', markersize=3)
+    # Prefer all_loggers for multi-segment; fallback to single logger
+    loggers_to_plot = all_loggers if (all_loggers and len(all_loggers) > 0) else ([logger] if logger else [])
+    if loggers_to_plot and any(lg and len(lg.costs) > 0 for lg in loggers_to_plot):
+        colors = ['b', 'r', 'g', 'm', 'c', 'orange', 'purple', 'brown']
+        cumulative_iter = 0
+        for seg_idx, lg in enumerate(loggers_to_plot):
+            if lg and len(lg.costs) > 0:
+                color = colors[seg_idx % len(colors)]
+                label = f'Segment {seg_idx + 1}' if len(loggers_to_plot) > 1 else 'Cost'
+                seg_iterations = np.arange(len(lg.costs)) + cumulative_iter
+                ax_cost.semilogy(seg_iterations, lg.costs, color=color, linewidth=2.5,
+                                marker='o', markersize=3, label=label)
+                cumulative_iter += len(lg.costs)
         ax_cost.set_xlabel('Iteration', fontsize=10)
         ax_cost.set_ylabel('Cost (log scale)', fontsize=10)
         ax_cost.set_title('Optimization Cost Convergence', fontsize=11, fontweight='bold')
         ax_cost.legend(fontsize=9)
         ax_cost.grid(True, alpha=0.3)
-        # Add final cost text
-        final_cost = logger.costs[-1]
-        ax_cost.text(0.02, 0.98, f'Final Cost: {final_cost:.4e}', 
-                    transform=ax_cost.transAxes, fontsize=9,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # Add final cost text (from last segment)
+        last_lg = next((lg for lg in reversed(loggers_to_plot) if lg and lg.costs), None)
+        if last_lg:
+            ax_cost.text(0.02, 0.98, f'Final Cost: {last_lg.costs[-1]:.4e}',
+                        transform=ax_cost.transAxes, fontsize=9,
+                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     else:
-        ax_cost.text(0.5, 0.5, 'No convergence data', 
+        ax_cost.text(0.5, 0.5, 'No convergence data',
                     ha='center', va='center', transform=ax_cost.transAxes, fontsize=12)
         ax_cost.set_title('Cost Convergence', fontsize=11, fontweight='bold')
     

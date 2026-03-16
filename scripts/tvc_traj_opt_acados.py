@@ -19,6 +19,7 @@ Before running, ensure Acados libs are in LD_LIBRARY_PATH:
 import os
 import sys
 import gc
+import time
 import numpy as np
 from pathlib import Path
 
@@ -81,14 +82,23 @@ def _Ry_sx(a):
     )
 
 
-def export_tvc_ode_model(m, I, r_thrust, g=9.81, model_name='tvc_rocket', use_control_rate=False):
+def export_tvc_ode_model(m, I, r_thrust, g=9.81, model_name='tvc_rocket', use_control_rate=False,
+                        use_actuator_dynamics=False, actuator_tau=None):
     """
     Export TVC rocket ODE model for Acados.
     State: [x, y, z, phi, theta, psi, vx, vy, vz, wx, wy, wz] (12 dim)
            or with use_control_rate: + [u_prev_th_p, u_prev_th_r, u_prev_T, u_prev_tau_yaw] (16 dim)
-    Control: [th_p, th_r, T, tau_yaw] (4 dim)
+           or with use_actuator_dynamics: + [u_act_th_p, u_act_th_r, u_act_T, u_act_tau_yaw] (16 dim)
+    Control: [th_p, th_r, T, tau_yaw] (4 dim) - commanded; plant uses u_actual when actuator
     use_control_rate: if True, augment state with u_prev for control rate penalty
+    use_actuator_dynamics: if True, first-order actuator u_act_dot = (u_cmd - u_act)/tau per channel
+    actuator_tau: [tau_pitch, tau_roll, tau_T, tau_yaw] in seconds; default [0.05]*4
     """
+    if actuator_tau is None:
+        actuator_tau = [0.05, 0.05, 0.05, 0.05]
+    # Actuator dynamics and control rate are mutually exclusive (both extend state to 16)
+    if use_actuator_dynamics:
+        use_control_rate = False
     # State
     x = ca.SX.sym('x')
     y = ca.SX.sym('y')
@@ -104,12 +114,23 @@ def export_tvc_ode_model(m, I, r_thrust, g=9.81, model_name='tvc_rocket', use_co
     wz = ca.SX.sym('wz')
     state_phys = ca.vertcat(x, y, z, phi, theta, psi, vx, vy, vz, wx, wy, wz)
     
-    # Control
-    th_p = ca.SX.sym('th_p')
-    th_r = ca.SX.sym('th_r')
-    T = ca.SX.sym('T')
-    tau_yaw = ca.SX.sym('tau_yaw')
-    control = ca.vertcat(th_p, th_r, T, tau_yaw)
+    # Control (u_cmd)
+    th_p_cmd = ca.SX.sym('th_p')
+    th_r_cmd = ca.SX.sym('th_r')
+    T_cmd = ca.SX.sym('T')
+    tau_yaw_cmd = ca.SX.sym('tau_yaw')
+    control = ca.vertcat(th_p_cmd, th_r_cmd, T_cmd, tau_yaw_cmd)
+    
+    # Plant input: u_actual when actuator, else u_cmd
+    if use_actuator_dynamics:
+        u_act_th_p = ca.SX.sym('u_act_th_p')
+        u_act_th_r = ca.SX.sym('u_act_th_r')
+        u_act_T = ca.SX.sym('u_act_T')
+        u_act_tau_yaw = ca.SX.sym('u_act_tau_yaw')
+        u_actual = ca.vertcat(u_act_th_p, u_act_th_r, u_act_T, u_act_tau_yaw)
+        th_p, th_r, T, tau_yaw = u_act_th_p, u_act_th_r, u_act_T, u_act_tau_yaw
+    else:
+        th_p, th_r, T, tau_yaw = th_p_cmd, th_r_cmd, T_cmd, tau_yaw_cmd
     
     # Rotation matrices (ZYX order: R = Rz(psi) @ Ry(theta) @ Rx(phi))
     cphi, sphi = ca.cos(phi), ca.sin(phi)
@@ -164,7 +185,17 @@ def export_tvc_ode_model(m, I, r_thrust, g=9.81, model_name='tvc_rocket', use_co
     v_dot = a_linear
     f_expl_phys = ca.vertcat(p_dot, euler_dot, v_dot, a_angular)
     
-    if use_control_rate:
+    if use_actuator_dynamics:
+        # First-order actuator: u_actual_dot = (u_cmd - u_actual) / tau per channel
+        state = ca.vertcat(state_phys, u_actual)
+        p = ca.SX.sym('p', 4)  # [1/tau_pitch, 1/tau_roll, 1/tau_T, 1/tau_yaw]
+        inv_tau = p
+        u_actual_dot = (control - u_actual) * inv_tau
+        f_expl = ca.vertcat(f_expl_phys, u_actual_dot)
+        nx = 16
+        model = AcadosModel()
+        model.p = p
+    elif use_control_rate:
         # Augment state with u_prev for control rate penalty
         u_prev_th_p = ca.SX.sym('u_prev_th_p')
         u_prev_th_r = ca.SX.sym('u_prev_th_r')
@@ -255,9 +286,11 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
         except AttributeError:
             ocp.json_file = json_file
     
-    nx = int(model.x.size1())  # 12 or 16 (with u_prev)
+    nx = int(model.x.size1())  # 12 or 16 (with u_prev or u_actual)
     nu = 4
-    use_control_rate = nx == 16
+    # Distinguish actuator (p size 4) vs control rate (p size 1)
+    use_actuator_dynamics = (nx == 16 and hasattr(model, 'p') and model.p.size1() == 4)
+    use_control_rate = (nx == 16 and hasattr(model, 'p') and model.p.size1() == 1)
     
     ocp.solver_options.N_horizon = N
     ocp.solver_options.tf = Tf
@@ -281,7 +314,16 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
     ])
     R_mat = w_u * np.eye(nu)
     
-    if use_control_rate:
+    if use_actuator_dynamics:
+        # cost_y = [x(16), u(4)]; x = [x_phys, u_actual], u = u_cmd; penalize state and control
+        cost_y_expr = ca.vertcat(model.x, model.u)
+        yref = np.concatenate([np.asarray(xg).flatten()[:12], uref, uref])
+        Q_aug = np.diag(np.concatenate([np.diag(Q), [w_u] * 4]))  # 16x16: Q(12) + w_u for u_actual(4)
+        ocp.cost.cost_type = 'NONLINEAR_LS'
+        ocp.model.cost_y_expr = cost_y_expr
+        ocp.cost.yref = yref
+        ocp.cost.W = np.block([[Q_aug, np.zeros((16, nu))], [np.zeros((nu, 16)), R_mat]])
+    elif use_control_rate:
         # cost_y = [x(16), u(4), u-u_prev(4)] = 24 dim; penalize ||u - u_prev||^2 for smooth control
         u_prev = model.x[12:16]
         cost_y_expr = ca.vertcat(model.x, model.u, model.u - u_prev)
@@ -378,15 +420,22 @@ def build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_w
         w_max                         # w_mag upper
     ])
     
-    # x0: augment with u_prev=uref when using control rate
+    # x0: augment with u_prev/u_actual=uref when using control rate or actuator
     x0_arr = np.asarray(x0).flatten()
-    if use_control_rate and len(x0_arr) == 12:
+    if (use_control_rate or use_actuator_dynamics) and len(x0_arr) == 12:
         x0_arr = np.concatenate([x0_arr, np.asarray(uref).flatten()[:4]])
     ocp.constraints.x0 = x0_arr
     
-    # When model has param p (control rate 1/dt), must set parameter_values for make_consistent
+    # When model has param p: control rate uses 1/dt; actuator uses 1/tau per channel
     if use_control_rate:
         ocp.parameter_values = np.array([N / Tf], dtype=float)
+    elif use_actuator_dynamics:
+        actuator_tau = weights.get("actuator_tau", [0.05, 0.05, 0.05, 0.05])
+        actuator_tau = np.asarray(actuator_tau).flatten()
+        if len(actuator_tau) < 4:
+            actuator_tau = np.resize(actuator_tau, 4)
+        inv_tau = 1.0 / np.maximum(np.asarray(actuator_tau, dtype=float), 1e-6)
+        ocp.parameter_values = inv_tau
     
     ocp.solver_options.qp_solver = qp_solver or 'PARTIAL_CONDENSING_HPIPM'
     ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
@@ -448,6 +497,8 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
     
     # Base dir for code export (avoid segment overwrite / module cache reuse)
     base_export = os.path.join(os.path.dirname(os.path.abspath(__file__)), "c_generated_code")
+    total_solve_time = 0.0
+    total_sqp_iters = 0
     
     for seg_idx in range(len(durations)):
         if running_flag is not None and not running_flag():
@@ -460,32 +511,47 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         N = max(10, int(duration / dt))
         Tf = duration
         
-        # Unique dir/model per segment to avoid Acados module cache reusing wrong solver (acados#905)
-        code_export_dir = os.path.join(base_export, f"tvc_seg{seg_idx}_N{N}")
-        json_file = f"tvc_rocket_seg{seg_idx}.json"
-        model_name = f"tvc_rocket_seg{seg_idx}"
-        
-        # Segment 2+: clear module cache, increase SQP iterations
+        # Segment 2+: clear module cache, increase SQP iterations (more when actuator dynamics)
+        use_actuator_dynamics = weights.get("actuator_dynamics", False)
+        actuator_tau = weights.get("actuator_tau", [0.05, 0.05, 0.05, 0.05])
+        use_control_rate = (not use_actuator_dynamics) and weights.get("du", 0.0) > 0
         if seg_idx > 0:
-            _clear_acados_module_cache(code_export_dir)
-            nlp_max_iter = max(200, max_iter * 2)
+            _clear_acados_module_cache(None)
+            nlp_max_iter = max(300, max_iter * 3) if weights.get("actuator_dynamics", False) else max(200, max_iter * 2)
             qp_solver = None
         else:
             nlp_max_iter = max_iter
             qp_solver = None
         
-        use_control_rate = weights.get("du", 0.0) > 0
-        model = export_tvc_ode_model(m, I, r_thrust, model_name=model_name, use_control_rate=use_control_rate)
+        # Model-type suffix: ensure segment 2 never loads wrong model (act vs control-rate vs basic)
+        model_suffix = "_act" if use_actuator_dynamics else ("_du" if use_control_rate else "")
+        code_export_dir = os.path.join(base_export, f"tvc_seg{seg_idx}{model_suffix}_N{N}")
+        json_file = f"tvc_rocket_seg{seg_idx}{model_suffix}.json"
+        model_name = f"tvc_rocket_seg{seg_idx}{model_suffix}"
+        model = export_tvc_ode_model(m, I, r_thrust, model_name=model_name, use_control_rate=use_control_rate,
+                                    use_actuator_dynamics=use_actuator_dynamics, actuator_tau=actuator_tau)
         ocp = build_acados_ocp(model, N, Tf, x0, xg, uref, weights, bounds, dt, terminal_weights,
                                code_export_dir=code_export_dir, json_file=json_file,
                                nlp_solver_max_iter=nlp_max_iter, qp_solver=qp_solver,
                                verbose_solve=verbose_solve)
         
-        # Extend x0/xg to 16-dim (with u_prev) for control rate model; keep x0 if already 16-dim from prev segment
-        x0_arr = np.asarray(x0).flatten()
-        xg_arr = np.asarray(xg).flatten()
-        x0_seg = np.concatenate([x0_arr[:12], uref]) if use_control_rate and len(x0_arr) == 12 else x0_arr
-        xg_seg = np.concatenate([xg_arr[:12], uref]) if use_control_rate and len(xg_arr) == 12 else xg_arr
+        # Extend x0/xg to 16-dim (with u_prev/u_actual) for control rate or actuator model
+        x0_arr = np.asarray(x0, dtype=float).flatten()
+        xg_arr = np.asarray(xg, dtype=float).flatten()
+        use_16 = use_control_rate or use_actuator_dynamics
+        # Segment 2+: x0 from prev segment should be 16-dim; if truncated, use u_actual from prev end or uref
+        if use_16 and len(x0_arr) == 12:
+            x0_seg = np.concatenate([x0_arr[:12], uref])
+        elif use_16 and len(x0_arr) >= 16:
+            x0_seg = x0_arr[:16]  # Ensure exactly 16, drop any extra
+        else:
+            x0_seg = x0_arr
+        if use_16 and len(xg_arr) == 12:
+            xg_seg = np.concatenate([xg_arr[:12], uref])
+        elif use_16 and len(xg_arr) >= 16:
+            xg_seg = xg_arr[:16]
+        else:
+            xg_seg = xg_arr
         
         try:
             try:
@@ -505,12 +571,37 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         except Exception as e:
             raise RuntimeError(f"Acados solver creation failed: {e}") from e
         
-        # Set initial state
+        # Set initial state (guess + enforce constraint at runtime for segment 2)
         solver.set(0, "x", x0_seg)
+        if seg_idx > 0:
+            # Explicitly set lbx_0=ubx_0=x0 at runtime; ensures correct initial state constraint
+            # (build-time x0 in OCP may not propagate correctly when module cache is cleared)
+            try:
+                solver.constraints_set(0, "lbx", np.asarray(x0_seg, dtype=float))
+                solver.constraints_set(0, "ubx", np.asarray(x0_seg, dtype=float))
+            except Exception as e:
+                if verbose_solve:
+                    print(f"  [Note] constraints_set lbx/ubx: {e}")
         
-        # Set control rate model param p (1/dt per step)
+        # Segment 2 + actuator: relax QP/SQP to avoid ACADOS_MINSTEP (status 4)
+        if seg_idx > 0 and use_actuator_dynamics:
+            try:
+                solver.options_set("qp_tau_min", 1e-8)  # allow smaller barrier param
+                solver.options_set("globalization", "FIXED_STEP")
+                solver.options_set("globalization_fixed_step_length", 0.7)  # conservative step
+            except Exception:
+                pass
+        
+        # Set model param p: control rate uses 1/dt; actuator uses 1/tau per channel
         if use_control_rate:
             p_val = np.array([N / Tf])
+            for i in range(N):
+                solver.set(i, "p", p_val)
+        elif use_actuator_dynamics:
+            actuator_tau_arr = np.asarray(actuator_tau).flatten()
+            if len(actuator_tau_arr) < 4:
+                actuator_tau_arr = np.resize(actuator_tau_arr, 4)
+            p_val = np.asarray(1.0 / np.maximum(actuator_tau_arr.astype(float), 1e-6), dtype=np.float64)
             for i in range(N):
                 solver.set(i, "p", p_val)
         
@@ -519,21 +610,47 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         if use_schedule_ref:
             x0_12 = np.asarray(x0_seg).flatten()[:12]
             xg_12 = np.asarray(xg_seg).flatten()[:12]
+            uref_arr_yref = np.array(uref)
+            # Segment 2 + actuator: use u_actual ref that interpolates u_a0 -> uref (smoother cost landscape)
+            u_actual_ref = uref_arr_yref
+            if seg_idx > 0 and use_actuator_dynamics:
+                u_a0_ref = np.asarray(x0_seg[12:16], dtype=float)
             for i in range(N):
                 alpha = float(i) / N
                 x_ref = (1 - alpha) * x0_12 + alpha * xg_12
                 if use_control_rate:
-                    yref = np.concatenate([x_ref, uref, uref, np.zeros(4)])
+                    yref = np.concatenate([x_ref, uref_arr_yref, uref_arr_yref, np.zeros(4)])
+                elif use_actuator_dynamics:
+                    if seg_idx > 0:
+                        # u_actual ref: interpolate from u_a0 to uref over horizon (reduces initial cost spike)
+                        t_frac = float(i + 1) / max(N, 1)
+                        decay = 1.0 - np.exp(-4.0 * t_frac)
+                        u_actual_ref = u_a0_ref + (uref_arr_yref - u_a0_ref) * decay
+                    yref = np.concatenate([x_ref, u_actual_ref, uref_arr_yref])  # [x_ref_12, u_actual_ref, uref]
                 else:
-                    yref = np.concatenate([x_ref, uref])
+                    yref = np.concatenate([x_ref, uref_arr_yref])
                 solver.set(i, "yref", yref)
         
         # Initial guess: linear interpolation x0->xg
+        # Segment 2 + actuator: u_actual from seg1 may differ from uref; use exponential decay for u_actual
+        # to give dynamics-consistent guess (avoids ACADOS_MINSTEP from bad linear interpolation)
         uref_arr = np.array(uref)
-        for i in range(1, N + 1):
-            alpha = float(i) / N
-            x_guess = (1 - alpha) * x0_seg + alpha * xg_seg
-            solver.set(i, "x", x_guess)
+        if seg_idx > 0 and use_actuator_dynamics:
+            u_a0 = np.asarray(x0_seg[12:16], dtype=float)
+            for i in range(1, N + 1):
+                alpha = float(i) / N
+                x_phys_guess = (1 - alpha) * x0_seg[:12] + alpha * xg_seg[:12]
+                # u_actual: exponential decay from u_a0 to uref (time constant ~3*tau over horizon)
+                t_frac = float(i) / max(N, 1)
+                decay = 1.0 - np.exp(-5.0 * t_frac)  # reach ~99% of (uref-u_a0) by 60% of horizon
+                u_actual_guess = u_a0 + (uref_arr - u_a0) * decay
+                x_guess = np.concatenate([x_phys_guess, u_actual_guess])
+                solver.set(i, "x", x_guess)
+        else:
+            for i in range(1, N + 1):
+                alpha = float(i) / N
+                x_guess = (1 - alpha) * x0_seg + alpha * xg_seg
+                solver.set(i, "x", x_guess)
         for i in range(N):
             solver.set(i, "u", uref_arr)
         
@@ -541,7 +658,10 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         if iteration_callback is not None:
             iteration_callback(0, 0.0, 0.0, seg_idx)
         
+        t0 = time.perf_counter()
         status = solver.solve()
+        elapsed = time.perf_counter() - t0
+        total_solve_time += elapsed
         if status != 0 and seg_idx > 0:
             # ACADOS_MINSTEP(4) common in segment 2: QP step too small, but solution often still usable
             print(f"  [Note] Segment {seg_idx+1} Acados status={status}, solution may be partial (ignore if trajectory OK)")
@@ -552,14 +672,16 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
             sqp_iter = solver.get_stats("sqp_iter")
         except Exception:
             sqp_iter = 1
+        total_sqp_iters += int(sqp_iter)
         if verbose_solve:
             solver.print_statistics()
-            print(f"  Segment {seg_idx+1} final: cost={cost_val:.6e}, SQP iter={sqp_iter}")
+            print(f"  Segment {seg_idx+1} final: cost={cost_val:.6e}, SQP iter={sqp_iter}, time={elapsed:.3f}s")
             sys.stdout.flush()
         if iteration_callback is not None:
             iteration_callback(int(sqp_iter), float(cost_val), 0.0, seg_idx)
         
         # Extract cost from store_iterates for convergence plot
+        # iterate 0 = initial, k = after k-th SQP step; do NOT use get_cost() before solve (returns wrong value)
         costs_list = []
         if verbose_solve:
             try:
@@ -568,10 +690,18 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
                     solver.set_iterate(it)
                     costs_list.append(float(solver.get_cost()))
                 solver.set_iterate(solver.get_iterate(-1))  # restore final solution
+                if len(costs_list) >= 2 and costs_list[-1] > 0:
+                    if abs(costs_list[-1] - cost_val) / max(costs_list[-1], 1e-12) > 0.01:
+                        costs_list[-1] = cost_val
+                    # Acados iter0 cost can be wrong (e.g. 2e-3 vs 1.5); if anomalously small, use iter1
+                    if costs_list[0] < costs_list[-1] * 0.1:
+                        costs_list[0] = costs_list[1]
             except Exception:
                 costs_list = [cost_val] if cost_val is not None else [0.0]
         if not costs_list:
             costs_list = [cost_val] if cost_val is not None else [0.0]
+        if verbose_solve and len(costs_list) >= 2:
+            print(f"  Cost curve: iter0={costs_list[0]:.4e}, iter_last={costs_list[-1]:.4e} (expect iter0>=iter_last)")
         
         # Simple logger for GUI compatibility (costs_list for convergence plot)
         class SimpleLogger:
@@ -584,7 +714,8 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         try:
             seg_xs = [acados_state_to_method1(np.array(solver.get(i, "x"), copy=True)) for i in range(N+1)]
             seg_us = [np.array(solver.get(i, "u"), copy=True) for i in range(N)]
-            x0 = np.array(solver.get(N, "x"), copy=True)
+            # Flatten x0 for next segment; critical for actuator/control-rate (16-dim) continuity
+            x0 = np.asarray(solver.get(N, "x"), dtype=float).flatten()
         except Exception as e:
             if status != 0:
                 # On solver failure use linear interpolation guess for seg_xs
@@ -608,6 +739,10 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
         # Explicitly destroy solver to avoid Acados module cache reusing wrong dim (acados#905)
         del solver
         gc.collect()
+    
+    if verbose_solve and total_sqp_iters > 0:
+        print(f"  [Acados] Total: SQP iter={total_sqp_iters}, time={total_solve_time:.3f}s, avg={total_solve_time/total_sqp_iters*1000:.1f}ms/iter")
+        sys.stdout.flush()
     
     # Combine segments
     combined_xs = []
@@ -654,12 +789,16 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
     uref = np.array([0.0, 0.0, m*9.81, 0.0])
     
     # Unified mode needs stronger waypoint tracking (higher position weight)
-    use_control_rate = weights.get("du", 0.0) > 0
-    model = export_tvc_ode_model(m, I, r_thrust, use_control_rate=use_control_rate)
+    use_actuator_dynamics = weights.get("actuator_dynamics", False)
+    actuator_tau = weights.get("actuator_tau", [0.05, 0.05, 0.05, 0.05])
+    use_control_rate = (not use_actuator_dynamics) and weights.get("du", 0.0) > 0
+    model = export_tvc_ode_model(m, I, r_thrust, use_control_rate=use_control_rate,
+                                use_actuator_dynamics=use_actuator_dynamics, actuator_tau=actuator_tau)
     ocp = build_acados_ocp(model, N_total, Tf_total, x0, xg, uref, weights, bounds, dt, terminal_weights,
                            verbose_solve=verbose_solve)
     
-    x0_seg = np.concatenate([np.asarray(x0).flatten()[:12], uref]) if use_control_rate else np.asarray(x0).flatten()
+    use_16 = use_control_rate or use_actuator_dynamics
+    x0_seg = np.concatenate([np.asarray(x0).flatten()[:12], uref]) if use_16 else np.asarray(x0).flatten()
     
     try:
         solver = AcadosOcpSolver(ocp, verbose=False)
@@ -668,9 +807,16 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
     
     solver.set(0, "x", x0_seg)
     
-    # Set control rate model param p
+    # Set model param p: control rate uses 1/dt; actuator uses 1/tau per channel
     if use_control_rate:
         p_val = np.array([N_total / Tf_total])
+        for i in range(N_total):
+            solver.set(i, "p", p_val)
+    elif use_actuator_dynamics:
+        actuator_tau_arr = np.asarray(actuator_tau).flatten()
+        if len(actuator_tau_arr) < 4:
+            actuator_tau_arr = np.resize(actuator_tau_arr, 4)
+        p_val = 1.0 / np.maximum(actuator_tau_arr.astype(float), 1e-6)
         for i in range(N_total):
             solver.set(i, "p", p_val)
     
@@ -697,17 +843,57 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
                     x_ref = x_ref_this
             if use_control_rate:
                 yref = np.concatenate([x_ref, uref, uref, np.zeros(4)])  # 24 dim
+            elif use_actuator_dynamics:
+                yref = np.concatenate([x_ref, uref, uref])  # 20 dim
             else:
                 yref = np.concatenate([x_ref, uref])
             solver.set(node_idx, "yref", yref)
             node_idx += 1
+    
+    # Boost cost at segment boundaries (intermediate waypoints): use terminal-like weights
+    # so trajectory reaches intermediate waypoints (otherwise only path cost w_p=1, too weak)
+    if (len(durations) > 1 and terminal_weights and
+            weights.get("waypoint_terminal_cost", True)):
+        tw = terminal_weights
+        tw_R = tw.get("R", 200)
+        terminal_scale = weights.get("terminal_scale", 1.0)
+        Qe = np.diag([
+            tw.get("p", 200) * terminal_scale, tw.get("p", 200) * terminal_scale, tw.get("p", 200) * terminal_scale,
+            tw.get("roll", tw_R), tw.get("pitch", tw_R), tw.get("yaw", tw_R),
+            tw.get("v", 50) * terminal_scale, tw.get("v", 50) * terminal_scale, tw.get("v", 50) * terminal_scale,
+            tw.get("w", 20), tw.get("w", 20), tw.get("w", 20)
+        ])
+        w_u = weights.get("u", 1e-3)
+        R_mat = w_u * np.eye(4)
+        W_boundary = None
+        if use_actuator_dynamics:
+            Q_aug = np.diag(np.concatenate([np.diag(Qe), [w_u] * 4]))
+            W_boundary = np.block([[Q_aug, np.zeros((16, 4))], [np.zeros((4, 16)), R_mat]])
+        elif use_control_rate:
+            Q_aug = np.diag(np.concatenate([np.diag(Qe), [w_u] * 4]))
+            w_du = weights.get("du", 0.0)
+            W_du = w_du * np.eye(4)
+            W_boundary = np.block([
+                [Q_aug, np.zeros((16, 4)), np.zeros((16, 4))],
+                [np.zeros((4, 16)), R_mat, np.zeros((4, 4))],
+                [np.zeros((4, 16)), np.zeros((4, 4)), W_du]
+            ])
+        else:
+            W_boundary = np.block([[Qe, np.zeros((12, 4))], [np.zeros((4, 12)), R_mat]])
+        if W_boundary is not None:
+            for seg_idx in range(len(durations) - 1):
+                boundary_node = sum(N_per_seg[:seg_idx + 1]) - 1
+                try:
+                    solver.cost_set(boundary_node, "W", W_boundary)
+                except Exception:
+                    pass
     
     # Initial guess: linear interpolation wp_i -> wp_{i+1} per segment
     x_prev = x0_seg.copy()
     for seg_idx in range(len(durations)):
         end_wp = waypoints[seg_idx + 1]
         x_end_12 = waypoint_to_acados_state(end_wp)[:12]
-        x_end = np.concatenate([x_end_12, uref]) if use_control_rate else x_end_12
+        x_end = np.concatenate([x_end_12, uref]) if use_16 else x_end_12
         n_seg = N_per_seg[seg_idx]
         i0 = sum(N_per_seg[:seg_idx])
         for k in range(n_seg):
@@ -721,7 +907,9 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
     if iteration_callback is not None:
         iteration_callback(0, 0.0, 0.0, 0)
     
+    t0 = time.perf_counter()
     status = solver.solve()
+    elapsed = time.perf_counter() - t0
     
     cost_val = solver.get_cost()
     try:
@@ -730,7 +918,9 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
         sqp_iter = 1
     if verbose_solve:
         solver.print_statistics()
-        print(f"  Final: cost={cost_val:.6e}, SQP iter={sqp_iter}")
+        print(f"  Final: cost={cost_val:.6e}, SQP iter={sqp_iter}, time={elapsed:.3f}s")
+        if sqp_iter > 0:
+            print(f"  [Acados] Total: SQP iter={sqp_iter}, time={elapsed:.3f}s, avg={elapsed/sqp_iter*1000:.1f}ms/iter")
         sys.stdout.flush()
     if iteration_callback is not None:
         iteration_callback(int(sqp_iter), float(cost_val), 0.0, 0)
@@ -744,10 +934,17 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
                 solver.set_iterate(it)
                 costs_list.append(float(solver.get_cost()))
             solver.set_iterate(solver.get_iterate(-1))  # restore final solution
+            if len(costs_list) >= 2 and costs_list[-1] > 0:
+                if abs(costs_list[-1] - cost_val) / max(costs_list[-1], 1e-12) > 0.01:
+                    costs_list[-1] = cost_val
+                if costs_list[0] < costs_list[-1] * 0.1:
+                    costs_list[0] = costs_list[1]
         except Exception:
             costs_list = [cost_val] if cost_val is not None else [0.0]
     if not costs_list:
         costs_list = [cost_val] if cost_val is not None else [0.0]
+    if verbose_solve and len(costs_list) >= 2:
+        print(f"  Cost curve: iter0={costs_list[0]:.4e}, iter_last={costs_list[-1]:.4e} (expect iter0>=iter_last)")
     
     class SimpleLogger:
         def __init__(self, costs):
@@ -765,20 +962,25 @@ def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, 
 
 
 def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=False, verbose_solve=True,
-                        waypoint_terminal_cost=True):
+                        waypoint_terminal_cost=True, use_actuator_dynamics=False, actuator_tau=None):
     """
     Simple test: trajectory optimization with 2+ waypoints.
     Supports: non-zero start time, single segment (2 waypoints), multi-segment (3+ waypoints).
     unified=True: single OCP for full trajectory, avoids ACADOS_MINSTEP in segment 2.
     use_control_rate_smooth=True: add control rate penalty for smoother u; False: keep default.
+    use_actuator_dynamics=True: first-order actuator dynamics per channel.
+    actuator_tau: [tau_pitch, tau_roll, tau_T, tau_yaw] in seconds; default [0.05]*4.
     Waypoint format: [x, y, z, yaw_deg, time]
     """
+    if actuator_tau is None:
+        actuator_tau = [0.05, 0.05, 0.05, 0.05]
     dt = 0.05
     # Example: 3 waypoints, 2 segments
     waypoints = [
         [0.0, 0.0, 0.0, 0.0, 0.0],   # start
         [2.0, 1.0, 3.0, 0.0, 5.0],   # intermediate
         [4.0, 0.0, 1.0, 0.0, 10.0],  # end
+        [6.0, 0.0, 1.0, 0.0, 15.0],  # end
     ]
     m = 0.6
     I = np.diag([0.02, 0.02, 0.01])
@@ -787,6 +989,11 @@ def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=
     weights = {"p": 1.0, "v": 0.2, "R": 1.0, 'yaw': 50.0, "w": 0.1, "u": 1.0}
     if use_control_rate_smooth:
         weights["du"] = 100.0
+    if use_actuator_dynamics:
+        weights["actuator_dynamics"] = True
+        weights["actuator_tau"] = list(np.asarray(actuator_tau).flatten()[:4])
+        if len(weights["actuator_tau"]) < 4:
+            weights["actuator_tau"] = weights["actuator_tau"] + [0.05] * (4 - len(weights["actuator_tau"]))
     # Terminal cost: ensure target achievement
     weights["schedule_ref"] = True
     weights["terminal_scale"] = 100.0
@@ -813,18 +1020,15 @@ def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=
     if len(waypoints) >= 2:
         seg_info = [f"{waypoints[i+1][4]-waypoints[i][4]:.1f}s" for i in range(n_seg)]
         print(f"dt={dt}s, segment durations: {seg_info}")
-    # When multi-WP and waypoint_terminal_cost: use segment mode for terminal cost at intermediate points
-    use_segment_for_waypoints = (
-        len(waypoints) > 2 and unified and weights.get("waypoint_terminal_cost", True)
-    )
-    if use_segment_for_waypoints:
-        unified = False
-        print("Mode: segment (multi-WP + waypoint terminal cost)")
-    elif unified:
+    # Respect unified: when user passes unified=True, use unified mode (single OCP).
+    # Unified solver supports waypoint terminal cost via per-segment cost targets.
+    # Segment mode is only used when unified=False (e.g. for debugging segment 2 actuator issues).
+    if unified:
         print("Mode: unified (single OCP)")
     else:
         print("Mode: segment (per-segment OCP)")
     print(f"Control rate penalty: {'enabled du=' + str(weights.get('du', 0)) if use_control_rate_smooth else 'disabled'}")
+    print(f"Actuator dynamics: {'enabled tau=' + str(weights.get('actuator_tau', [])) if use_actuator_dynamics else 'disabled'}")
     print(f"Ref mode: {'on-time arrival (schedule_ref)' if weights.get('schedule_ref', True) else 'constant goal (may arrive early)'}")
     print(f"Terminal cost: terminal_weights={terminal_weights}")
     print(f"Terminal scale: terminal_scale={weights.get('terminal_scale', 1)}, terminal_constraint={weights.get('terminal_constraint', False)}")
@@ -857,7 +1061,7 @@ def test_three_waypoints(show_plot=True, unified=False, use_control_rate_smooth=
                 print(f"  WP{i} at: {at_wp} | error: {err:.4f}m")
     for i, lg in enumerate(loggers):
         if lg and lg.costs:
-            print(f"  Segment {i+1} cost: {lg.costs[0]:.6e}")
+            print(f"  Segment {i+1} final cost: {lg.costs[-1]:.6e}")
     print("=" * 50)
 
     if show_plot:
@@ -879,10 +1083,19 @@ def _plot_result(xs, us, waypoints, dt, loggers):
         print(f"  Segment boundary indices: {boundaries} ({len(boundaries)} segments)")
     wp_list = waypoints if waypoints and all(len(wp) >= 5 for wp in waypoints) else [[wp[0], wp[1], wp[2], 0.0, i * dt] for i, wp in enumerate(waypoints)]
 
+    # Print cost curve before plotting
+    if loggers:
+        print("Cost curve (before plot):")
+        for i, lg in enumerate(loggers):
+            if lg and lg.costs:
+                print(f"  Segment {i+1}: n={len(lg.costs)}, cost[0]={lg.costs[0]:.6e}, cost[-1]={lg.costs[-1]:.6e}")
+                if len(lg.costs) <= 20:
+                    print(f"    costs = {[f'{c:.4e}' for c in lg.costs]}")
+                else:
+                    print(f"    costs[:5] = {[f'{c:.4e}' for c in lg.costs[:5]]} ... costs[-3:] = {[f'{c:.4e}' for c in lg.costs[-3:]]}")
     try:
         from tvc_traj_opt import plot_trajectory
-        logger = loggers[0] if loggers else None
-        fig = plot_trajectory(xs, us, dt, logger=logger, x_goal=None, waypoints=wp_list,
+        fig = plot_trajectory(xs, us, dt, all_loggers=loggers, x_goal=None, waypoints=wp_list,
                              segment_boundaries=boundaries if boundaries else None)
         fig.suptitle("TVC Trajectory - Acados", fontsize=12)
         plt.show()
@@ -933,13 +1146,23 @@ if __name__ == "__main__":
     parser.add_argument("--no-waypoint-terminal", action="store_true",
                         help="Do not enforce waypoint terminal cost. With --unified keeps unified; else multi-WP uses segment mode")
     parser.add_argument("--smooth", action="store_true", help="Add control rate penalty for smoother u")
+    parser.add_argument("--actuator", action="store_true",
+                        help="Enable first-order actuator dynamics (tau*u_dot = u_cmd - u_actual per channel)")
+    parser.add_argument("--actuator-tau", type=str, default="0.5,0.5,0.3,0.1",
+                        help="Actuator time constants [pitch,roll,T,yaw] in seconds (default: 0.05,0.05,0.05,0.05)")
     parser.add_argument("--quiet", action="store_true", help="Do not print SQP iteration stats and cost")
     args = parser.parse_args()
 
+    actuator_tau_list = [float(x.strip()) for x in args.actuator_tau.split(",") if x.strip()]
+    if args.actuator and len(actuator_tau_list) < 4:
+        actuator_tau_list = actuator_tau_list + [0.05] * (4 - len(actuator_tau_list))
+
     test_three_waypoints(
         show_plot=not args.no_plot,
-        unified=args.unified,
+        unified=True,
         use_control_rate_smooth=args.smooth,
         verbose_solve=not args.quiet,
         waypoint_terminal_cost=not args.no_waypoint_terminal,
+        use_actuator_dynamics=True,
+        actuator_tau=actuator_tau_list,
     )

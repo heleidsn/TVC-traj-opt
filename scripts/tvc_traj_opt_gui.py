@@ -886,6 +886,52 @@ class MainWindow(QMainWindow):
         self.schedule_ref_checkbox.setToolTip('Checked: time-interpolated ref for on-time arrival; unchecked: constant goal ref, may arrive early')
         cost_layout.addWidget(self.schedule_ref_checkbox, 5, 0, 1, 4)
         
+        # Acados: first-order actuator dynamics (per-channel time constants)
+        self.actuator_dynamics_checkbox = QCheckBox('Actuator dynamics (first-order) [Acados]')
+        self.actuator_dynamics_checkbox.setChecked(False)
+        self.actuator_dynamics_checkbox.setToolTip('When enabled: model actuator as tau*u_dot = u_cmd - u_actual per channel. Acados only.')
+        cost_layout.addWidget(self.actuator_dynamics_checkbox, 6, 0, 1, 4)
+        self.tau_pitch_spin = QDoubleSpinBox()
+        self.tau_pitch_spin.setRange(0.001, 1.0)
+        self.tau_pitch_spin.setValue(0.05)
+        self.tau_pitch_spin.setDecimals(3)
+        self.tau_pitch_spin.setSingleStep(0.01)
+        self.tau_pitch_spin.setMaximumHeight(25)
+        self.tau_pitch_spin.setMaximumWidth(80)
+        self.tau_pitch_spin.setToolTip('Pitch channel time constant (s)')
+        self.tau_roll_spin = QDoubleSpinBox()
+        self.tau_roll_spin.setRange(0.001, 1.0)
+        self.tau_roll_spin.setValue(0.05)
+        self.tau_roll_spin.setDecimals(3)
+        self.tau_roll_spin.setSingleStep(0.01)
+        self.tau_roll_spin.setMaximumHeight(25)
+        self.tau_roll_spin.setMaximumWidth(80)
+        self.tau_roll_spin.setToolTip('Roll channel time constant (s)')
+        self.tau_T_spin = QDoubleSpinBox()
+        self.tau_T_spin.setRange(0.001, 1.0)
+        self.tau_T_spin.setValue(0.05)
+        self.tau_T_spin.setDecimals(3)
+        self.tau_T_spin.setSingleStep(0.01)
+        self.tau_T_spin.setMaximumHeight(25)
+        self.tau_T_spin.setMaximumWidth(80)
+        self.tau_T_spin.setToolTip('Thrust channel time constant (s)')
+        self.tau_yaw_spin = QDoubleSpinBox()
+        self.tau_yaw_spin.setRange(0.001, 1.0)
+        self.tau_yaw_spin.setValue(0.05)
+        self.tau_yaw_spin.setDecimals(3)
+        self.tau_yaw_spin.setSingleStep(0.01)
+        self.tau_yaw_spin.setMaximumHeight(25)
+        self.tau_yaw_spin.setMaximumWidth(80)
+        self.tau_yaw_spin.setToolTip('Yaw channel time constant (s)')
+        cost_layout.addWidget(QLabel('tau pitch (s):'), 7, 0)
+        cost_layout.addWidget(self.tau_pitch_spin, 7, 1)
+        cost_layout.addWidget(QLabel('tau roll (s):'), 7, 2)
+        cost_layout.addWidget(self.tau_roll_spin, 7, 3)
+        cost_layout.addWidget(QLabel('tau T (s):'), 8, 0)
+        cost_layout.addWidget(self.tau_T_spin, 8, 1)
+        cost_layout.addWidget(QLabel('tau yaw (s):'), 8, 2)
+        cost_layout.addWidget(self.tau_yaw_spin, 8, 3)
+        
         cost_group.setLayout(cost_layout)
         
         # Terminal cost weights - applied at waypoint arrival
@@ -1226,6 +1272,7 @@ class MainWindow(QMainWindow):
             },
             3: {  # Method 4: Acados - native constraints
                 "w_p": 1.0, "w_v": 0.2, "w_R": 0.5, "w_yaw": 0.5, "w_w": 0.1,
+                "actuator_dynamics": False, "actuator_tau": [0.05, 0.05, 0.05, 0.05],
                 "w_u": 0.5, "w_du": 0.5, "schedule_ref": True,
                 "terminal_scale": 100.0, "terminal_constraint": False, "waypoint_terminal_cost": True,
                 "k_bound": 200.0, "k_state_bound": 20.0,
@@ -1416,6 +1463,15 @@ class MainWindow(QMainWindow):
             self.terminal_constraint_checkbox.setChecked(params["terminal_constraint"])
         if "waypoint_terminal_cost" in params:
             self.waypoint_terminal_checkbox.setChecked(params["waypoint_terminal_cost"])
+        if "actuator_dynamics" in params:
+            self.actuator_dynamics_checkbox.setChecked(params["actuator_dynamics"])
+        if "actuator_tau" in params:
+            tau = params["actuator_tau"]
+            if len(tau) >= 4:
+                self.tau_pitch_spin.setValue(tau[0])
+                self.tau_roll_spin.setValue(tau[1])
+                self.tau_T_spin.setValue(tau[2])
+                self.tau_yaw_spin.setValue(tau[3])
         method_names = ["Method 1 (Custom calcDiff)", "Method 2 (FDDP)", "Method 3 (BoxFDDP)", "Method 4 (Acados)"]
         self.status_text.append(f"Parameters loaded for {method_names[index] if index < len(method_names) else 'Unknown'}")
     
@@ -1544,7 +1600,10 @@ class MainWindow(QMainWindow):
             "schedule_ref": self.schedule_ref_checkbox.isChecked(),
             "terminal_scale": self.terminal_scale_spin.value(),
             "terminal_constraint": self.terminal_constraint_checkbox.isChecked(),
-            "waypoint_terminal_cost": self.waypoint_terminal_checkbox.isChecked()
+            "waypoint_terminal_cost": self.waypoint_terminal_checkbox.isChecked(),
+            "actuator_dynamics": self.actuator_dynamics_checkbox.isChecked(),
+            "actuator_tau": [self.tau_pitch_spin.value(), self.tau_roll_spin.value(),
+                            self.tau_T_spin.value(), self.tau_yaw_spin.value()]
         }
         
         # Terminal cost weights
@@ -2095,8 +2154,7 @@ class MainWindow(QMainWindow):
         
         # Show full trajectory plot only if checkbox is checked
         if self.show_plot_checkbox.isChecked():
-            main_logger = all_loggers[0] if all_loggers and len(all_loggers) > 0 else None
-            self.show_full_trajectory(xs, us, main_logger)
+            self.show_full_trajectory(xs, us, all_loggers)
     
     def optimization_error(self, error_msg):
         """Optimization error"""
@@ -2105,7 +2163,7 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
     
-    def show_full_trajectory(self, xs, us, logger):
+    def show_full_trajectory(self, xs, us, all_loggers=None):
         """Show full trajectory plot"""
         try:
             from tvc_traj_opt import plot_trajectory
@@ -2113,7 +2171,7 @@ class MainWindow(QMainWindow):
             
             waypoints = self.waypoints if hasattr(self, 'waypoints') else None
             dt = self.dt_spin.value()
-            fig = plot_trajectory(xs, us, dt, logger, x_goal=None, waypoints=waypoints)
+            fig = plot_trajectory(xs, us, dt, all_loggers=all_loggers, x_goal=None, waypoints=waypoints)
             plt.show()
         except Exception as e:
             QMessageBox.warning(self, 'Warning', f'Cannot display full trajectory plot: {str(e)}')
