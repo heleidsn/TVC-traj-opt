@@ -1,12 +1,12 @@
 # TVC Rocket Trajectory Optimization
 
-TVC (Thrust Vector Control) Rocket Trajectory Optimization using Crocoddyl optimal control library.
+TVC (Thrust Vector Control) Rocket Trajectory Optimization using Crocoddyl and Acados optimal control libraries.
 
 ## Features
 
-- **Trajectory Optimization**: Uses Crocoddyl's FDDP algorithm for trajectory optimization
+- **Trajectory Optimization**: Crocoddyl FDDP algorithm and Acados NLP solver
 - **Multi-Waypoint Planning**: Supports multiple waypoints with specified arrival times and yaw angles
-- **Real-time GUI**: Interactive PyQt5 GUI for parameter adjustment and visualization
+- **Real-time GUI**: Interactive PyQt5/PySide2 GUI for parameter adjustment and visualization
 - **Comprehensive Constraints**: 
   - Control constraints (TVC pitch/roll angles, thrust, yaw torque)
   - State constraints (velocity, angles, angular velocity)
@@ -19,15 +19,21 @@ TVC (Thrust Vector Control) Rocket Trajectory Optimization using Crocoddyl optim
 - Python 3.7+
 
 ### Main Dependencies
-- `crocoddyl`: Optimal control library
+- `crocoddyl`: Optimal control library (Crocoddyl-based scripts)
 - `numpy`: Numerical computing
 - `matplotlib`: Visualization
 - `PyQt5` or `PySide2`: GUI framework
 - `pyyaml`: YAML configuration file parsing
 
+### Optional (for Acados)
+- `casadi`: Symbolic framework
+- `acados`: Nonlinear MPC/NLP solver (requires build from source)
+
 ## Installation
 
-### Using conda (Recommended)
+### 1. Base Installation (Crocoddyl + GUI)
+
+#### Using conda (Recommended)
 
 ```bash
 conda create -n tvc-opt python=3.10
@@ -36,47 +42,81 @@ conda install -c conda-forge crocoddyl
 pip install -r requirements.txt
 ```
 
-### Using pip + virtualenv
+#### Using pip + virtualenv
 
 ```bash
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
+source venv/bin/activate   # Linux/Mac
 # or venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
 **Note**: `crocoddyl` may need to be installed via conda-forge on some systems.
 
+### 2. Acados Installation (Optional, for `tvc_traj_opt_acados.py`)
+
+Acados provides faster trajectory optimization with native constraint handling. Build from source:
+
+#### Prerequisites
+- `git`, `make`, `cmake`
+- `casadi`: `pip install casadi`
+
+#### Build Acados (Linux/Mac)
+
+```bash
+git clone https://github.com/acados/acados.git
+cd acados
+git submodule update --recursive --init
+
+mkdir -p build
+cd build
+cmake -DACADOS_WITH_QPOASES=ON -DBUILD_SHARED_LIBS=ON ..
+make install -j4
+```
+
+#### Install Python Interface
+
+```bash
+pip install -e <acados_root>/interfaces/acados_template
+```
+
+#### Set Environment Variables
+
+Add to your shell config (`~/.bashrc` or `~/.zshrc`):
+
+```bash
+export ACADOS_SOURCE_DIR=/path/to/acados
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib
+```
+
+On macOS, use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH`.
+
+See [acados installation docs](https://docs.acados.org/installation/) for more details.
+
 ## Project Structure
 
 ```
-tvc-rocket-trajectory-optimization/
-├── scripts/              # Executable scripts
-│   ├── tvc_traj_opt.py   # Command-line optimization script
-│   └── tvc_traj_opt_gui.py  # GUI application
-├── models/               # Model files (URDF, SDF)
-│   └── tvc/
-├── config/               # Configuration files
-│   └── default_params.yaml
-├── results/              # Output directory
-│   ├── trajectories/
-│   ├── plots/
-│   ├── videos/          # Generated videos
-│   └── logs/
-├── assets/               # Project resources
-│   ├── images/          # Example/demo images
-│   └── videos/          # Example/demo videos
+TVC-traj-opt/
+├── scripts/                    # Executable scripts
+│   ├── tvc_traj_opt.py         # Crocoddyl command-line optimization
+│   ├── tvc_traj_opt_gui.py     # Crocoddyl GUI application
+│   ├── tvc_traj_opt_acados.py  # Acados trajectory optimization
+│   ├── tvc_attitude_ctrl_gui.py # TVC attitude control simulation GUI
+│   └── tvc_common.py           # Shared utilities
+├── config/                     # Configuration files
+│   └── tvc_params.json         # Default params for attitude GUI
+├── results/                    # Output directory
+├── models/                     # Model files
+└── assets/                     # Project resources
 ```
 
 ## Usage
 
-### GUI Application (Recommended)
+### GUI Application (Crocoddyl-based)
 
 ```bash
 python scripts/tvc_traj_opt_gui.py
 ```
-
-![TVC Rocket Trajectory Optimization GUI](/assets/images/gui_v1.png)
 
 The GUI allows you to:
 - Set waypoints with positions, yaw angles, and arrival times
@@ -84,13 +124,41 @@ The GUI allows you to:
 - Configure physical parameters
 - Visualize optimization results in real-time
 
-### Command-line Script
+### Command-line Script (Crocoddyl)
 
 ```bash
 python -u scripts/tvc_traj_opt.py
 ```
 
 Use `-u` flag for unbuffered output to see real-time iteration information.
+
+### Acados Trajectory Optimization
+
+Acados-based optimization with native constraint handling and faster convergence:
+
+```bash
+# Ensure environment variables are set (add to ~/.bashrc for persistence)
+export ACADOS_SOURCE_DIR=/path/to/acados
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib
+
+python -u scripts/tvc_traj_opt_acados.py
+```
+
+The script auto-detects `acados` if not found in `PATH`. It supports:
+- Control bounds (TVC angles, thrust, yaw torque)
+- State path constraints (velocity, angles)
+- Optional actuator dynamics (first-order lag)
+- Optional control rate penalty
+
+### TVC Attitude Control Simulation
+
+Interactive P+PID attitude control simulation with GUI:
+
+```bash
+python scripts/tvc_attitude_ctrl_gui.py
+```
+
+Parameters are saved/loaded from `config/tvc_params.json` by default.
 
 ## Waypoint Format
 
@@ -134,10 +202,6 @@ Waypoints are specified as: `[x, y, z, yaw_deg, arrival_time]`
 After optimization, the following are generated:
 - **Visualization Plots**: Complete plots of all states, controls, and cost
 - **Trajectory Data**: State and control trajectories
-
-## TODO
-
-- Add faster optimization method
 
 ## Author
 
