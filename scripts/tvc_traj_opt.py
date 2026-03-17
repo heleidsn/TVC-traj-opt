@@ -21,61 +21,10 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.gridspec import GridSpec
 import crocoddyl
 
-# -------- quaternion utils --------
-def quat_mul(q1, q2):
-    # q = [w,x,y,z]
-    w1,x1,y1,z1 = q1
-    w2,x2,y2,z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2
-    ])
-
-def quat_conj(q):
-    w,x,y,z = q
-    return np.array([w,-x,-y,-z])
-
-def quat_norm(q):
-    return q / np.linalg.norm(q)
-
-def quat_exp(dtheta):
-    # exp map from so(3) to quaternion, dtheta is 3-vector
-    a = np.linalg.norm(dtheta)
-    if a < 1e-12:
-        return np.array([1.0, 0.5*dtheta[0], 0.5*dtheta[1], 0.5*dtheta[2]])
-    axis = dtheta / a
-    s = np.sin(0.5*a)
-    return np.array([np.cos(0.5*a), axis[0]*s, axis[1]*s, axis[2]*s])
-
-def so3_log_from_quat(q):
-    # q must be unit, returns rotation vector
-    q = quat_norm(q)
-    w, v = q[0], q[1:]
-    nv = np.linalg.norm(v)
-    w = np.clip(w, -1.0, 1.0)
-    if nv < 1e-12:
-        return np.zeros(3)
-    angle = 2.0*np.arctan2(nv, w)
-    return angle * (v / nv)
-
-def R_from_quat(q):
-    # q=[w,x,y,z]
-    w,x,y,z = q
-    return np.array([
-        [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
-    ])
-
-def Rx(a):
-    ca, sa = np.cos(a), np.sin(a)
-    return np.array([[1,0,0],[0,ca,-sa],[0,sa,ca]])
-
-def Ry(a):
-    ca, sa = np.cos(a), np.sin(a)
-    return np.array([[ca,0,sa],[0,1,0],[-sa,0,ca]])
+from tvc_common import (
+    quat_mul, quat_conj, quat_norm, quat_exp, so3_log_from_quat, R_from_quat,
+    Rx, Ry, quat_to_euler, segment_boundaries_from_waypoints, SEGMENT_COLORS,
+)
 
 # -------- Crocoddyl Action Model --------
 class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
@@ -192,9 +141,16 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         x_next[13:17] = u                      # u_prev <- u
         return x_next
 
-    def _bound_pen(self, val, lb, ub, k):
-        if val < lb: return k*(lb - val)**2
-        if val > ub: return k*(val - ub)**2
+    def _bound_pen(self, val, lb, ub, k, alpha=5.0):
+        """Smooth boundary penalty (C∞) using soft-plus² for optimization stability"""
+        if val < lb:
+            z = lb - val
+            sp = np.logaddexp(0, alpha * z) / alpha
+            return k * sp * sp
+        if val > ub:
+            z = val - ub
+            sp = np.logaddexp(0, alpha * z) / alpha
+            return k * sp * sp
         return 0.0
     
     def _quat_to_euler(self, q):
@@ -246,7 +202,8 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         # State constraints
         kSB = self.state_b["k_state_bound"]
         # Velocity constraints (horizontal and vertical)
-        v_horizontal = np.sqrt(v[0]**2 + v[1]**2)  # Horizontal velocity magnitude
+        _eps_vh = 1e-8
+        v_horizontal = np.sqrt(v[0]**2 + v[1]**2 + _eps_vh**2)  # Smooth, no singularity at origin
         v_vertical = abs(v[2])  # Vertical velocity magnitude
         cost += self._bound_pen(v_horizontal, 0.0, self.state_b["v_horizontal_max"], kSB)
         cost += self._bound_pen(v_vertical, 0.0, self.state_b["v_vertical_max"], kSB)
@@ -486,7 +443,7 @@ def solve_once(dt=0.02, N=100, max_iter=100):
 
 # xs, us = solve_once()
 
-def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
+def plot_trajectory(xs, us, dt, logger=None, all_loggers=None, x_goal=None, waypoints=None, segment_boundaries=None):
     """
     Plot trajectory optimization results - all states, controls and cost on one page
     
@@ -494,9 +451,11 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
         xs: State trajectory list
         us: Control input list
         dt: Time step
-        logger: Callback logger (optional, for plotting convergence curve)
+        logger: Single callback logger (optional, for backward compatibility)
+        all_loggers: List of loggers per segment (optional; overrides logger when multi-segment)
         x_goal: Target state (optional)
-        waypoints: List of waypoint positions (optional, for plotting waypoints)
+        waypoints: List of waypoint positions (optional). If [x,y,z,yaw,time], segments are colored.
+        segment_boundaries: Optional [end_idx_seg1, end_idx_seg2, ...] to override segment coloring.
     """
     # Convert to numpy arrays
     xs_array = np.array(xs)
@@ -518,16 +477,8 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
     T = us_array[:, 2]     # thrust
     tau_yaw = us_array[:, 3]  # yaw torque
     
-    # Convert quaternion to Euler angles (for display)
-    def quat_to_euler(q):
-        """Convert quaternion to Euler angles (ZYX order)"""
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        roll = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
-        pitch = np.arcsin(2*(w*y - z*x))
-        yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
-        return np.array([roll, pitch, yaw])
-    
-    euler_angles = np.array([quat_to_euler(q) for q in quaternions])
+    # Convert quaternion to Euler angles (for display), Method 1 uses wxyz
+    euler_angles = np.array([quat_to_euler(q, format='wxyz') for q in quaternions])
     
     # Create figure - use GridSpec for flexible layout, all content on one page
     # Layout: 4 rows x 4 columns, 16 subplot positions
@@ -539,10 +490,31 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
     # First row: 3D trajectory and convergence curve
     # 1. 3D position trajectory (occupies 2 positions)
     ax1 = fig.add_subplot(gs[0, 0:2], projection='3d')
-    ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Trajectory')
-    ax1.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
+    boundaries = segment_boundaries if segment_boundaries is not None else (
+        segment_boundaries_from_waypoints(waypoints, dt) if waypoints else [])
+    if boundaries:
+        idx = 0
+        for i, end_idx in enumerate(boundaries):
+            end_idx = min(end_idx, len(positions) - 1)
+            if idx <= end_idx:
+                seg_pos = positions[idx:end_idx + 1]
+                c = SEGMENT_COLORS[i % len(SEGMENT_COLORS)]
+                ax1.plot(seg_pos[:, 0], seg_pos[:, 1], seg_pos[:, 2],
+                         color=c, linewidth=2.5, label=f'Segment {i + 1}')
+                if idx < end_idx:
+                    ax1.scatter(seg_pos[-1, 0], seg_pos[-1, 1], seg_pos[-1, 2],
+                                color=c, s=60, marker='o', edgecolors='black', linewidths=1, zorder=5)
+            idx = end_idx
+        if idx < len(positions) - 1:
+            seg_pos = positions[idx:]
+            c = SEGMENT_COLORS[len(boundaries) % len(SEGMENT_COLORS)]
+            ax1.plot(seg_pos[:, 0], seg_pos[:, 1], seg_pos[:, 2],
+                     color=c, linewidth=2.5, label=f'Segment {len(boundaries) + 1}')
+    else:
+        ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Trajectory')
+    ax1.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
                 color='green', s=100, marker='o', label='Start')
-    ax1.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
+    ax1.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2],
                 color='red', s=100, marker='*', label='End')
     
     # Collect all points for unified scaling
@@ -602,21 +574,32 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
     
     # 2. Cost convergence curve (occupies 2 positions)
     ax_cost = fig.add_subplot(gs[0, 2:4])
-    if logger is not None and len(logger.costs) > 0:
-        iterations = np.arange(len(logger.costs))
-        ax_cost.semilogy(iterations, logger.costs, 'b-', linewidth=2.5, label='Cost', marker='o', markersize=3)
+    # Prefer all_loggers for multi-segment; fallback to single logger
+    loggers_to_plot = all_loggers if (all_loggers and len(all_loggers) > 0) else ([logger] if logger else [])
+    if loggers_to_plot and any(lg and len(lg.costs) > 0 for lg in loggers_to_plot):
+        colors = ['b', 'r', 'g', 'm', 'c', 'orange', 'purple', 'brown']
+        cumulative_iter = 0
+        for seg_idx, lg in enumerate(loggers_to_plot):
+            if lg and len(lg.costs) > 0:
+                color = colors[seg_idx % len(colors)]
+                label = f'Segment {seg_idx + 1}' if len(loggers_to_plot) > 1 else 'Cost'
+                seg_iterations = np.arange(len(lg.costs)) + cumulative_iter
+                ax_cost.semilogy(seg_iterations, lg.costs, color=color, linewidth=2.5,
+                                marker='o', markersize=3, label=label)
+                cumulative_iter += len(lg.costs)
         ax_cost.set_xlabel('Iteration', fontsize=10)
         ax_cost.set_ylabel('Cost (log scale)', fontsize=10)
         ax_cost.set_title('Optimization Cost Convergence', fontsize=11, fontweight='bold')
         ax_cost.legend(fontsize=9)
         ax_cost.grid(True, alpha=0.3)
-        # Add final cost text
-        final_cost = logger.costs[-1]
-        ax_cost.text(0.02, 0.98, f'Final Cost: {final_cost:.4e}', 
-                    transform=ax_cost.transAxes, fontsize=9,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # Add final cost text (from last segment)
+        last_lg = next((lg for lg in reversed(loggers_to_plot) if lg and lg.costs), None)
+        if last_lg:
+            ax_cost.text(0.02, 0.98, f'Final Cost: {last_lg.costs[-1]:.4e}',
+                        transform=ax_cost.transAxes, fontsize=9,
+                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     else:
-        ax_cost.text(0.5, 0.5, 'No convergence data', 
+        ax_cost.text(0.5, 0.5, 'No convergence data',
                     ha='center', va='center', transform=ax_cost.transAxes, fontsize=12)
         ax_cost.set_title('Cost Convergence', fontsize=11, fontweight='bold')
     

@@ -42,3 +42,6 @@ Thumbs.db
 # Environment
 .env
 .venv
+c_generated_code/
+scripts/*.json
+tvc_rocket_ocp.json

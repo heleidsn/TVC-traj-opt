@@ -6,7 +6,7 @@
        ========================= -->
   <link name="base_link">
     <inertial>
-      <!-- NOTE: URDF惯量默认在link坐标系下 -->
+      <!-- NOTE: URDF inertia is in link frame by default -->
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <mass value="0.6"/>
       <inertia
@@ -15,7 +15,7 @@
         izz="0.0001"/>
     </inertial>
 
-    <!-- 可选：仅用于可视化（对优化无影响） -->
+    <!-- Optional: for visualization only (no effect on optimization) -->
     <visual>
       <origin xyz="0 0 0.5" rpy="0 0 0"/>
       <geometry>
@@ -54,8 +54,8 @@
   <joint name="base_to_gimbal_mount" type="fixed">
     <parent link="base_link"/>
     <child link="gimbal_mount"/>
-    <!-- 你SDF里gimbal_mount pose=0 0 0.2525，但那是模型在世界的摆放/展示用。
-         如果你希望几何位置一致，可把 xyz 改成 0 0 0.2525 -->
+    <!-- In your SDF gimbal_mount pose=0 0 0.2525; that is for world placement/display.
+         For matching geometry, set xyz to 0 0 0.2525 -->
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
 
@@ -120,7 +120,7 @@
     <parent link="servo0_roll"/>
     <child link="servo1_pitch"/>
     <origin xyz="0 0 0" rpy="0 0 0"/>
-    <!-- 这里严格按你SDF：0 -1 0 -->
+    <!-- Match your SDF: 0 -1 0 -->
     <axis xyz="0 -1 0"/>
     <limit lower="-1.0" upper="1.0" effort="100.0" velocity="50.0"/>
     <dynamics damping="0.0" friction="0.0"/>
@@ -128,10 +128,10 @@
 
   <!-- =========================
        Optional: nozzle/motor frame (fixed)
-       用来放“推力作用点/方向”的frame，方便你在动力学里施加wrench
+       Frame for thrust point/direction, for applying wrench in dynamics
        ========================= -->
   <link name="nozzle_frame">
-    <!-- 这个link可以没有inertial；为了兼容性给一个极小值 -->
+    <!-- This link can have no inertial; minimal value for compatibility -->
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <mass value="1e-6"/>
@@ -145,7 +145,7 @@
   <joint name="pitch_to_nozzle" type="fixed">
     <parent link="servo1_pitch"/>
     <child link="nozzle_frame"/>
-    <!-- 如果推力点相对servo1_pitch有偏置，把xyz改掉（比如沿z方向） -->
+    <!-- If thrust point has offset from servo1_pitch, change xyz (e.g. along z) -->
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
 
