@@ -20,10 +20,10 @@ setup(
         "pyyaml>=5.4.0",
     ],
     python_requires=">=3.7",
+    py_modules=["run_tvc_traj_opt"],
     entry_points={
         "console_scripts": [
-            "tvc-opt-gui=scripts.tvc_traj_opt_gui:main",
-            "tvc-opt=scripts.tvc_traj_opt:solve_once",
+            "tvc-traj-opt=run_tvc_traj_opt:main",
         ],
     },
 )

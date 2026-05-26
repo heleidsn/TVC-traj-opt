@@ -97,11 +97,14 @@ See [acados installation docs](https://docs.acados.org/installation/) for more d
 
 ```
 TVC-traj-opt/
-├── scripts/                    # Executable scripts
-│   ├── tvc_traj_opt.py         # Crocoddyl command-line optimization
-│   ├── tvc_traj_opt_gui.py     # Crocoddyl GUI application
-│   ├── tvc_traj_opt_acados.py  # Acados trajectory optimization
-│   ├── tvc_attitude_ctrl_gui.py # TVC attitude control simulation GUI
+├── run_tvc_traj_opt.py         # **Main entry** — launches trajectory optimization GUI
+├── scripts/                    # Implementation (called by GUI / CLI)
+│   ├── tvc_traj_opt_gui.py     # GUI implementation (Methods 1–7)
+│   ├── tvc_traj_opt.py         # Method 1: Crocoddyl custom calcDiff
+│   ├── tvc_traj_opt_pinocchio.py
+│   ├── tvc_traj_opt_acados.py  # Methods 4–5–7 (Acados)
+│   ├── tvc_traj_opt_acados_min_time.py  # Method 6 (Spannagl FFTF)
+│   ├── tvc_attitude_ctrl_gui.py # Attitude control simulation (separate app)
 │   └── tvc_common.py           # Shared utilities
 ├── config/                     # Configuration files
 │   └── tvc_params.json         # Default params for attitude GUI
@@ -112,11 +115,13 @@ TVC-traj-opt/
 
 ## Usage
 
-### GUI Application (Crocoddyl-based)
+### GUI Application (main entry)
 
 ```bash
-python scripts/tvc_traj_opt_gui.py
+python run_tvc_traj_opt.py
 ```
+
+All optimization methods (Crocoddyl Methods 1–3, Acados Methods 4–7) are selected inside the GUI; solvers live under `scripts/`.
 
 The GUI allows you to:
 - Set waypoints with positions, yaw angles, and arrival times
