@@ -156,6 +156,62 @@ def segment_boundaries_from_waypoints(waypoints, dt):
     return [int((float(wp[4]) - t0) / dt) for wp in waypoints[1:] if len(wp) >= 5]
 
 
+def physical_time_grid_per_shooting_segment(T_seg_list, boundary_indices):
+    """
+    Physical time [s] at each shooting node after multi-segment stitching.
+
+    ``boundary_indices[s]`` is the global index (inclusive) of the last node of segment ``s``,
+    consistent with ``meta['segment_boundary_indices']`` from
+    ``solve_with_acados_waypoints`` / ``tvc_min_time_simple``.
+    Each segment is uniformly discretized in pseudo-time; the physical step is ``T_seg[s] / N_s``.
+
+    Parameters
+    ----------
+    T_seg_list : sequence of float
+        Optimal (or nominal) segment duration ``T_seg``, same order as ``boundary_indices``.
+    boundary_indices : sequence of int
+        Global index of each segment's terminal node.
+
+    Returns
+    -------
+    np.ndarray
+        Length ``boundary_indices[-1] + 1``, matching stitched ``len(xs)``.
+    """
+    Ts = np.asarray(list(T_seg_list), dtype=float).reshape(-1)
+    bi = np.asarray(list(boundary_indices), dtype=int).reshape(-1)
+    if Ts.size == 0 or bi.size == 0:
+        return np.array([0.0], dtype=float)
+    if Ts.size != bi.size:
+        raise ValueError(
+            f"len(T_seg_list)={Ts.size} must equal len(boundary_indices)={bi.size}"
+        )
+    n_states = int(bi[-1]) + 1
+    t_out = np.zeros(n_states, dtype=float)
+    prev_b = -1
+    for s in range(Ts.size):
+        T = float(Ts[s])
+        end_idx = int(bi[s])
+        if s == 0:
+            n_nodes = end_idx + 1
+            if n_nodes < 2:
+                t_out[0] = 0.0
+            else:
+                t_out[0 : end_idx + 1] = np.linspace(0.0, T, n_nodes)
+        else:
+            start_idx = prev_b + 1
+            n_new = end_idx - prev_b
+            if n_new <= 0:
+                raise ValueError(
+                    f"Invalid segment boundaries: prev_b={prev_b}, end_idx={end_idx}"
+                )
+            t0_off = float(t_out[prev_b])
+            t_out[start_idx : end_idx + 1] = t0_off + np.linspace(
+                T / n_new, T, n_new
+            )
+        prev_b = end_idx
+    return t_out
+
+
 # =============================================================================
 # Segment colors (for plotting)
 # =============================================================================
