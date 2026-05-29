@@ -46,7 +46,7 @@ try:
                                  QHBoxLayout, QPushButton, QLabel, QLineEdit, 
                                  QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                  QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
-                                 QFileDialog)
+                                 QFileDialog, QScrollArea, QSizePolicy)
     from PyQt5.QtCore import QThread, pyqtSignal, Qt
     from PyQt5.QtGui import QFont
     QT_AVAILABLE = True
@@ -59,7 +59,7 @@ except ImportError:
                                       QHBoxLayout, QPushButton, QLabel, QLineEdit, 
                                       QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                       QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
-                                      QFileDialog)
+                                      QFileDialog, QScrollArea, QSizePolicy)
         from PySide2.QtCore import QThread, Signal as pyqtSignal, Qt
         from PySide2.QtGui import QFont
         QT_AVAILABLE = True
@@ -632,6 +632,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.opt_thread = None
         self.params_file_path = os.path.join(script_dir, DEFAULT_GUI_PARAMS_FILENAME)
+        # Cached most-recent optimized trajectory for CSV export
+        self.last_trajectory = None
+        self.last_csv_path = None
         self.init_ui()
         self._update_params_file_label()
         if os.path.isfile(self.params_file_path):
@@ -640,70 +643,87 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         """Initialize UI"""
         self.setWindowTitle('TVC Rocket Trajectory Optimization')
-        
-        # Set window size
-        window_width = 1400
-        window_height = 900
-        self.resize(window_width, window_height)
-        
-        # Remove any size restrictions to allow full maximization
-        # QMainWindow should have maximize button by default, but ensure it's enabled
-        # Don't set maximum size restrictions that would prevent maximization
-        self.setMaximumSize(16777215, 16777215)  # Qt's maximum value, effectively unlimited
-        
+
+        # Cap the window at a standard 1080p screen, but never exceed the
+        # actual available screen area (e.g. laptop 1366x768, screen with a
+        # visible taskbar/dock, etc.). This guarantees every button stays
+        # reachable regardless of the host display size.
+        screen_w, screen_h = self._get_available_screen_size()
+        max_width = min(1920, screen_w)
+        max_height = min(1080, screen_h)
+        self.setMaximumSize(max_width, max_height)
+
+        # Allow the window to shrink well below the natural sizeHint of the
+        # plot canvas / parameter panel (the scroll areas below handle the
+        # overflow). Without this, a tall Figure sizeHint would block the
+        # user from shrinking the window vertically.
+        self.setMinimumSize(900, 600)
+
+        # Default window size, capped by the maximum above
+        default_width = min(1400, max_width)
+        default_height = min(900, max_height)
+        self.resize(default_width, default_height)
+
         # Center window on screen
         self.center_window()
-        
+
         # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         # Main layout
         main_layout = QHBoxLayout(central_widget)
-        
-        # Left panel: parameter settings
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
+
+        # Left panel: parameter settings, wrapped in a scroll area so that
+        # all controls remain reachable even when the window is shorter than
+        # the panel's natural height.
         left_panel = self.create_parameter_panel()
-        main_layout.addWidget(left_panel, 1)
-        
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_panel)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setMinimumWidth(380)
+        left_scroll.setMaximumWidth(560)
+        main_layout.addWidget(left_scroll, 0)
+
         # Right panel: display panel
         right_panel = self.create_display_panel()
-        main_layout.addWidget(right_panel, 2)
-    
+        main_layout.addWidget(right_panel, 1)
+
+    def _get_available_screen_size(self):
+        """Return the available screen size (width, height) in pixels.
+
+        Falls back to 1920x1080 if the screen size cannot be determined.
+        """
+        try:
+            app = QApplication.instance()
+            if app is None:
+                return 1920, 1080
+            try:
+                screen = app.desktop().availableGeometry()
+                return screen.width(), screen.height()
+            except AttributeError:
+                try:
+                    screen = app.primaryScreen().availableGeometry()
+                    return screen.width(), screen.height()
+                except AttributeError:
+                    return 1920, 1080
+        except Exception:
+            return 1920, 1080
+
     def center_window(self):
         """Center the window on the screen"""
         try:
-            # Get the QApplication instance
-            app = QApplication.instance()
-            if app is None:
-                return
-            
-            # Get screen geometry
-            try:
-                # Try PyQt5 method
-                screen = app.desktop().screenGeometry()
-                screen_width = screen.width()
-                screen_height = screen.height()
-            except AttributeError:
-                # Try PySide2 or newer PyQt5 method
-                try:
-                    screen = app.primaryScreen().geometry()
-                    screen_width = screen.width()
-                    screen_height = screen.height()
-                except AttributeError:
-                    # Fallback: use default screen size
-                    screen_width = 1920
-                    screen_height = 1080
-            
-            # Calculate center position
+            screen_width, screen_height = self._get_available_screen_size()
             window_width = self.width()
             window_height = self.height()
-            x = (screen_width - window_width) // 2
-            y = (screen_height - window_height) // 2
-            
-            # Move window to center
+            x = max(0, (screen_width - window_width) // 2)
+            y = max(0, (screen_height - window_height) // 2)
             self.move(x, y)
         except Exception as e:
-            # If centering fails, use default position
             print(f"Warning: Could not center window: {e}")
             self.move(100, 100)
         
@@ -1452,6 +1472,30 @@ class MainWindow(QMainWindow):
         self.params_file_label.setWordWrap(True)
         self.params_file_label.setStyleSheet('color: #555;')
         layout.addWidget(self.params_file_label)
+
+        # Trajectory export row: write the optimized trajectory to a CSV file
+        # suitable for PX4 offboard / setpoint-trajectory tracking.
+        traj_io_layout = QHBoxLayout()
+        self.btn_save_traj_csv = QPushButton('Save trajectory (CSV)...')
+        self.btn_save_traj_csv.setToolTip(
+            'Export the most recent optimized trajectory as a CSV file '
+            '(time, position, velocity, quaternion, body rates, Euler, control). '
+            'The CSV can be replayed by a PX4 offboard / trajectory tracker.'
+        )
+        self.btn_save_traj_csv.setEnabled(False)
+        self.btn_save_traj_csv.clicked.connect(self.save_trajectory_csv)
+        traj_io_layout.addWidget(self.btn_save_traj_csv)
+
+        self.frame_combo = QComboBox()
+        self.frame_combo.addItem('Frame: ENU (as planned)')
+        self.frame_combo.addItem('Frame: NED (PX4 default)')
+        self.frame_combo.setToolTip(
+            'Coordinate frame for the exported CSV.\n'
+            'ENU = as used by the planner (x East, y North, z Up).\n'
+            'NED = PX4 internal convention (x North, y East, z Down).'
+        )
+        traj_io_layout.addWidget(self.frame_combo)
+        layout.addLayout(traj_io_layout)
         
         # Progress bar
         self.progress = QProgressBar()
@@ -1473,10 +1517,15 @@ class MainWindow(QMainWindow):
         """Create display panel - all states, controls and cost on one page"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        
-        # Create single canvas with all subplots
-        self.fig = Figure(figsize=(20, 10.5))
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Create single canvas with all subplots. figsize is only used to
+        # set the figure's natural aspect ratio; the canvas is allowed to
+        # shrink below it so the whole window can stay within the screen.
+        self.fig = Figure(figsize=(12, 7))
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setMinimumSize(400, 300)
         gs = GridSpec(3, 4, figure=self.fig, hspace=0.35, wspace=0.3)
         self.fig.suptitle('TVC Rocket Trajectory Optimization', 
                          fontsize=16, fontweight='bold', y=0.995)
@@ -2368,7 +2417,220 @@ class MainWindow(QMainWindow):
             segment_boundaries_override=sbo,
             time_states=time_axis,
         )
+
+        # Cache the optimized trajectory so the user can export it as CSV later.
+        self.last_trajectory = {
+            'xs': xs,
+            'us': us,
+            'us_actual': u_act,
+            'plot_dt': pdt,
+            'dt': self.dt_spin.value(),
+            'time_states': time_axis,
+            'segment_boundary_indices': sbo,
+            'optimal_segment_times': ots,
+            'method': self.method_combo.currentIndex(),
+            'method_name': (timing_info or {}).get('method', ''),
+        }
+        if hasattr(self, 'btn_save_traj_csv'):
+            self.btn_save_traj_csv.setEnabled(True)
     
+    def save_trajectory_csv(self):
+        """Export the most recently optimized trajectory to a CSV file.
+
+        The CSV format is designed to be consumed by a PX4 offboard /
+        setpoint-trajectory tracker. Columns:
+
+            t, x, y, z, vx, vy, vz,
+            qw, qx, qy, qz, wx, wy, wz,
+            roll_deg, pitch_deg, yaw_deg,
+            th_p_cmd, th_r_cmd, T_cmd, tau_yaw_cmd,
+            th_p_act, th_r_act, T_act, tau_yaw_act
+
+        The state and command columns are aligned by node index (length
+        ``N+1`` for state, ``N`` for command). The last command row repeats
+        the previous one (zero-order hold) so the file has uniform length.
+
+        Coordinate frame is selected by ``self.frame_combo``:
+          - ENU: as used internally by the planner (x East, y North, z Up).
+          - NED: converted for PX4 (x North, y East, z Down, yaw Z-down).
+        """
+        if not self.last_trajectory or self.last_trajectory.get('xs') is None:
+            QMessageBox.warning(
+                self, 'No trajectory',
+                'Please run an optimization first; there is no trajectory to export yet.'
+            )
+            return
+
+        traj = self.last_trajectory
+        xs = np.asarray(traj['xs'], dtype=float)
+        us = np.asarray(traj['us'], dtype=float) if traj.get('us') is not None else None
+        us_act = (
+            np.asarray(traj['us_actual'], dtype=float)
+            if traj.get('us_actual') is not None
+            else None
+        )
+
+        if xs.ndim != 2 or xs.shape[1] < 13:
+            QMessageBox.critical(
+                self, 'Invalid trajectory',
+                f'Unexpected state shape {xs.shape}; expected (N+1, >=13).'
+            )
+            return
+
+        N_states = xs.shape[0]
+
+        # Physical time axis per state
+        time_states = traj.get('time_states')
+        if time_states is not None:
+            t = np.asarray(time_states, dtype=float).reshape(-1)
+            if t.size != N_states:
+                t = None
+        else:
+            t = None
+        if t is None:
+            dt_vis = traj.get('plot_dt') or traj.get('dt') or 0.02
+            t = np.arange(N_states, dtype=float) * float(dt_vis)
+
+        # State decomposition
+        p = xs[:, 0:3]
+        v = xs[:, 3:6]
+        q = xs[:, 6:10]  # [qw, qx, qy, qz]
+        w = xs[:, 10:13]
+
+        # Euler ZYX (rad) per node; convert to deg for the CSV
+        euler_rad = np.array([quat_to_euler(qq, format='wxyz') for qq in q])
+        euler_deg = np.degrees(euler_rad)
+
+        # Pad commands to N+1 with zero-order hold so columns line up
+        def _pad_to_state_length(arr):
+            if arr is None:
+                return np.full((N_states, 4), np.nan, dtype=float)
+            arr = np.asarray(arr, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if arr.shape[1] < 4:
+                pad = np.full((arr.shape[0], 4 - arr.shape[1]), np.nan)
+                arr = np.hstack([arr, pad])
+            arr = arr[:, :4]
+            if arr.shape[0] == N_states:
+                return arr
+            if arr.shape[0] == N_states - 1:
+                return np.vstack([arr, arr[-1:]])  # ZOH last row
+            if arr.shape[0] > N_states:
+                return arr[:N_states]
+            pad_rows = np.repeat(arr[-1:], N_states - arr.shape[0], axis=0)
+            return np.vstack([arr, pad_rows])
+
+        u_cmd = _pad_to_state_length(us)
+        u_act_out = _pad_to_state_length(us_act)
+
+        # Optional NED conversion: planner uses ENU (x East, y North, z Up).
+        # PX4 internally uses NED (x North, y East, z Down). The conversion is:
+        #   x_NED = y_ENU, y_NED = x_ENU, z_NED = -z_ENU
+        # Velocities, angular rates and Euler angles transform the same way.
+        frame_is_ned = (
+            hasattr(self, 'frame_combo') and self.frame_combo.currentIndex() == 1
+        )
+        if frame_is_ned:
+            p = np.column_stack([p[:, 1], p[:, 0], -p[:, 2]])
+            v = np.column_stack([v[:, 1], v[:, 0], -v[:, 2]])
+            w = np.column_stack([w[:, 1], w[:, 0], -w[:, 2]])
+            # Rotate quaternion from ENU body->world to NED body->world by
+            # composing with R_enu2ned = diag(...). Simpler: rebuild from the
+            # NED Euler angles (ZYX with sign flips on y and z components).
+            euler_ned = np.column_stack([
+                 euler_rad[:, 0],          # roll
+                -euler_rad[:, 1],          # pitch (sign flip: Up -> Down)
+                -euler_rad[:, 2],          # yaw   (sign flip: Up -> Down)
+            ])
+            from tvc_common import euler_to_quat_wxyz
+            q_out = np.array([
+                euler_to_quat_wxyz(r, pi, ya) for r, pi, ya in euler_ned
+            ])
+            euler_deg = np.degrees(euler_ned)
+        else:
+            q_out = q
+
+        # Default file name based on method and timestamp
+        method_name = traj.get('method_name') or f"method{traj.get('method', 0) + 1}"
+        safe_method = ''.join(c if c.isalnum() else '_' for c in str(method_name)).strip('_')
+        default_dir = (
+            os.path.dirname(self.last_csv_path) if self.last_csv_path
+            else os.path.dirname(self.params_file_path) or script_dir
+        )
+        default_name = time.strftime(
+            f"tvc_traj_{safe_method}_%Y%m%d_%H%M%S.csv"
+        )
+        default_path = os.path.join(default_dir, default_name)
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Save trajectory as CSV',
+            default_path,
+            'CSV files (*.csv);;All files (*.*)',
+        )
+        if not path:
+            return
+        if not path.lower().endswith('.csv'):
+            path += '.csv'
+
+        frame_tag = 'NED' if frame_is_ned else 'ENU'
+        header_lines = [
+            f"# TVC trajectory exported from tvc_traj_opt_gui",
+            f"# generated_at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# method: {method_name}",
+            f"# frame: {frame_tag} "
+            f"({'x N, y E, z D (PX4)' if frame_is_ned else 'x E, y N, z U (planner native)'})",
+            f"# N_states: {N_states}, duration: {float(t[-1] - t[0]):.6f} s",
+            "# Commands repeat the last row (zero-order hold) so all columns "
+            "have length N_states.",
+            "# th_p, th_r: gimbal pitch/roll angles [rad]; T: thrust [N]; "
+            "tau_yaw: reaction-wheel torque [N*m].",
+            "# *_act columns are the actuator's actual states (NaN when the "
+            "method has no actuator dynamics).",
+        ]
+        columns = [
+            't',
+            'x', 'y', 'z',
+            'vx', 'vy', 'vz',
+            'qw', 'qx', 'qy', 'qz',
+            'wx', 'wy', 'wz',
+            'roll_deg', 'pitch_deg', 'yaw_deg',
+            'th_p_cmd', 'th_r_cmd', 'T_cmd', 'tau_yaw_cmd',
+            'th_p_act', 'th_r_act', 'T_act', 'tau_yaw_act',
+        ]
+
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                for line in header_lines:
+                    f.write(line + '\n')
+                f.write(','.join(columns) + '\n')
+                for i in range(N_states):
+                    row = [
+                        f"{t[i]:.9f}",
+                        f"{p[i, 0]:.9f}", f"{p[i, 1]:.9f}", f"{p[i, 2]:.9f}",
+                        f"{v[i, 0]:.9f}", f"{v[i, 1]:.9f}", f"{v[i, 2]:.9f}",
+                        f"{q_out[i, 0]:.9f}", f"{q_out[i, 1]:.9f}",
+                        f"{q_out[i, 2]:.9f}", f"{q_out[i, 3]:.9f}",
+                        f"{w[i, 0]:.9f}", f"{w[i, 1]:.9f}", f"{w[i, 2]:.9f}",
+                        f"{euler_deg[i, 0]:.6f}",
+                        f"{euler_deg[i, 1]:.6f}",
+                        f"{euler_deg[i, 2]:.6f}",
+                        f"{u_cmd[i, 0]:.9f}", f"{u_cmd[i, 1]:.9f}",
+                        f"{u_cmd[i, 2]:.9f}", f"{u_cmd[i, 3]:.9f}",
+                        f"{u_act_out[i, 0]:.9f}", f"{u_act_out[i, 1]:.9f}",
+                        f"{u_act_out[i, 2]:.9f}", f"{u_act_out[i, 3]:.9f}",
+                    ]
+                    f.write(','.join(row) + '\n')
+        except OSError as e:
+            QMessageBox.critical(self, 'Save failed', f'Could not write {path}:\n{e}')
+            return
+
+        self.last_csv_path = path
+        self.status_text.append(
+            f'Saved trajectory ({N_states} samples, {frame_tag}) to:\n  {path}'
+        )
+
     def optimization_error(self, error_msg):
         """Optimization error"""
         QMessageBox.critical(self, 'Error', f'Error during optimization:\n{error_msg}')

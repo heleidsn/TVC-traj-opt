@@ -46,3 +46,4 @@ c_generated_code/
 scripts/*.json
 tvc_rocket_ocp.json
 scripts/c_generated_code_min_simple/
+trajs/
