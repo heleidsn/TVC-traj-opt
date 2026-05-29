@@ -33,31 +33,66 @@ import time
 import numpy as np
 from pathlib import Path
 
-# Setup Acados environment before import (fixes libqpOASES_e.so / libhpipm.so not found)
+# Setup Acados environment before import (fixes libqpOASES_e.so / libhpipm.so not found).
+#
+# IMPORTANT: setting ``LD_LIBRARY_PATH`` via ``os.environ`` from Python is too
+# late: the dynamic linker caches the search path at process startup, so a
+# later ``dlopen("libqpOASES_e.so")`` will still fail. We therefore preload
+# the acados libraries with ``ctypes.CDLL(<absolute path>, RTLD_GLOBAL)`` —
+# their symbols become globally available and basename ``dlopen`` calls
+# succeed without needing ``LD_LIBRARY_PATH``.
 def _setup_acados_env():
-    """Prepend acados lib to LD_LIBRARY_PATH if not already set"""
+    """Find acados, set env vars and preload its shared libraries."""
+    import ctypes
+
     acados_root = os.environ.get("ACADOS_SOURCE_DIR")
     if not acados_root:
-        # Guess from acados_template package location
         try:
             import acados_template
             pkg_path = Path(acados_template.__file__).resolve().parent
             # acados_template is in interfaces/acados_template, go up to acados root
-            for _ in range(3):
+            for _ in range(4):
                 pkg_path = pkg_path.parent
-                if (pkg_path / "lib").exists():
+                if (pkg_path / "lib" / "libacados.so").exists():
                     acados_root = str(pkg_path)
                     break
         except Exception:
             pass
-    if acados_root:
-        lib_path = os.path.join(acados_root, "lib")
-        if os.path.isdir(lib_path):
-            ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-            if lib_path not in ld_path.split(os.pathsep):
-                os.environ["LD_LIBRARY_PATH"] = lib_path + (os.pathsep + ld_path if ld_path else "")
-            if "ACADOS_SOURCE_DIR" not in os.environ:
-                os.environ["ACADOS_SOURCE_DIR"] = acados_root
+    if not acados_root:
+        for fallback in (
+            os.path.expanduser("~/Documents/GitHub/acados"),
+            os.path.expanduser("~/acados"),
+            "/opt/acados",
+        ):
+            if os.path.isfile(os.path.join(fallback, "lib", "libacados.so")):
+                acados_root = fallback
+                break
+    if not acados_root:
+        return
+
+    lib_path = os.path.join(acados_root, "lib")
+    if not os.path.isdir(lib_path):
+        return
+    os.environ.setdefault("ACADOS_SOURCE_DIR", acados_root)
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if lib_path not in ld_path.split(os.pathsep):
+        os.environ["LD_LIBRARY_PATH"] = lib_path + (os.pathsep + ld_path if ld_path else "")
+
+    # Preload acados' dependencies in dependency order with ``RTLD_GLOBAL``
+    # so their symbols are visible to later dlopen calls. ``os.environ``
+    # alone is not enough because the dynamic linker caches LD_LIBRARY_PATH
+    # at process startup. acados_template will load libacados.so itself.
+    #
+    # ``libosqp`` is required because libacados has an undefined reference
+    # to ``LINSYS_SOLVER_NAME`` that libosqp provides.
+    mode = ctypes.RTLD_GLOBAL
+    for libname in ("libblasfeo.so", "libhpipm.so", "libqpOASES_e.so", "libosqp.so"):
+        full = os.path.join(lib_path, libname)
+        if os.path.isfile(full):
+            try:
+                ctypes.CDLL(full, mode=mode)
+            except OSError:
+                pass  # Best-effort; downstream import will report a clearer error.
 
 _setup_acados_env()
 
@@ -276,10 +311,9 @@ def solve_with_acados_waypoints_min_time(
             if "cannot open shared object file" in str(e) or "libqpOASES" in str(e) or "libhpipm" in str(e):
                 raise RuntimeError(
                     f"Acados solver failed: {e}\n\n"
-                    "Fix: Add acados lib to LD_LIBRARY_PATH before running:\n"
+                    "Fix: set ACADOS_SOURCE_DIR (so the libraries can be preloaded), e.g.:\n"
                     "  export ACADOS_SOURCE_DIR=/path/to/acados\n"
-                    "  export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib\n"
-                    "Or use: ./scripts/run_acados.sh"
+                    "Or launch via ``python run_tvc_traj_opt.py`` which preloads the libs automatically."
                 ) from e
             raise
         except Exception as e:
@@ -635,10 +669,9 @@ def solve_with_acados_waypoints_free_tf(
             if "cannot open shared object file" in str(e) or "libqpOASES" in str(e) or "libhpipm" in str(e):
                 raise RuntimeError(
                     f"Acados solver failed: {e}\n\n"
-                    "Fix: Add acados lib to LD_LIBRARY_PATH before running:\n"
+                    "Fix: set ACADOS_SOURCE_DIR (so the libraries can be preloaded), e.g.:\n"
                     "  export ACADOS_SOURCE_DIR=/path/to/acados\n"
-                    "  export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib\n"
-                    "Or use: ./scripts/run_acados.sh"
+                    "Or launch via ``python run_tvc_traj_opt.py`` which preloads the libs automatically."
                 ) from e
             raise
         except Exception as e:
@@ -975,10 +1008,9 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
             if "cannot open shared object file" in str(e) or "libqpOASES" in str(e) or "libhpipm" in str(e):
                 raise RuntimeError(
                     f"Acados solver failed: {e}\n\n"
-                    "Fix: Add acados lib to LD_LIBRARY_PATH before running:\n"
+                    "Fix: set ACADOS_SOURCE_DIR (so the libraries can be preloaded), e.g.:\n"
                     "  export ACADOS_SOURCE_DIR=/path/to/acados\n"
-                    "  export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib\n"
-                    "Or use: ./scripts/run_acados.sh"
+                    "Or launch via ``python run_tvc_traj_opt.py`` which preloads the libs automatically."
                 ) from e
             raise
         except Exception as e:
