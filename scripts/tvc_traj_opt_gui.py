@@ -25,6 +25,8 @@ import sys
 import os
 import json
 import time
+import signal
+import subprocess
 
 # Ensure tvc_traj_opt module can be imported
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +35,9 @@ if script_dir not in sys.path:
 
 GUI_PARAMS_VERSION = 1
 DEFAULT_GUI_PARAMS_FILENAME = 'tvc_traj_opt_gui_params.json'
+LEFT_STATUS_TEXT_HEIGHT = 72
+DEFAULT_TRAJ_CSV_DIR = os.path.abspath(os.path.join(script_dir, '..', 'trajs'))
+DEFAULT_TRAJ_CSV_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'latest.csv')
 
 import numpy as np
 import matplotlib
@@ -120,6 +125,59 @@ TRAJECTORY_PRESETS = (
         ],
     ),
 )
+
+
+OPTIMIZATION_METHOD_ITEMS = (
+    'Method 1: Custom calcDiff (Slower, Numerical)',
+    'Method 2: Pinocchio + FDDP (Penalty constraints)',
+    'Method 3: Pinocchio + BoxFDDP (Native control bounds)',
+    'Method 4: Acados (Native constraints)',
+    'Method 5: Acados min-time (free segment duration)',
+    'Method 6: Spannagl min-fuel FFTF (free t_f per leg)',
+    'Method 7: Acados free t_f + EXTERNAL (thrust/TVC/time)',
+)
+
+
+def _populate_optimization_method_combo(combo):
+    """Fill a QComboBox with the standard optimization method list."""
+    combo.clear()
+    for label in OPTIMIZATION_METHOD_ITEMS:
+        combo.addItem(label)
+
+
+def _build_optimization_method_group(combo):
+    """Return a group box with label + method combo (shared by both tabs)."""
+    group = QGroupBox('Optimization Method')
+    outer = QVBoxLayout()
+    outer.setSpacing(4)
+    row = QHBoxLayout()
+    row.setSpacing(3)
+    _populate_optimization_method_combo(combo)
+    row.addWidget(QLabel('Method:'))
+    row.addWidget(combo, 1)
+    outer.addLayout(row)
+    group.setLayout(outer)
+    return group
+
+
+class TabScrollArea(QScrollArea):
+    """Keep tab content at natural height; scroll vertically when needed."""
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self._page = page
+        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.setWidget(page)
+        self.setWidgetResizable(False)
+        self.setFrameShape(QScrollArea.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        vw = self.viewport().width()
+        if vw > 0:
+            self._page.setFixedWidth(vw)
 
 
 def _normalize_waypoint_row(row):
@@ -635,6 +693,10 @@ class MainWindow(QMainWindow):
         # Cached most-recent optimized trajectory for CSV export
         self.last_trajectory = None
         self.last_csv_path = None
+        self.default_traj_csv_path = DEFAULT_TRAJ_CSV_PATH
+        self._tvc_launch_proc = None
+        self._traj_player_proc = None
+        self._method_sync_guard = False
         self.init_ui()
         self._update_params_file_label()
         if os.path.isfile(self.params_file_path):
@@ -676,18 +738,12 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
 
-        # Left panel: parameter settings, wrapped in a scroll area so that
-        # all controls remain reachable even when the window is shorter than
-        # the panel's natural height.
-        left_panel = self.create_parameter_panel()
-        left_scroll = QScrollArea()
-        left_scroll.setWidget(left_panel)
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setMinimumWidth(380)
-        left_scroll.setMaximumWidth(560)
-        main_layout.addWidget(left_scroll, 0)
+        # Left panel: tabbed sidebar (no outer scroll; Parameters tab scrolls internally)
+        left_panel = self.create_left_panel()
+        left_panel.setMinimumWidth(380)
+        left_panel.setMaximumWidth(480)
+        left_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        main_layout.addWidget(left_panel, 0)
 
         # Right panel: display panel
         right_panel = self.create_display_panel()
@@ -727,17 +783,46 @@ class MainWindow(QMainWindow):
             print(f"Warning: Could not center window: {e}")
             self.move(100, 100)
         
-    def create_parameter_panel(self):
-        """Create parameter setting panel"""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(8)  # Reduce spacing between widgets
-        layout.setContentsMargins(5, 5, 5, 5)  # Reduce margins
-        
-        # Title
-        title = QLabel('Parameters')
-        title.setFont(QFont('Arial', 12, QFont.Bold))
-        layout.addWidget(title)
+    def create_left_panel(self):
+        """Create tabbed left sidebar (Trajectory / Parameters)."""
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setSpacing(4)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        traj_tab, params_tab = self.create_parameter_panels()
+        traj_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        params_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+
+        self.left_tabs = QTabWidget()
+        self.left_tabs.setDocumentMode(True)
+        self.left_tabs.addTab(TabScrollArea(traj_tab), 'Trajectory')
+        self.left_tabs.addTab(TabScrollArea(params_tab), 'Parameters')
+        self.left_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        outer.addWidget(self.left_tabs, 1)
+
+        self.progress = QProgressBar()
+        self.progress.setFixedHeight(20)
+        outer.addWidget(self.progress)
+        outer.addWidget(QLabel('Status:'))
+        self.status_text = QTextEdit()
+        self.status_text.setFixedHeight(LEFT_STATUS_TEXT_HEIGHT)
+        self.status_text.setReadOnly(True)
+        outer.addWidget(self.status_text)
+
+        return container
+
+    def create_parameter_panels(self):
+        """Build content widgets for each left-sidebar tab."""
+        traj_tab = QWidget()
+        layout = QVBoxLayout(traj_tab)
+        layout.setSpacing(4)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        params_tab = QWidget()
+        adv_layout = QVBoxLayout(params_tab)
+        adv_layout.setSpacing(4)
+        adv_layout.setContentsMargins(4, 4, 4, 4)
         
         # Waypoints management
         waypoint_group = QGroupBox('Waypoints')
@@ -764,7 +849,7 @@ class MainWindow(QMainWindow):
             QListWidgetItem = None
         
         self.waypoint_list = QListWidget()
-        self.waypoint_list.setMaximumHeight(100)  # Reduce height
+        self.waypoint_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         waypoint_layout.addWidget(self.waypoint_list)
         
         # Buttons for waypoint management
@@ -786,35 +871,30 @@ class MainWindow(QMainWindow):
         self.wp_x.setRange(-100, 100)
         self.wp_x.setValue(0.0)
         self.wp_x.setDecimals(2)
-        self.wp_x.setMaximumHeight(25)
         self.wp_x.setMaximumWidth(80)
         
         self.wp_y = QDoubleSpinBox()
         self.wp_y.setRange(-100, 100)
         self.wp_y.setValue(0.0)
         self.wp_y.setDecimals(2)
-        self.wp_y.setMaximumHeight(25)
         self.wp_y.setMaximumWidth(80)
         
         self.wp_z = QDoubleSpinBox()
         self.wp_z.setRange(-100, 100)
         self.wp_z.setValue(10.0)
         self.wp_z.setDecimals(2)
-        self.wp_z.setMaximumHeight(25)
         self.wp_z.setMaximumWidth(80)
         
         self.wp_yaw = QDoubleSpinBox()
         self.wp_yaw.setRange(-180, 180)
         self.wp_yaw.setValue(0.0)
         self.wp_yaw.setDecimals(1)
-        self.wp_yaw.setMaximumHeight(25)
         self.wp_yaw.setMaximumWidth(80)
         
         self.wp_time = QDoubleSpinBox()
         self.wp_time.setRange(0.0, 1000.0)
         self.wp_time.setValue(5.0)
         self.wp_time.setDecimals(2)
-        self.wp_time.setMaximumHeight(25)
         self.wp_time.setMaximumWidth(80)
         
         # Two pairs per row (4 grid cols)
@@ -831,7 +911,6 @@ class MainWindow(QMainWindow):
         
         self.update_waypoint_btn = QPushButton('Update Selected')
         self.update_waypoint_btn.clicked.connect(self.update_waypoint)
-        self.update_waypoint_btn.setMaximumHeight(30)
         current_wp_layout.addWidget(self.update_waypoint_btn, 2, 2, 1, 2)
         
         current_wp_group.setLayout(current_wp_layout)
@@ -850,52 +929,54 @@ class MainWindow(QMainWindow):
         self.trajectory_preset_combo.setCurrentIndex(0)
         self.trajectory_preset_combo.currentIndexChanged.connect(self.on_trajectory_preset_changed)
         
-        # Optimization method selection (method combo on first row; Unified options on second — saves width)
-        method_group = QGroupBox('Optimization Method')
-        method_outer = QVBoxLayout()
-        method_outer.setSpacing(4)
-        method_row1 = QHBoxLayout()
-        method_row1.setSpacing(3)
-        method_row2 = QHBoxLayout()
-        method_row2.setSpacing(8)
-
+        # Optimization method (Trajectory tab; synced with Parameters tab)
         self.method_combo = QComboBox()
-        self.method_combo.addItem('Method 1: Custom calcDiff (Slower, Numerical)')
-        self.method_combo.addItem('Method 2: Pinocchio + FDDP (Penalty constraints)')
-        self.method_combo.addItem('Method 3: Pinocchio + BoxFDDP (Native control bounds)')
-        self.method_combo.addItem('Method 4: Acados (Native constraints)')
-        self.method_combo.addItem('Method 5: Acados min-time (free segment duration)')
-        self.method_combo.addItem('Method 6: Spannagl min-fuel FFTF (free t_f per leg)')
-        self.method_combo.addItem('Method 7: Acados free t_f + EXTERNAL (thrust/TVC/time)')
-        method_row1.addWidget(QLabel('Method:'))
-        method_row1.addWidget(self.method_combo, 1)
-        self.method_combo.currentIndexChanged.connect(self.on_method_changed)
+        layout.addWidget(_build_optimization_method_group(self.method_combo))
+        self.method_combo.currentIndexChanged.connect(
+            lambda idx: self._on_method_combo_changed(idx, self.method_combo)
+        )
+
+        # Parameters tab: duplicate method selector at top (linked to Trajectory tab)
+        self.method_combo_params = QComboBox()
+        adv_layout.addWidget(_build_optimization_method_group(self.method_combo_params))
+        self.method_combo_params.currentIndexChanged.connect(
+            lambda idx: self._on_method_combo_changed(idx, self.method_combo_params)
+        )
 
         self.unified_checkbox = QCheckBox('Unified (merge all segments)')
-        self.unified_checkbox.setToolTip('Merge all waypoint segments into one optimization problem (Method 2/3/4)')
+        self.unified_checkbox.setToolTip(
+            'Merge all waypoint segments into one optimization problem (Method 2/3/4)'
+        )
         self.unified_checkbox.setChecked(False)
-        self.unified_checkbox.setEnabled(False)  # Enabled when Method 2/3/4 selected
-        method_row2.addWidget(self.unified_checkbox)
-        self.unified_interp_guess_checkbox = QCheckBox('Unified (Acados): interpolate x initial guess')
+        self.unified_checkbox.setEnabled(False)
+        self.unified_interp_guess_checkbox = QCheckBox('Unified (Acados)')
         self.unified_interp_guess_checkbox.setToolTip(
             'If checked, Method 4 unified uses linearly interpolated state over each segment as the initial '
             'guess. Default off: all nodes use the start state x0.'
         )
         self.unified_interp_guess_checkbox.setChecked(False)
         self.unified_interp_guess_checkbox.setEnabled(False)
-        method_row2.addWidget(self.unified_interp_guess_checkbox)
-        method_row2.addStretch(1)
+
         self.unified_checkbox.stateChanged.connect(self._refresh_unified_interp_guess_enabled)
         self.method_combo.currentIndexChanged.connect(self._update_unified_checkbox_state)
-
-        method_outer.addLayout(method_row1)
-        method_outer.addLayout(method_row2)
-        method_group.setLayout(method_outer)
-        layout.addWidget(method_group)
+        self.method_combo_params.currentIndexChanged.connect(self._update_unified_checkbox_state)
         self._update_unified_checkbox_state(self.method_combo.currentIndex())
-        
-        # Optimization parameters
+
+        params_tabs = QTabWidget()
+        params_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+
+        # Optimization parameters (+ method options inside same group)
         opt_group = QGroupBox('Optimization Parameters')
+        opt_outer = QVBoxLayout()
+        opt_outer.setSpacing(4)
+
+        method_row2 = QHBoxLayout()
+        method_row2.setSpacing(8)
+        method_row2.addWidget(self.unified_checkbox)
+        method_row2.addWidget(self.unified_interp_guess_checkbox)
+        method_row2.addStretch(1)
+        opt_outer.addLayout(method_row2)
+
         opt_layout = QGridLayout()
         opt_layout.setSpacing(3)  # Reduce spacing
         
@@ -904,19 +985,16 @@ class MainWindow(QMainWindow):
         self.dt_spin.setValue(0.05)
         self.dt_spin.setSingleStep(0.01)
         self.dt_spin.setDecimals(3)
-        self.dt_spin.setMaximumHeight(25)
         self.dt_spin.setMaximumWidth(100)
         
         self.N_spin = QSpinBox()
         self.N_spin.setRange(10, 500)
         self.N_spin.setValue(100)
-        self.N_spin.setMaximumHeight(25)
         self.N_spin.setMaximumWidth(100)
         
         self.max_iter_spin = QSpinBox()
         self.max_iter_spin.setRange(10, 1000)
         self.max_iter_spin.setValue(100)
-        self.max_iter_spin.setMaximumHeight(25)
         self.max_iter_spin.setMaximumWidth(100)
         
         # Two pairs per row (4 grid cols)
@@ -926,19 +1004,17 @@ class MainWindow(QMainWindow):
         opt_layout.addWidget(self.N_spin, 0, 3)
         opt_layout.addWidget(QLabel('Max Iter:'), 1, 0)
         opt_layout.addWidget(self.max_iter_spin, 1, 1)
-        
-        opt_group.setLayout(opt_layout)
-        
-        # Tab widget for parameters
-        params_tabs = QTabWidget()
-        
-        # Tab 1: Optimization + physical parameters (single tab)
+
+        opt_outer.addLayout(opt_layout)
+        opt_group.setLayout(opt_outer)
+
         opt_tab = QWidget()
+        opt_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         opt_tab_layout = QVBoxLayout()
         opt_tab_layout.addWidget(opt_group)
         opt_tab.setLayout(opt_tab_layout)
         params_tabs.addTab(opt_tab, 'Optimization')
-        
+
         # Running cost weights
         cost_group = QGroupBox('Running Cost')
         cost_layout = QGridLayout()
@@ -948,28 +1024,24 @@ class MainWindow(QMainWindow):
         self.w_p.setRange(0, 1000)
         self.w_p.setValue(1.0)
         self.w_p.setDecimals(3)
-        self.w_p.setMaximumHeight(25)
         self.w_p.setMaximumWidth(100)  # Reduce width
         
         self.w_v = QDoubleSpinBox()
         self.w_v.setRange(0, 1000)
         self.w_v.setValue(01.0)
         self.w_v.setDecimals(3)
-        self.w_v.setMaximumHeight(25)
         self.w_v.setMaximumWidth(100)
         
         self.w_R = QDoubleSpinBox()
         self.w_R.setRange(0, 1000)
         self.w_R.setValue(1.0)
         self.w_R.setDecimals(3)
-        self.w_R.setMaximumHeight(25)
         self.w_R.setMaximumWidth(100)
         
         self.w_yaw = QDoubleSpinBox()
         self.w_yaw.setRange(0, 1000)
         self.w_yaw.setValue(1.0)
         self.w_yaw.setDecimals(3)
-        self.w_yaw.setMaximumHeight(25)
         self.w_yaw.setMaximumWidth(100)
         self.w_yaw.setToolTip('Separate weight for yaw (default same as Attitude R)')
         
@@ -977,21 +1049,18 @@ class MainWindow(QMainWindow):
         self.w_w.setRange(0, 1000)
         self.w_w.setValue(0.1)
         self.w_w.setDecimals(3)
-        self.w_w.setMaximumHeight(25)
         self.w_w.setMaximumWidth(100)
         
         self.w_u = QDoubleSpinBox()
         self.w_u.setRange(0, 100)
         self.w_u.setValue(1.0)
         self.w_u.setDecimals(3)
-        self.w_u.setMaximumHeight(25)
         self.w_u.setMaximumWidth(100)
         
         self.w_du = QDoubleSpinBox()
         self.w_du.setRange(0, 100)
         self.w_du.setValue(1.0)  # Default: enable control rate penalty
         self.w_du.setDecimals(3)
-        self.w_du.setMaximumHeight(25)
         self.w_du.setMaximumWidth(100)
         
         # Constraint penalty coefficients
@@ -999,14 +1068,12 @@ class MainWindow(QMainWindow):
         self.k_bound.setRange(0, 10000)
         self.k_bound.setValue(200.0)
         self.k_bound.setDecimals(1)
-        self.k_bound.setMaximumHeight(25)
         self.k_bound.setMaximumWidth(100)
         
         self.k_state_bound = QDoubleSpinBox()
         self.k_state_bound.setRange(0, 10000)
         self.k_state_bound.setValue(20.0)  # Lower default to avoid constraint gradient dominating position cost
         self.k_state_bound.setDecimals(1)
-        self.k_state_bound.setMaximumHeight(25)
         self.k_state_bound.setMaximumWidth(100)
         
         # Two pairs per row (4 grid cols)
@@ -1043,7 +1110,6 @@ class MainWindow(QMainWindow):
         self.tau_pitch_spin.setValue(0.05)
         self.tau_pitch_spin.setDecimals(3)
         self.tau_pitch_spin.setSingleStep(0.01)
-        self.tau_pitch_spin.setMaximumHeight(25)
         self.tau_pitch_spin.setMaximumWidth(80)
         self.tau_pitch_spin.setToolTip('Pitch channel time constant (s)')
         self.tau_roll_spin = QDoubleSpinBox()
@@ -1051,7 +1117,6 @@ class MainWindow(QMainWindow):
         self.tau_roll_spin.setValue(0.05)
         self.tau_roll_spin.setDecimals(3)
         self.tau_roll_spin.setSingleStep(0.01)
-        self.tau_roll_spin.setMaximumHeight(25)
         self.tau_roll_spin.setMaximumWidth(80)
         self.tau_roll_spin.setToolTip('Roll channel time constant (s)')
         self.tau_T_spin = QDoubleSpinBox()
@@ -1059,7 +1124,6 @@ class MainWindow(QMainWindow):
         self.tau_T_spin.setValue(0.5)
         self.tau_T_spin.setDecimals(3)
         self.tau_T_spin.setSingleStep(0.01)
-        self.tau_T_spin.setMaximumHeight(25)
         self.tau_T_spin.setMaximumWidth(80)
         self.tau_T_spin.setToolTip('Thrust channel time constant (s)')
         self.tau_yaw_spin = QDoubleSpinBox()
@@ -1067,7 +1131,6 @@ class MainWindow(QMainWindow):
         self.tau_yaw_spin.setValue(0.05)
         self.tau_yaw_spin.setDecimals(3)
         self.tau_yaw_spin.setSingleStep(0.01)
-        self.tau_yaw_spin.setMaximumHeight(25)
         self.tau_yaw_spin.setMaximumWidth(80)
         self.tau_yaw_spin.setToolTip('Yaw channel time constant (s)')
         cost_layout.addWidget(QLabel('tau pitch (s):'), 7, 0)
@@ -1092,7 +1155,6 @@ class MainWindow(QMainWindow):
         self.min_time_T_min_spin.setValue(0.15)
         self.min_time_T_min_spin.setDecimals(3)
         self.min_time_T_min_spin.setSingleStep(0.05)
-        self.min_time_T_min_spin.setMaximumHeight(25)
         self.min_time_T_min_spin.setMaximumWidth(100)
         self.min_time_T_min_spin.setToolTip(
             'Lower bound on physical segment duration per leg [s]. Acados: state T_seg; '
@@ -1103,7 +1165,6 @@ class MainWindow(QMainWindow):
         self.min_time_T_max_scale_spin.setValue(1.0)
         self.min_time_T_max_scale_spin.setDecimals(3)
         self.min_time_T_max_scale_spin.setSingleStep(0.05)
-        self.min_time_T_max_scale_spin.setMaximumHeight(25)
         self.min_time_T_max_scale_spin.setMaximumWidth(100)
         self.min_time_T_max_scale_spin.setToolTip(
             'Upper bound scale: T_max = (waypoint time gap) × this factor [—]. '
@@ -1127,7 +1188,6 @@ class MainWindow(QMainWindow):
         self.terminal_cost_multiplier_spin.setRange(0.01, 10000.0)
         self.terminal_cost_multiplier_spin.setValue(200.0)
         self.terminal_cost_multiplier_spin.setDecimals(2)
-        self.terminal_cost_multiplier_spin.setMaximumHeight(25)
         self.terminal_cost_multiplier_spin.setMaximumWidth(100)
         self.terminal_cost_multiplier_spin.setToolTip(
             'Terminal / waypoint-stage state weights use the same layout as Running Cost, multiplied by k. '
@@ -1146,11 +1206,11 @@ class MainWindow(QMainWindow):
         
         # Tab 2: Cost Weights
         cost_tab = QWidget()
+        cost_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         cost_tab_layout = QVBoxLayout()
         cost_tab_layout.addWidget(cost_group)
         cost_tab_layout.addWidget(self.min_time_duration_group)
         cost_tab_layout.addWidget(terminal_cost_group)
-        cost_tab_layout.addStretch()
         cost_tab.setLayout(cost_tab_layout)
         params_tabs.addTab(cost_tab, 'Cost Weights')
         
@@ -1163,70 +1223,60 @@ class MainWindow(QMainWindow):
         self.th_p_max.setRange(0, 90)  # Range in degrees
         self.th_p_max.setValue(10.0)  # 10 degrees
         self.th_p_max.setDecimals(1)
-        self.th_p_max.setMaximumHeight(25)
         self.th_p_max.setMaximumWidth(100)
 
         self.th_r_max = QDoubleSpinBox()
         self.th_r_max.setRange(0, 90)  # Range in degrees
         self.th_r_max.setValue(10.0)  # 10 degrees
         self.th_r_max.setDecimals(1)
-        self.th_r_max.setMaximumHeight(25)
         self.th_r_max.setMaximumWidth(100)
 
         self.T_max = QDoubleSpinBox()
         self.T_max.setRange(0, 100)
         self.T_max.setValue(25.0)
         self.T_max.setDecimals(2)
-        self.T_max.setMaximumHeight(25)
         self.T_max.setMaximumWidth(100)
 
         self.tau_yaw_max = QDoubleSpinBox()
         self.tau_yaw_max.setRange(0, 10)
         self.tau_yaw_max.setValue(1.0)
         self.tau_yaw_max.setDecimals(2)
-        self.tau_yaw_max.setMaximumHeight(25)
         self.tau_yaw_max.setMaximumWidth(100)
 
         self.v_horizontal_max = QDoubleSpinBox()
         self.v_horizontal_max.setRange(0, 100)
         self.v_horizontal_max.setValue(1.0)
         self.v_horizontal_max.setDecimals(1)
-        self.v_horizontal_max.setMaximumHeight(25)
         self.v_horizontal_max.setMaximumWidth(100)
 
         self.v_vertical_max = QDoubleSpinBox()
         self.v_vertical_max.setRange(0, 100)
         self.v_vertical_max.setValue(3.0)
         self.v_vertical_max.setDecimals(1)
-        self.v_vertical_max.setMaximumHeight(25)
         self.v_vertical_max.setMaximumWidth(100)
 
         self.roll_max = QDoubleSpinBox()
         self.roll_max.setRange(0, 180)
         self.roll_max.setValue(10.0)
         self.roll_max.setDecimals(1)
-        self.roll_max.setMaximumHeight(25)
         self.roll_max.setMaximumWidth(100)
 
         self.pitch_max = QDoubleSpinBox()
         self.pitch_max.setRange(0, 180)
         self.pitch_max.setValue(10.0)
         self.pitch_max.setDecimals(1)
-        self.pitch_max.setMaximumHeight(25)
         self.pitch_max.setMaximumWidth(100)
 
         self.yaw_max = QDoubleSpinBox()
         self.yaw_max.setRange(0, 180)
         self.yaw_max.setValue(180.0)
         self.yaw_max.setDecimals(1)
-        self.yaw_max.setMaximumHeight(25)
         self.yaw_max.setMaximumWidth(100)
 
         self.w_max = QDoubleSpinBox()
         self.w_max.setRange(0, 10)
         self.w_max.setValue(2.0)
         self.w_max.setDecimals(2)
-        self.w_max.setMaximumHeight(25)
         self.w_max.setMaximumWidth(100)
 
         row = 0
@@ -1258,9 +1308,9 @@ class MainWindow(QMainWindow):
         constraints_group.setLayout(constraints_layout)
 
         constraints_tab = QWidget()
+        constraints_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         constraints_tab_layout = QVBoxLayout()
         constraints_tab_layout.addWidget(constraints_group)
-        constraints_tab_layout.addStretch()
         constraints_tab.setLayout(constraints_tab_layout)
         params_tabs.addTab(constraints_tab, 'Constraints')
         
@@ -1274,7 +1324,6 @@ class MainWindow(QMainWindow):
         self.mass.setRange(0.01, 10.0)
         self.mass.setValue(0.6)
         self.mass.setDecimals(3)
-        self.mass.setMaximumHeight(25)
         self.mass.setMaximumWidth(100)
         
         # Moment of inertia (diagonal components)
@@ -1282,21 +1331,18 @@ class MainWindow(QMainWindow):
         self.Ixx.setRange(0.0001, 1.0)
         self.Ixx.setValue(0.02)
         self.Ixx.setDecimals(2)
-        self.Ixx.setMaximumHeight(25)
         self.Ixx.setMaximumWidth(100)
         
         self.Iyy = QDoubleSpinBox()
         self.Iyy.setRange(0.0001, 1.0)
         self.Iyy.setValue(0.02)
         self.Iyy.setDecimals(2)
-        self.Iyy.setMaximumHeight(25)
         self.Iyy.setMaximumWidth(100)
         
         self.Izz = QDoubleSpinBox()
         self.Izz.setRange(0.0001, 1.0)
         self.Izz.setValue(0.01)
         self.Izz.setDecimals(2)
-        self.Izz.setMaximumHeight(25)
         self.Izz.setMaximumWidth(100)
         
         # Thrust position (r_thrust)
@@ -1304,21 +1350,18 @@ class MainWindow(QMainWindow):
         self.r_thrust_x.setRange(-1.0, 1.0)
         self.r_thrust_x.setValue(0.0)
         self.r_thrust_x.setDecimals(2)
-        self.r_thrust_x.setMaximumHeight(25)
         self.r_thrust_x.setMaximumWidth(100)
         
         self.r_thrust_y = QDoubleSpinBox()
         self.r_thrust_y.setRange(-1.0, 1.0)
         self.r_thrust_y.setValue(0.0)
         self.r_thrust_y.setDecimals(2)
-        self.r_thrust_y.setMaximumHeight(25)
         self.r_thrust_y.setMaximumWidth(100)
         
         self.r_thrust_z = QDoubleSpinBox()
         self.r_thrust_z.setRange(-1.0, 1.0)
         self.r_thrust_z.setValue(-0.2)
         self.r_thrust_z.setDecimals(2)
-        self.r_thrust_z.setMaximumHeight(25)
         self.r_thrust_z.setMaximumWidth(100)
         
         # Two pairs per row (4 grid cols)
@@ -1338,10 +1381,15 @@ class MainWindow(QMainWindow):
         physics_layout.addWidget(self.r_thrust_z, 3, 1)
         
         physics_group.setLayout(physics_layout)
-        opt_tab_layout.addWidget(physics_group)
-        opt_tab_layout.addStretch()
 
-        layout.addWidget(params_tabs)
+        physics_tab = QWidget()
+        physics_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        physics_tab_layout = QVBoxLayout()
+        physics_tab_layout.addWidget(physics_group)
+        physics_tab.setLayout(physics_tab_layout)
+        params_tabs.insertTab(1, physics_tab, 'Physical')
+
+        adv_layout.addWidget(params_tabs)
         
         # Default parameters per method (state/control constraints equal across all methods)
         self.DEFAULT_PARAMS = {
@@ -1441,19 +1489,18 @@ class MainWindow(QMainWindow):
         }
         
         # Default optimization method: Method 4 (Acados); applied after all widgets exist
-        self.method_combo.setCurrentIndex(3)
+        self._set_method_combo_index(3)
+        self.on_method_changed(3)
         
         # Start optimization + load parameters (one row)
         button_layout = QHBoxLayout()
         self.run_btn = QPushButton('Start Optimization')
         self.run_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
-        self.run_btn.setMaximumHeight(35)  # Reduce button height
         self.run_btn.clicked.connect(self.start_optimization)
         button_layout.addWidget(self.run_btn)
         self.btn_load_params = QPushButton('Load parameters...')
         self.btn_load_params.setToolTip('Load settings from a JSON file; subsequent Save writes to this file')
         self.btn_load_params.clicked.connect(self.load_parameters)
-        self.btn_load_params.setMaximumHeight(35)
         button_layout.addWidget(self.btn_load_params)
         button_layout.addStretch(1)
         layout.addLayout(button_layout)
@@ -1473,9 +1520,16 @@ class MainWindow(QMainWindow):
         self.params_file_label.setStyleSheet('color: #555;')
         layout.addWidget(self.params_file_label)
 
-        # Trajectory export row: write the optimized trajectory to a CSV file
-        # suitable for PX4 offboard / setpoint-trajectory tracking.
+        # Trajectory export row: quick save + save-as dialog
         traj_io_layout = QHBoxLayout()
+        self.btn_save_traj = QPushButton('Save trajectory')
+        self.btn_save_traj.setToolTip(
+            f'Write the latest optimized trajectory to the default path:\n{DEFAULT_TRAJ_CSV_PATH}'
+        )
+        self.btn_save_traj.setEnabled(False)
+        self.btn_save_traj.clicked.connect(self.save_trajectory_default)
+        traj_io_layout.addWidget(self.btn_save_traj)
+
         self.btn_save_traj_csv = QPushButton('Save trajectory (CSV)...')
         self.btn_save_traj_csv.setToolTip(
             'Export the most recent optimized trajectory as a CSV file '
@@ -1496,22 +1550,88 @@ class MainWindow(QMainWindow):
         )
         traj_io_layout.addWidget(self.frame_combo)
         layout.addLayout(traj_io_layout)
-        
-        # Progress bar
-        self.progress = QProgressBar()
-        self.progress.setMaximumHeight(20)  # Reduce height
-        layout.addWidget(self.progress)
-        
-        # Status information
-        self.status_text = QTextEdit()
-        self.status_text.setMaximumHeight(80)  # Reduce height
-        self.status_text.setReadOnly(True)
-        layout.addWidget(QLabel('Status:'))
-        layout.addWidget(self.status_text)
-        
-        layout.addStretch()
-        
-        return panel
+
+        self.traj_default_path_label = QLabel()
+        self.traj_default_path_label.setWordWrap(True)
+        self.traj_default_path_label.setStyleSheet('color: #555;')
+        self.traj_default_path_label.setText(f'Default: {DEFAULT_TRAJ_CSV_PATH}')
+        layout.addWidget(self.traj_default_path_label)
+
+        # ROS2 simulation / tracking controls (label + button rows)
+        sim_group = QGroupBox('Simulation & Tracking')
+        sim_layout = QGridLayout()
+        sim_layout.setSpacing(3)
+
+        self.btn_start_px4_sitl = QPushButton('Start')
+        self.btn_start_px4_sitl.setToolTip('ros2 launch tvc_controller tvc.launch.py')
+        self.btn_start_px4_sitl.clicked.connect(self.start_px4_sitl)
+        self.btn_stop_px4_sitl = QPushButton('Stop')
+        self.btn_stop_px4_sitl.setToolTip('Terminate the TVC launch stack (PX4 SITL + agents)')
+        self.btn_stop_px4_sitl.clicked.connect(self.stop_px4_sitl)
+        self.btn_stop_px4_sitl.setEnabled(False)
+        self.lbl_px4_sitl_status = QLabel('Stopped')
+        self.lbl_px4_sitl_status.setStyleSheet('color: #888;')
+        sim_layout.addWidget(QLabel('PX4 SITL:'), 0, 0)
+        sim_layout.addWidget(self.btn_start_px4_sitl, 0, 1)
+        sim_layout.addWidget(self.btn_stop_px4_sitl, 0, 2)
+        sim_layout.addWidget(self.lbl_px4_sitl_status, 0, 3)
+
+        self.btn_start_tracking = QPushButton('Start')
+        self.btn_start_tracking.setToolTip(
+            'ros2 launch tvc_controller tvc_traj_player.launch.py '
+            '(uses last saved CSV when available)'
+        )
+        self.btn_start_tracking.clicked.connect(self.start_tracking_node)
+        self.btn_stop_tracking = QPushButton('Stop')
+        self.btn_stop_tracking.setToolTip('Terminate tvc_traj_player launch')
+        self.btn_stop_tracking.clicked.connect(self.stop_tracking_node)
+        self.btn_stop_tracking.setEnabled(False)
+        self.lbl_tracking_status = QLabel('Stopped')
+        self.lbl_tracking_status.setStyleSheet('color: #888;')
+        sim_layout.addWidget(QLabel('Tracking:'), 1, 0)
+        sim_layout.addWidget(self.btn_start_tracking, 1, 1)
+        sim_layout.addWidget(self.btn_stop_tracking, 1, 2)
+        sim_layout.addWidget(self.lbl_tracking_status, 1, 3)
+
+        self.tracking_source_combo = QComboBox()
+        self.tracking_source_combo.addItem('Last saved trajectory')
+        self.tracking_source_combo.addItem('CSV file')
+        self.tracking_source_combo.addItem('GUI waypoints')
+        self.tracking_source_combo.setToolTip(
+            'Trajectory source for tvc_traj_player:\n'
+            'Last saved — default CSV from Save trajectory;\n'
+            'CSV file — pick an existing trajectory CSV;\n'
+            'GUI waypoints — GotoSetpoint through current waypoint list.'
+        )
+        self.tracking_source_combo.currentIndexChanged.connect(self._on_tracking_source_changed)
+        sim_layout.addWidget(QLabel('Track source:'), 2, 0)
+        sim_layout.addWidget(self.tracking_source_combo, 2, 1, 1, 3)
+
+        self.tracking_csv_widget = QWidget()
+        tracking_csv_row = QHBoxLayout(self.tracking_csv_widget)
+        tracking_csv_row.setContentsMargins(0, 0, 0, 0)
+        tracking_csv_row.setSpacing(4)
+        self.tracking_csv_edit = QLineEdit()
+        self.tracking_csv_edit.setPlaceholderText('Path to trajectory CSV')
+        self.tracking_csv_edit.setText(DEFAULT_TRAJ_CSV_PATH)
+        self.tracking_csv_edit.textChanged.connect(self._on_tracking_csv_edited)
+        tracking_csv_row.addWidget(self.tracking_csv_edit, 1)
+        self.tracking_csv_browse = QPushButton('Browse…')
+        self.tracking_csv_browse.clicked.connect(self.browse_tracking_csv)
+        tracking_csv_row.addWidget(self.tracking_csv_browse)
+        sim_layout.addWidget(self.tracking_csv_widget, 3, 0, 1, 4)
+        self.tracking_csv_widget.setVisible(False)
+
+        self.lbl_tracking_source_info = QLabel()
+        self.lbl_tracking_source_info.setWordWrap(True)
+        self.lbl_tracking_source_info.setStyleSheet('color: #555;')
+        sim_layout.addWidget(self.lbl_tracking_source_info, 4, 0, 1, 4)
+        self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
+
+        sim_group.setLayout(sim_layout)
+        layout.addWidget(sim_group)
+
+        return traj_tab, params_tab
     
     def create_display_panel(self):
         """Create display panel - all states, controls and cost on one page"""
@@ -1659,6 +1779,37 @@ class MainWindow(QMainWindow):
         """Convert yaw angle (degrees) to quaternion [w, x, y, z], roll=0, pitch=0"""
         return yaw_to_quaternion(yaw_deg)
     
+    def _method_combos(self):
+        """Both linked optimization-method selectors (Trajectory + Parameters tabs)."""
+        combos = [self.method_combo]
+        if hasattr(self, 'method_combo_params'):
+            combos.append(self.method_combo_params)
+        return combos
+
+    def _set_method_combo_index(self, index):
+        """Set method index on all linked combos without triggering handlers."""
+        for combo in self._method_combos():
+            combo.blockSignals(True)
+            idx = max(0, min(combo.count() - 1, int(index)))
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    def _on_method_combo_changed(self, index, source):
+        """Keep Trajectory / Parameters method combos in sync and apply defaults."""
+        if self._method_sync_guard:
+            return
+        self._method_sync_guard = True
+        try:
+            for combo in self._method_combos():
+                if combo is source:
+                    continue
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+            self.on_method_changed(index)
+        finally:
+            self._method_sync_guard = False
+
     def _refresh_unified_interp_guess_enabled(self):
         idx = self.method_combo.currentIndex()
         acados = idx in (3, 4, 6)
@@ -1765,6 +1916,11 @@ class MainWindow(QMainWindow):
                 from PySide2.QtWidgets import QListWidgetItem
             item = QListWidgetItem(item_text)
             self.waypoint_list.addItem(item)
+        if (
+            hasattr(self, 'tracking_source_combo')
+            and self.tracking_source_combo.currentIndex() == 2
+        ):
+            self._on_tracking_source_changed(2)
     
     def add_waypoint(self):
         """Add a new waypoint"""
@@ -1885,7 +2041,8 @@ class MainWindow(QMainWindow):
         """Apply settings from dict (e.g. loaded JSON). Does not call on_method_changed."""
         if not cfg:
             return
-        self.method_combo.blockSignals(True)
+        for combo in self._method_combos():
+            combo.blockSignals(True)
         try:
             if 'waypoints' in cfg:
                 self.waypoints = []
@@ -1919,7 +2076,8 @@ class MainWindow(QMainWindow):
             if 'method' in cfg:
                 idx = int(cfg['method'])
                 idx = max(0, min(self.method_combo.count() - 1, idx))
-                self.method_combo.setCurrentIndex(idx)
+                for combo in self._method_combos():
+                    combo.setCurrentIndex(idx)
             _set_check(self.unified_checkbox, 'unified')
             _set_check(self.unified_interp_guess_checkbox, 'unified_interp_initial_guess')
 
@@ -1960,7 +2118,8 @@ class MainWindow(QMainWindow):
             _set_spin(self.min_time_T_min_spin, 'min_time_T_min')
             _set_spin(self.min_time_T_max_scale_spin, 'min_time_T_max_scale')
         finally:
-            self.method_combo.blockSignals(False)
+            for combo in self._method_combos():
+                combo.blockSignals(False)
         self._update_unified_checkbox_state(self.method_combo.currentIndex())
         self._refresh_min_time_duration_group_visible(self.method_combo.currentIndex())
         self._sync_trajectory_preset_combo_from_waypoints()
@@ -2433,33 +2592,16 @@ class MainWindow(QMainWindow):
         }
         if hasattr(self, 'btn_save_traj_csv'):
             self.btn_save_traj_csv.setEnabled(True)
+        if hasattr(self, 'btn_save_traj'):
+            self.btn_save_traj.setEnabled(True)
     
-    def save_trajectory_csv(self):
-        """Export the most recently optimized trajectory to a CSV file.
+    def _frame_is_ned(self):
+        return hasattr(self, 'frame_combo') and self.frame_combo.currentIndex() == 1
 
-        The CSV format is designed to be consumed by a PX4 offboard /
-        setpoint-trajectory tracker. Columns:
-
-            t, x, y, z, vx, vy, vz,
-            qw, qx, qy, qz, wx, wy, wz,
-            roll_deg, pitch_deg, yaw_deg,
-            th_p_cmd, th_r_cmd, T_cmd, tau_yaw_cmd,
-            th_p_act, th_r_act, T_act, tau_yaw_act
-
-        The state and command columns are aligned by node index (length
-        ``N+1`` for state, ``N`` for command). The last command row repeats
-        the previous one (zero-order hold) so the file has uniform length.
-
-        Coordinate frame is selected by ``self.frame_combo``:
-          - ENU: as used internally by the planner (x East, y North, z Up).
-          - NED: converted for PX4 (x North, y East, z Down, yaw Z-down).
-        """
+    def _build_trajectory_csv_payload(self):
+        """Prepare arrays and metadata for CSV export; None if no valid trajectory."""
         if not self.last_trajectory or self.last_trajectory.get('xs') is None:
-            QMessageBox.warning(
-                self, 'No trajectory',
-                'Please run an optimization first; there is no trajectory to export yet.'
-            )
-            return
+            return None
 
         traj = self.last_trajectory
         xs = np.asarray(traj['xs'], dtype=float)
@@ -2471,15 +2613,9 @@ class MainWindow(QMainWindow):
         )
 
         if xs.ndim != 2 or xs.shape[1] < 13:
-            QMessageBox.critical(
-                self, 'Invalid trajectory',
-                f'Unexpected state shape {xs.shape}; expected (N+1, >=13).'
-            )
-            return
+            return None
 
         N_states = xs.shape[0]
-
-        # Physical time axis per state
         time_states = traj.get('time_states')
         if time_states is not None:
             t = np.asarray(time_states, dtype=float).reshape(-1)
@@ -2491,17 +2627,13 @@ class MainWindow(QMainWindow):
             dt_vis = traj.get('plot_dt') or traj.get('dt') or 0.02
             t = np.arange(N_states, dtype=float) * float(dt_vis)
 
-        # State decomposition
         p = xs[:, 0:3]
         v = xs[:, 3:6]
-        q = xs[:, 6:10]  # [qw, qx, qy, qz]
+        q = xs[:, 6:10]
         w = xs[:, 10:13]
-
-        # Euler ZYX (rad) per node; convert to deg for the CSV
         euler_rad = np.array([quat_to_euler(qq, format='wxyz') for qq in q])
         euler_deg = np.degrees(euler_rad)
 
-        # Pad commands to N+1 with zero-order hold so columns line up
         def _pad_to_state_length(arr):
             if arr is None:
                 return np.full((N_states, 4), np.nan, dtype=float)
@@ -2515,7 +2647,7 @@ class MainWindow(QMainWindow):
             if arr.shape[0] == N_states:
                 return arr
             if arr.shape[0] == N_states - 1:
-                return np.vstack([arr, arr[-1:]])  # ZOH last row
+                return np.vstack([arr, arr[-1:]])
             if arr.shape[0] > N_states:
                 return arr[:N_states]
             pad_rows = np.repeat(arr[-1:], N_states - arr.shape[0], axis=0)
@@ -2524,43 +2656,143 @@ class MainWindow(QMainWindow):
         u_cmd = _pad_to_state_length(us)
         u_act_out = _pad_to_state_length(us_act)
 
-        # Optional NED conversion: planner uses ENU (x East, y North, z Up).
-        # PX4 internally uses NED (x North, y East, z Down). The conversion is:
-        #   x_NED = y_ENU, y_NED = x_ENU, z_NED = -z_ENU
-        # Velocities, angular rates and Euler angles transform the same way.
-        frame_is_ned = (
-            hasattr(self, 'frame_combo') and self.frame_combo.currentIndex() == 1
-        )
-        if frame_is_ned:
+        if self._frame_is_ned():
             p = np.column_stack([p[:, 1], p[:, 0], -p[:, 2]])
             v = np.column_stack([v[:, 1], v[:, 0], -v[:, 2]])
             w = np.column_stack([w[:, 1], w[:, 0], -w[:, 2]])
-            # Rotate quaternion from ENU body->world to NED body->world by
-            # composing with R_enu2ned = diag(...). Simpler: rebuild from the
-            # NED Euler angles (ZYX with sign flips on y and z components).
             euler_ned = np.column_stack([
-                 euler_rad[:, 0],          # roll
-                -euler_rad[:, 1],          # pitch (sign flip: Up -> Down)
-                -euler_rad[:, 2],          # yaw   (sign flip: Up -> Down)
+                euler_rad[:, 0],
+                -euler_rad[:, 1],
+                -euler_rad[:, 2],
             ])
             from tvc_common import euler_to_quat_wxyz
             q_out = np.array([
                 euler_to_quat_wxyz(r, pi, ya) for r, pi, ya in euler_ned
             ])
             euler_deg = np.degrees(euler_ned)
+            frame_tag = 'NED'
         else:
             q_out = q
+            frame_tag = 'ENU'
 
-        # Default file name based on method and timestamp
         method_name = traj.get('method_name') or f"method{traj.get('method', 0) + 1}"
+        return {
+            't': t,
+            'p': p,
+            'v': v,
+            'q_out': q_out,
+            'w': w,
+            'euler_deg': euler_deg,
+            'u_cmd': u_cmd,
+            'u_act_out': u_act_out,
+            'N_states': N_states,
+            'frame_tag': frame_tag,
+            'method_name': method_name,
+        }
+
+    def _write_trajectory_csv(self, path, payload):
+        """Write prepared trajectory payload to ``path``."""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        t = payload['t']
+        p = payload['p']
+        v = payload['v']
+        q_out = payload['q_out']
+        w = payload['w']
+        euler_deg = payload['euler_deg']
+        u_cmd = payload['u_cmd']
+        u_act_out = payload['u_act_out']
+        N_states = payload['N_states']
+        frame_tag = payload['frame_tag']
+        method_name = payload['method_name']
+
+        header_lines = [
+            '# TVC trajectory exported from tvc_traj_opt_gui',
+            f"# generated_at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f'# method: {method_name}',
+            f"# frame: {frame_tag} "
+            f"({'x N, y E, z D (PX4)' if frame_tag == 'NED' else 'x E, y N, z U (planner native)'})",
+            f'# N_states: {N_states}, duration: {float(t[-1] - t[0]):.6f} s',
+            '# Commands repeat the last row (zero-order hold) so all columns have length N_states.',
+            '# th_p, th_r: gimbal pitch/roll angles [rad]; T: thrust [N]; tau_yaw: reaction-wheel torque [N*m].',
+            '# *_act columns are the actuator actual states (NaN when the method has no actuator dynamics).',
+        ]
+        columns = [
+            't', 'x', 'y', 'z', 'vx', 'vy', 'vz',
+            'qw', 'qx', 'qy', 'qz', 'wx', 'wy', 'wz',
+            'roll_deg', 'pitch_deg', 'yaw_deg',
+            'th_p_cmd', 'th_r_cmd', 'T_cmd', 'tau_yaw_cmd',
+            'th_p_act', 'th_r_act', 'T_act', 'tau_yaw_act',
+        ]
+        with open(path, 'w', encoding='utf-8') as f:
+            for line in header_lines:
+                f.write(line + '\n')
+            f.write(','.join(columns) + '\n')
+            for i in range(N_states):
+                row = [
+                    f"{t[i]:.9f}",
+                    f"{p[i, 0]:.9f}", f"{p[i, 1]:.9f}", f"{p[i, 2]:.9f}",
+                    f"{v[i, 0]:.9f}", f"{v[i, 1]:.9f}", f"{v[i, 2]:.9f}",
+                    f"{q_out[i, 0]:.9f}", f"{q_out[i, 1]:.9f}",
+                    f"{q_out[i, 2]:.9f}", f"{q_out[i, 3]:.9f}",
+                    f"{w[i, 0]:.9f}", f"{w[i, 1]:.9f}", f"{w[i, 2]:.9f}",
+                    f"{euler_deg[i, 0]:.6f}",
+                    f"{euler_deg[i, 1]:.6f}",
+                    f"{euler_deg[i, 2]:.6f}",
+                    f"{u_cmd[i, 0]:.9f}", f"{u_cmd[i, 1]:.9f}",
+                    f"{u_cmd[i, 2]:.9f}", f"{u_cmd[i, 3]:.9f}",
+                    f"{u_act_out[i, 0]:.9f}", f"{u_act_out[i, 1]:.9f}",
+                    f"{u_act_out[i, 2]:.9f}", f"{u_act_out[i, 3]:.9f}",
+                ]
+                f.write(','.join(row) + '\n')
+
+    def _after_trajectory_saved(self, path, payload):
+        """Update paths/labels after a successful CSV write."""
+        self.last_csv_path = path
+        self.default_traj_csv_path = path
+        if hasattr(self, 'traj_default_path_label'):
+            self.traj_default_path_label.setText(f'Default: {path}')
+        if hasattr(self, 'tracking_csv_edit'):
+            if self.tracking_source_combo.currentIndex() == 0:
+                self.tracking_csv_edit.setText(path)
+            self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
+        self.status_text.append(
+            f'Saved trajectory ({payload["N_states"]} samples, {payload["frame_tag"]}) to:\n  {path}'
+        )
+
+    def save_trajectory_default(self):
+        """Save the latest optimized trajectory to the default CSV path."""
+        payload = self._build_trajectory_csv_payload()
+        if payload is None:
+            QMessageBox.warning(
+                self, 'No trajectory',
+                'Please run an optimization first; there is no trajectory to export yet.'
+            )
+            return
+        path = DEFAULT_TRAJ_CSV_PATH
+        try:
+            self._write_trajectory_csv(path, payload)
+        except OSError as e:
+            QMessageBox.critical(self, 'Save failed', f'Could not write {path}:\n{e}')
+            return
+        self._after_trajectory_saved(path, payload)
+
+    def save_trajectory_csv(self):
+        """Export the most recently optimized trajectory via file dialog."""
+        payload = self._build_trajectory_csv_payload()
+        if payload is None:
+            QMessageBox.warning(
+                self, 'No trajectory',
+                'Please run an optimization first; there is no trajectory to export yet.'
+            )
+            return
+
+        method_name = payload['method_name']
         safe_method = ''.join(c if c.isalnum() else '_' for c in str(method_name)).strip('_')
         default_dir = (
             os.path.dirname(self.last_csv_path) if self.last_csv_path
-            else os.path.dirname(self.params_file_path) or script_dir
+            else DEFAULT_TRAJ_CSV_DIR
         )
-        default_name = time.strftime(
-            f"tvc_traj_{safe_method}_%Y%m%d_%H%M%S.csv"
-        )
+        default_name = time.strftime(f'tvc_traj_{safe_method}_%Y%m%d_%H%M%S.csv')
         default_path = os.path.join(default_dir, default_name)
 
         path, _ = QFileDialog.getSaveFileName(
@@ -2574,62 +2806,272 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith('.csv'):
             path += '.csv'
 
-        frame_tag = 'NED' if frame_is_ned else 'ENU'
-        header_lines = [
-            f"# TVC trajectory exported from tvc_traj_opt_gui",
-            f"# generated_at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"# method: {method_name}",
-            f"# frame: {frame_tag} "
-            f"({'x N, y E, z D (PX4)' if frame_is_ned else 'x E, y N, z U (planner native)'})",
-            f"# N_states: {N_states}, duration: {float(t[-1] - t[0]):.6f} s",
-            "# Commands repeat the last row (zero-order hold) so all columns "
-            "have length N_states.",
-            "# th_p, th_r: gimbal pitch/roll angles [rad]; T: thrust [N]; "
-            "tau_yaw: reaction-wheel torque [N*m].",
-            "# *_act columns are the actuator's actual states (NaN when the "
-            "method has no actuator dynamics).",
-        ]
-        columns = [
-            't',
-            'x', 'y', 'z',
-            'vx', 'vy', 'vz',
-            'qw', 'qx', 'qy', 'qz',
-            'wx', 'wy', 'wz',
-            'roll_deg', 'pitch_deg', 'yaw_deg',
-            'th_p_cmd', 'th_r_cmd', 'T_cmd', 'tau_yaw_cmd',
-            'th_p_act', 'th_r_act', 'T_act', 'tau_yaw_act',
-        ]
-
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                for line in header_lines:
-                    f.write(line + '\n')
-                f.write(','.join(columns) + '\n')
-                for i in range(N_states):
-                    row = [
-                        f"{t[i]:.9f}",
-                        f"{p[i, 0]:.9f}", f"{p[i, 1]:.9f}", f"{p[i, 2]:.9f}",
-                        f"{v[i, 0]:.9f}", f"{v[i, 1]:.9f}", f"{v[i, 2]:.9f}",
-                        f"{q_out[i, 0]:.9f}", f"{q_out[i, 1]:.9f}",
-                        f"{q_out[i, 2]:.9f}", f"{q_out[i, 3]:.9f}",
-                        f"{w[i, 0]:.9f}", f"{w[i, 1]:.9f}", f"{w[i, 2]:.9f}",
-                        f"{euler_deg[i, 0]:.6f}",
-                        f"{euler_deg[i, 1]:.6f}",
-                        f"{euler_deg[i, 2]:.6f}",
-                        f"{u_cmd[i, 0]:.9f}", f"{u_cmd[i, 1]:.9f}",
-                        f"{u_cmd[i, 2]:.9f}", f"{u_cmd[i, 3]:.9f}",
-                        f"{u_act_out[i, 0]:.9f}", f"{u_act_out[i, 1]:.9f}",
-                        f"{u_act_out[i, 2]:.9f}", f"{u_act_out[i, 3]:.9f}",
-                    ]
-                    f.write(','.join(row) + '\n')
+            self._write_trajectory_csv(path, payload)
         except OSError as e:
             QMessageBox.critical(self, 'Save failed', f'Could not write {path}:\n{e}')
             return
+        self._after_trajectory_saved(path, payload)
 
-        self.last_csv_path = path
-        self.status_text.append(
-            f'Saved trajectory ({N_states} samples, {frame_tag}) to:\n  {path}'
+    def _effective_last_saved_csv_path(self):
+        """Path used for 'Last saved trajectory' tracking mode."""
+        if self.last_csv_path and os.path.isfile(self.last_csv_path):
+            return self.last_csv_path
+        if os.path.isfile(self.default_traj_csv_path):
+            return self.default_traj_csv_path
+        if os.path.isfile(DEFAULT_TRAJ_CSV_PATH):
+            return DEFAULT_TRAJ_CSV_PATH
+        return self.default_traj_csv_path
+
+    def _encode_waypoints_for_tracking(self):
+        """Encode GUI waypoint list as tvc_traj_player waypoints_enu string."""
+        if not self.waypoints:
+            return ''
+        parts = []
+        for i, wp in enumerate(self.waypoints):
+            row = _normalize_waypoint_row(wp)
+            x, y, z, yaw, t_arr = row
+            if i == 0:
+                hover_s = 2.0
+            else:
+                prev_t = float(_normalize_waypoint_row(self.waypoints[i - 1])[4])
+                hover_s = max(0.5, float(t_arr) - prev_t)
+            parts.append(f'{x},{y},{z},{yaw},{hover_s:.3f}')
+        return ';'.join(parts)
+
+    def _launch_arg(self, key, value):
+        """Format a ros2 launch key:=value argument with safe shell quoting."""
+        v = str(value).replace("'", "'\\''")
+        return f"{key}:='{v}'"
+
+    def _on_tracking_source_changed(self, index):
+        """Show/hide CSV picker and update tracking source summary."""
+        if hasattr(self, 'tracking_csv_widget'):
+            self.tracking_csv_widget.setVisible(index == 1)
+        if not hasattr(self, 'lbl_tracking_source_info'):
+            return
+        if index == 0:
+            path = self._effective_last_saved_csv_path()
+            exists = os.path.isfile(path)
+            self.lbl_tracking_source_info.setText(
+                f'CSV: {path}' + ('' if exists else ' (not saved yet — run Save trajectory first)')
+            )
+            if hasattr(self, 'tracking_csv_edit'):
+                self.tracking_csv_edit.setText(path)
+        elif index == 1:
+            path = self.tracking_csv_edit.text().strip() if hasattr(self, 'tracking_csv_edit') else ''
+            ok = bool(path) and os.path.isfile(path)
+            self.lbl_tracking_source_info.setText(
+                f'CSV: {path or "(choose a file)"}' + ('' if ok else ' — file not found')
+            )
+        else:
+            n = len(self.waypoints) if hasattr(self, 'waypoints') else 0
+            self.lbl_tracking_source_info.setText(
+                f'Using {n} waypoint(s) from the Trajectory tab (GotoSetpoint mode).'
+            )
+
+    def _on_tracking_csv_edited(self, _text=''):
+        if self.tracking_source_combo.currentIndex() == 1:
+            self._on_tracking_source_changed(1)
+
+    def browse_tracking_csv(self):
+        """Pick a trajectory CSV for tracking."""
+        start = self.tracking_csv_edit.text().strip() or DEFAULT_TRAJ_CSV_DIR
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Select trajectory CSV',
+            start,
+            'CSV files (*.csv);;All files (*.*)',
         )
+        if path:
+            self.tracking_csv_edit.setText(path)
+            self._on_tracking_source_changed(1)
+
+    def _ros2_workspace_root(self):
+        """Resolve TVC_ws root (parent of TVC-traj-opt)."""
+        return os.path.abspath(os.path.join(script_dir, '..', '..'))
+
+    def _ros2_shell_command(self, launch_file, extra_args=None):
+        """Build a bash command that sources the workspace then runs ros2 launch."""
+        ws = self._ros2_workspace_root()
+        setup = os.path.join(ws, 'install', 'setup.bash')
+        args = ' '.join(extra_args or [])
+        launch_cmd = f'ros2 launch tvc_controller {launch_file}'
+        if args:
+            launch_cmd = f'{launch_cmd} {args}'
+        if os.path.isfile(setup):
+            return ['bash', '-lc', f'source "{setup}" && {launch_cmd}']
+        return ['ros2', 'launch', 'tvc_controller', launch_file] + (extra_args or [])
+
+    def _start_background_process(self, attr_name, cmd, label):
+        """Start a detached process group; store handle on self.<attr_name>."""
+        proc = getattr(self, attr_name, None)
+        if proc is not None and proc.poll() is None:
+            QMessageBox.information(self, label, f'{label} is already running.')
+            return
+        try:
+            new_proc = subprocess.Popen(
+                cmd,
+                cwd=self._ros2_workspace_root(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+                text=True,
+            )
+        except OSError as e:
+            QMessageBox.critical(self, f'{label} failed', str(e))
+            self.status_text.append(f'{label} failed: {e}')
+            return
+        setattr(self, attr_name, new_proc)
+        self.status_text.append(f'{label} started (pid {new_proc.pid})')
+        self._refresh_sim_button_states()
+
+    def _stop_background_process(self, attr_name, label):
+        """Send SIGTERM to the process group, then SIGKILL if needed."""
+        proc = getattr(self, attr_name, None)
+        if proc is None or proc.poll() is not None:
+            setattr(self, attr_name, None)
+            self._refresh_sim_button_states()
+            self.status_text.append(f'{label}: not running')
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            QMessageBox.warning(self, f'{label}', f'Could not stop process: {e}')
+            return
+        try:
+            proc.wait(timeout=8.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=3.0)
+        setattr(self, attr_name, None)
+        self.status_text.append(f'{label} stopped')
+        self._refresh_sim_button_states()
+
+    def _refresh_sim_button_states(self):
+        """Enable start/stop buttons and status labels according to subprocess state."""
+        tvc_running = (
+            self._tvc_launch_proc is not None and self._tvc_launch_proc.poll() is None
+        )
+        track_running = (
+            self._traj_player_proc is not None and self._traj_player_proc.poll() is None
+        )
+        if hasattr(self, 'btn_start_px4_sitl'):
+            self.btn_start_px4_sitl.setEnabled(not tvc_running)
+            self.btn_stop_px4_sitl.setEnabled(tvc_running)
+        if hasattr(self, 'lbl_px4_sitl_status'):
+            if tvc_running:
+                self.lbl_px4_sitl_status.setText('Running')
+                self.lbl_px4_sitl_status.setStyleSheet('color: #2e7d32; font-weight: bold;')
+            else:
+                self.lbl_px4_sitl_status.setText('Stopped')
+                self.lbl_px4_sitl_status.setStyleSheet('color: #888;')
+        if hasattr(self, 'btn_start_tracking'):
+            self.btn_start_tracking.setEnabled(not track_running)
+            self.btn_stop_tracking.setEnabled(track_running)
+        if hasattr(self, 'lbl_tracking_status'):
+            if track_running:
+                self.lbl_tracking_status.setText('Running')
+                self.lbl_tracking_status.setStyleSheet('color: #2e7d32; font-weight: bold;')
+            else:
+                self.lbl_tracking_status.setText('Stopped')
+                self.lbl_tracking_status.setStyleSheet('color: #888;')
+
+    def start_px4_sitl(self):
+        """Launch full TVC stack (PX4 SITL + micro-XRCE + controller)."""
+        self._start_background_process(
+            '_tvc_launch_proc',
+            self._ros2_shell_command('tvc.launch.py'),
+            'PX4 SITL (tvc.launch.py)',
+        )
+
+    def stop_px4_sitl(self):
+        """Stop tvc.launch.py process group."""
+        self._stop_background_process('_tvc_launch_proc', 'PX4 SITL')
+
+    def start_tracking_node(self):
+        """Launch tvc_traj_player with the selected tracking source."""
+        source = self.tracking_source_combo.currentIndex()
+        extra = []
+
+        if source == 0:
+            path = self._effective_last_saved_csv_path()
+            if not os.path.isfile(path):
+                QMessageBox.warning(
+                    self,
+                    'No trajectory CSV',
+                    'Save a trajectory first (Save trajectory), or choose another track source.',
+                )
+                return
+            extra = [
+                self._launch_arg('play_mode', 'trajectory'),
+                self._launch_arg('csv_path', path),
+            ]
+            self.status_text.append(f'Tracking: last saved CSV\n  {path}')
+        elif source == 1:
+            path = self.tracking_csv_edit.text().strip()
+            if not path or not os.path.isfile(path):
+                QMessageBox.warning(
+                    self,
+                    'CSV not found',
+                    'Select a valid trajectory CSV file for tracking.',
+                )
+                return
+            extra = [
+                self._launch_arg('play_mode', 'trajectory'),
+                self._launch_arg('csv_path', path),
+            ]
+            self.status_text.append(f'Tracking: CSV file\n  {path}')
+        else:
+            if len(self.waypoints) < 1:
+                QMessageBox.warning(
+                    self,
+                    'No waypoints',
+                    'Add at least one waypoint on the Trajectory tab.',
+                )
+                return
+            wp_str = self._encode_waypoints_for_tracking()
+            extra = [
+                self._launch_arg('play_mode', 'waypoint'),
+                self._launch_arg('waypoints_enu', wp_str),
+            ]
+            self.status_text.append(
+                f'Tracking: GUI waypoints ({len(self.waypoints)} pts, GotoSetpoint mode)'
+            )
+
+        self._start_background_process(
+            '_traj_player_proc',
+            self._ros2_shell_command('tvc_traj_player.launch.py', extra),
+            'Tracking node (tvc_traj_player.launch.py)',
+        )
+
+    def stop_tracking_node(self):
+        """Stop tvc_traj_player.launch.py process group."""
+        self._stop_background_process('_traj_player_proc', 'Tracking node')
+
+    def closeEvent(self, event):
+        """Terminate background ROS2 launches when the GUI exits."""
+        for attr, label in (
+            ('_traj_player_proc', 'Tracking node'),
+            ('_tvc_launch_proc', 'PX4 SITL'),
+        ):
+            proc = getattr(self, attr, None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    proc.wait(timeout=5.0)
+                except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+                setattr(self, attr, None)
+        super().closeEvent(event)
 
     def optimization_error(self, error_msg):
         """Optimization error"""
