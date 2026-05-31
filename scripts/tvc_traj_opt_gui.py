@@ -38,6 +38,19 @@ DEFAULT_GUI_PARAMS_FILENAME = 'tvc_traj_opt_gui_params.json'
 LEFT_STATUS_TEXT_HEIGHT = 72
 DEFAULT_TRAJ_CSV_DIR = os.path.abspath(os.path.join(script_dir, '..', 'trajs'))
 DEFAULT_TRAJ_CSV_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'latest.csv')
+DEFAULT_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'saved_waypoints.json')
+TRAJ_PRESETS_DIR = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'presets')
+CUSTOM_WAYPOINTS_PATH = os.path.join(TRAJ_PRESETS_DIR, 'custom_waypoints.json')
+
+# Table columns in the Trajectory tab waypoint editor
+WP_COL_IDX = 0
+WP_COL_X = 1
+WP_COL_Y = 2
+WP_COL_Z = 3
+WP_COL_YAW = 4
+WP_COL_LEG_DT = 5
+WP_COL_T_ARR = 6
+WP_TABLE_HEADERS = ('#', 'X (m)', 'Y (m)', 'Z (m)', 'Yaw (°)', 'Δt (s)', 't (s)')
 
 import numpy as np
 import matplotlib
@@ -51,8 +64,9 @@ try:
                                  QHBoxLayout, QPushButton, QLabel, QLineEdit, 
                                  QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                  QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
-                                 QFileDialog, QScrollArea, QSizePolicy)
-    from PyQt5.QtCore import QThread, pyqtSignal, Qt
+                                 QFileDialog, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
+                                 QAbstractItemView, QHeaderView)
+    from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
     from PyQt5.QtGui import QFont
     QT_AVAILABLE = True
 except ImportError:
@@ -64,8 +78,9 @@ except ImportError:
                                       QHBoxLayout, QPushButton, QLabel, QLineEdit, 
                                       QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                       QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
-                                      QFileDialog, QScrollArea, QSizePolicy)
-        from PySide2.QtCore import QThread, Signal as pyqtSignal, Qt
+                                      QFileDialog, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
+                                      QAbstractItemView, QHeaderView)
+        from PySide2.QtCore import QThread, Signal as pyqtSignal, Qt, QTimer
         from PySide2.QtGui import QFont
         QT_AVAILABLE = True
     except ImportError:
@@ -106,9 +121,10 @@ except ImportError:
     solve_spannagl_style_waypoints = None
 
 # Built-in trajectory presets: waypoint [x_m, y_m, z_m, yaw_deg, arrival_time_s]
+TRAJECTORY_PRESET_STORAGE_SLUGS = ('grasshopper', 'platform_hop')
 TRAJECTORY_PRESETS = (
     (
-        'Grasshopper',
+        'Traj1: Grasshopper',
         [
             [0.0, 0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 6.0, 0.0, 5.0],
@@ -125,6 +141,258 @@ TRAJECTORY_PRESETS = (
         ],
     ),
 )
+
+
+# JSON ``trajectory_preset`` ids (built-in presets use 0 .. len-1).
+TRAJECTORY_PRESET_SAVED = -2
+TRAJECTORY_PRESET_CUSTOM = -1
+TRAJECTORY_SAVED_COMBO_LABEL = 'Traj2: Waypoints(optimal)'
+
+# QComboBox order (decoupled from preset_id numeric order).
+TRAJECTORY_COMBO_SLOTS = (
+    {'label': 'Traj1: Grasshopper', 'preset_id': 0},
+    {'label': TRAJECTORY_SAVED_COMBO_LABEL, 'preset_id': TRAJECTORY_PRESET_SAVED},
+    {'label': 'Platform hop (0→1 m, +2 m x, land)', 'preset_id': 1},
+    {'label': 'Custom waypoints', 'preset_id': TRAJECTORY_PRESET_CUSTOM},
+)
+
+# Trajectory optimization mode (below Trajectory combo).
+TRAJ_OPT_MODE_NORMAL = 0
+TRAJ_OPT_MODE_MIN_TIME = 1
+METHOD_NORMAL_DEFAULT_INDEX = 3   # Method 4: Acados
+METHOD_MIN_TIME_INDEX = 4         # Method 5: Acados min-time
+
+
+def trajectory_saved_combo_index():
+    """QComboBox index for the user-saved waypoint slot."""
+    for i, slot in enumerate(TRAJECTORY_COMBO_SLOTS):
+        if slot['preset_id'] == TRAJECTORY_PRESET_SAVED:
+            return i
+    return 1
+
+
+def trajectory_custom_combo_index():
+    """QComboBox index for ephemeral / params-embedded custom waypoints."""
+    for i, slot in enumerate(TRAJECTORY_COMBO_SLOTS):
+        if slot['preset_id'] == TRAJECTORY_PRESET_CUSTOM:
+            return i
+    return len(TRAJECTORY_COMBO_SLOTS) - 1
+
+
+def combo_index_to_trajectory_preset_id(combo_index):
+    """Map Trajectory combo index to JSON ``trajectory_preset`` id."""
+    combo_index = int(combo_index)
+    if 0 <= combo_index < len(TRAJECTORY_COMBO_SLOTS):
+        return TRAJECTORY_COMBO_SLOTS[combo_index]['preset_id']
+    return TRAJECTORY_PRESET_CUSTOM
+
+
+def trajectory_preset_id_to_combo_index(preset_id):
+    """Map JSON ``trajectory_preset`` id to Trajectory combo index."""
+    if preset_id is None:
+        return trajectory_custom_combo_index()
+    preset_id = int(preset_id)
+    for i, slot in enumerate(TRAJECTORY_COMBO_SLOTS):
+        if slot['preset_id'] == preset_id:
+            return i
+    return trajectory_custom_combo_index()
+
+
+def trajectory_waypoints_path_for_preset_id(preset_id):
+    """JSON file that stores waypoints for a trajectory preset id."""
+    preset_id = int(preset_id)
+    if preset_id == TRAJECTORY_PRESET_CUSTOM:
+        return CUSTOM_WAYPOINTS_PATH
+    if preset_id == TRAJECTORY_PRESET_SAVED:
+        return DEFAULT_SAVED_WAYPOINTS_PATH
+    if 0 <= preset_id < len(TRAJECTORY_PRESET_STORAGE_SLUGS):
+        return os.path.join(
+            TRAJ_PRESETS_DIR,
+            f'{TRAJECTORY_PRESET_STORAGE_SLUGS[preset_id]}.json',
+        )
+    return CUSTOM_WAYPOINTS_PATH
+
+
+def trajectory_waypoints_path_for_combo_index(combo_index):
+    """JSON file that stores waypoints for a Trajectory combo slot."""
+    return trajectory_waypoints_path_for_preset_id(
+        combo_index_to_trajectory_preset_id(combo_index)
+    )
+
+
+def trajectory_combo_label(combo_index):
+    """Human-readable Trajectory combo label."""
+    combo_index = int(combo_index)
+    if 0 <= combo_index < len(TRAJECTORY_COMBO_SLOTS):
+        return TRAJECTORY_COMBO_SLOTS[combo_index]['label']
+    return 'Custom waypoints'
+
+
+TRAJ_JSON_VERSION = 3
+
+
+def traj_opt_mode_key(mode_index=None):
+    """Return ``'normal'`` or ``'min_time'`` for artifact file suffixes."""
+    if mode_index is None:
+        return 'normal'
+    if int(mode_index) == TRAJ_OPT_MODE_MIN_TIME:
+        return 'min_time'
+    return 'normal'
+
+
+def trajectory_artifact_paths(combo_index, mode_key='normal'):
+    """JSON / CSV / NPZ paths for a trajectory slot + optimization mode."""
+    json_path = trajectory_waypoints_path_for_combo_index(combo_index)
+    base, _ = os.path.splitext(json_path)
+    if mode_key not in ('normal', 'min_time'):
+        mode_key = traj_opt_mode_key(mode_key)
+    return {
+        'json': json_path,
+        'csv': f'{base}_{mode_key}.csv',
+        'npz': f'{base}_{mode_key}_traj.npz',
+        'mode_key': mode_key,
+    }
+
+
+def resolve_trajectory_artifact_paths(combo_index, mode_key='normal'):
+    """Like ``trajectory_artifact_paths`` but fall back to legacy unsuffixed files."""
+    paths = trajectory_artifact_paths(combo_index, mode_key)
+    if os.path.isfile(paths['npz']) or os.path.isfile(paths['csv']):
+        return paths
+    if mode_key == 'normal':
+        base, _ = os.path.splitext(paths['json'])
+        leg_csv, leg_npz = f'{base}.csv', f'{base}_traj.npz'
+        if os.path.isfile(leg_npz):
+            return {**paths, 'csv': leg_csv, 'npz': leg_npz}
+        if os.path.isfile(leg_csv):
+            return {**paths, 'csv': leg_csv, 'npz': leg_npz if os.path.isfile(leg_npz) else paths['npz']}
+    return paths
+
+
+def optimization_summary_from_json(data, mode_key='normal'):
+    """Extract saved optimization summary for one mode from trajectory JSON."""
+    if not isinstance(data, dict):
+        return None
+    opts = data.get('optimizations')
+    if isinstance(opts, dict) and opts.get(mode_key):
+        return opts[mode_key]
+    legacy = data.get('optimization')
+    if not legacy:
+        return None
+    method_idx = legacy.get('method')
+    if mode_key == 'min_time':
+        return legacy if method_idx == METHOD_MIN_TIME_INDEX else None
+    if method_idx is None or method_idx != METHOD_MIN_TIME_INDEX:
+        return legacy
+    return None
+
+
+def optimization_summary_matches_mode(summary, mode_key='normal'):
+    """True when a summary dict belongs to the requested optimization mode."""
+    if not summary:
+        return False
+    saved_mode = summary.get('mode_key')
+    if saved_mode in ('normal', 'min_time'):
+        return saved_mode == mode_key
+    method_idx = summary.get('method')
+    if mode_key == 'min_time':
+        return method_idx == METHOD_MIN_TIME_INDEX
+    if method_idx is None:
+        return mode_key == 'normal'
+    return method_idx != METHOD_MIN_TIME_INDEX
+
+
+def load_trajectory_from_export_csv(csv_path):
+    """Rebuild ``xs`` / ``time_states`` from a GUI-exported trajectory CSV."""
+    numeric_rows = []
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#'):
+                    continue
+                if s.lower().startswith('t,') and 'x,' in s.lower():
+                    continue
+                parts = [p.strip() for p in s.split(',')]
+                if len(parts) < 13:
+                    continue
+                try:
+                    numeric_rows.append([float(p) for p in parts])
+                except ValueError:
+                    continue
+    except OSError:
+        return None
+    if not numeric_rows:
+        return None
+    data = np.asarray(numeric_rows, dtype=float)
+    n = int(data.shape[0])
+    t = data[:, 0]
+    xs = np.zeros((n, 17), dtype=float)
+    xs[:, 0:3] = data[:, 1:4]
+    xs[:, 3:6] = data[:, 4:7]
+    xs[:, 6:10] = data[:, 7:11]
+    xs[:, 10:13] = data[:, 11:14]
+    us = None
+    if data.shape[1] >= 21:
+        u = data[:, 17:21]
+        us = np.vstack([u, u[-1:]])
+    dt = float(np.median(np.diff(t))) if n > 1 else 0.05
+    return {
+        'xs': xs,
+        'us': us,
+        'us_actual': None,
+        'plot_dt': dt,
+        'dt': dt,
+        'time_states': t,
+        'segment_boundary_indices': None,
+        'optimal_segment_times': None,
+    }
+
+
+def trajectory_path_length_m(xs):
+    """Total path length [m] along optimized position samples."""
+    arr = np.asarray(xs, dtype=float)
+    if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 3:
+        return 0.0
+    p = arr[:, 0:3]
+    return float(np.sum(np.linalg.norm(np.diff(p, axis=0), axis=1)))
+
+
+class _SavedCostLogger:
+    """Minimal stand-in for crocoddyl.CallbackLogger when reloading saved costs."""
+
+    def __init__(self, costs):
+        self.costs = list(costs or [])
+
+
+def nominal_segment_duration(dt, N):
+    """Default leg duration [s] when adding a waypoint (dt × N)."""
+    return float(dt) * int(N)
+
+
+def waypoints_to_json_list(waypoints):
+    """Normalize waypoint rows for JSON export."""
+    out = []
+    for w in waypoints:
+        row = _normalize_waypoint_row(w)
+        out.append([
+            float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]),
+        ])
+    return out
+
+
+def waypoints_for_optimizer(waypoints):
+    """Normalize to [x,y,z,yaw,time_s] for solvers."""
+    return [_normalize_waypoint_row(w) for w in waypoints]
+
+
+def leg_duration_s(waypoints, index):
+    """Duration [s] of the leg ending at waypoint ``index``."""
+    if index <= 0 or index >= len(waypoints):
+        return 0.0
+    a = _normalize_waypoint_row(waypoints[index - 1])
+    b = _normalize_waypoint_row(waypoints[index])
+    return float(b[4]) - float(a[4])
 
 
 OPTIMIZATION_METHOD_ITEMS = (
@@ -180,11 +448,13 @@ class TabScrollArea(QScrollArea):
             self._page.setFixedWidth(vw)
 
 
-def _normalize_waypoint_row(row):
+def _normalize_waypoint_row(row, default_t=0.0):
+    """Return [x, y, z, yaw_deg, arrival_time_s]."""
     r = list(row)
-    while len(r) < 5:
+    while len(r) < 4:
         r.append(0.0)
-    return [float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])]
+    t = float(r[4]) if len(r) >= 5 else float(default_t)
+    return [float(r[0]), float(r[1]), float(r[2]), float(r[3]), t]
 
 
 def trajectory_preset_match_index(waypoints, tolerance=1e-4):
@@ -228,7 +498,8 @@ class OptimizationThread(QThread):
             m = self.params['m']
             I = self.params['I']
             r_thrust = self.params['r_thrust']
-            waypoints = self.params.get('waypoints', [])
+            waypoints_raw = self.params.get('waypoints', [])
+            waypoints = waypoints_for_optimizer(waypoints_raw)
             method = self.params.get('method', 3)  # 3–4,6 Acados; 5 = Method 6 Spannagl FFTF
             use_box_solver = (method == 2)  # BoxFDDP uses native control bounds
             unified = self.params.get('unified', False)  # Merge all segments into one problem
@@ -363,35 +634,22 @@ class OptimizationThread(QThread):
                     self.finished.emit(combined_xs, combined_us, all_loggers, timing_info)
                 return
             
-            # Check if we have waypoints with times
+            # Check if we have waypoints
             if len(waypoints) < 2:
                 self.error.emit("Need at least 2 waypoints (start and at least one waypoint)")
                 return
-            
-            # Ensure all waypoints have all required fields and convert to lists
-            # Format: [x, y, z, yaw_deg, time]
-            waypoints_list = []
-            for wp in waypoints:
-                wp_list = list(wp) if isinstance(wp, (list, tuple, np.ndarray)) else [wp]
-                # Ensure waypoint has 5 elements [x, y, z, yaw_deg, time]
-                if len(wp_list) == 4:
-                    # Old format: [x, y, z, time] -> convert to [x, y, z, yaw=0, time]
-                    wp_list = [wp_list[0], wp_list[1], wp_list[2], 0.0, wp_list[3]]
-                while len(wp_list) < 5:
-                    wp_list.append(0.0)
-                waypoints_list.append(wp_list[:5])  # Keep only first 5 elements
-            
-            # Sort waypoints by time (index 4)
-            waypoints = sorted(waypoints_list, key=lambda x: float(x[4]))
-            
-            # Calculate segment durations
-            durations = []
+
             for i in range(len(waypoints) - 1):
-                duration = waypoints[i+1][4] - waypoints[i][4]  # time is at index 4
-                if duration <= 0:
-                    self.error.emit(f"Waypoint {i+1} time must be greater than waypoint {i} time")
+                if waypoints[i][4] >= waypoints[i + 1][4]:
+                    self.error.emit(
+                        f"Waypoint {i + 1} arrival time ({waypoints[i + 1][4]:.2f}s) must be "
+                        f"greater than waypoint {i} time ({waypoints[i][4]:.2f}s)"
+                    )
                     return
-                durations.append(duration)
+
+            durations = [
+                waypoints[i + 1][4] - waypoints[i][4] for i in range(len(waypoints) - 1)
+            ]
             
             uref = np.array([0.0, 0.0, m*9.81, 0.0])
             
@@ -547,8 +805,7 @@ class OptimizationThread(QThread):
                 duration = durations[seg_idx]
                 start_wp = waypoints[seg_idx]
                 end_wp = waypoints[seg_idx + 1]
-                
-                # Calculate number of time steps for this segment
+
                 N = max(10, int(duration / dt))
                 
                 # Debug info
@@ -692,8 +949,11 @@ class MainWindow(QMainWindow):
         self.params_file_path = os.path.join(script_dir, DEFAULT_GUI_PARAMS_FILENAME)
         # Cached most-recent optimized trajectory for CSV export
         self.last_trajectory = None
+        self.opt_summary = None
+        self._trajectory_mode_cache = {}
         self.last_csv_path = None
         self.default_traj_csv_path = DEFAULT_TRAJ_CSV_PATH
+        self.saved_waypoints_path = DEFAULT_SAVED_WAYPOINTS_PATH
         self._tvc_launch_proc = None
         self._traj_player_proc = None
         self._method_sync_guard = False
@@ -748,6 +1008,14 @@ class MainWindow(QMainWindow):
         # Right panel: display panel
         right_panel = self.create_display_panel()
         main_layout.addWidget(right_panel, 1)
+
+        # Load default trajectory after plot axes exist (restore may redraw panels).
+        self._load_trajectory_for_combo_index(0, quiet=True)
+        self._traj_combo_prev_index = 0
+        if hasattr(self, 'traj_opt_mode_combo'):
+            self._traj_opt_mode_prev_index = self.traj_opt_mode_combo.currentIndex()
+        if hasattr(self, 'tracking_source_combo'):
+            self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
 
     def _get_available_screen_size(self):
         """Return the available screen size (width, height) in pixels.
@@ -831,102 +1099,73 @@ class MainWindow(QMainWindow):
         traj_pick_row = QHBoxLayout()
         traj_pick_row.addWidget(QLabel('Trajectory:'))
         self.trajectory_preset_combo = QComboBox()
-        for name, _wps in TRAJECTORY_PRESETS:
-            self.trajectory_preset_combo.addItem(name)
+        for slot in TRAJECTORY_COMBO_SLOTS:
+            self.trajectory_preset_combo.addItem(slot['label'])
         self.trajectory_preset_combo.setToolTip(
-            'Select a built-in waypoint sequence; the list below updates. Times are segment arrival times (s).')
+            'Traj1 / Traj2 load from trajs/presets/*.json or saved_waypoints.json when saved.\n'
+            f'Traj2 — {DEFAULT_SAVED_WAYPOINTS_PATH}\n'
+            'Custom — trajs/presets/custom_waypoints.json or parameters file.\n'
+            'After optimization, use Save Trajectory (next to Start Optimization) '
+            'to store results for this slot.'
+        )
         traj_pick_row.addWidget(self.trajectory_preset_combo, 1)
         waypoint_layout.addLayout(traj_pick_row)
 
-        # Waypoint list widget
-        if QT_AVAILABLE:
-            try:
-                from PyQt5.QtWidgets import QListWidget, QListWidgetItem
-            except ImportError:
-                from PySide2.QtWidgets import QListWidget, QListWidgetItem
-        else:
-            QListWidget = None
-            QListWidgetItem = None
-        
-        self.waypoint_list = QListWidget()
-        self.waypoint_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        waypoint_layout.addWidget(self.waypoint_list)
-        
-        # Buttons for waypoint management
+        traj_mode_row = QHBoxLayout()
+        traj_mode_row.addWidget(QLabel('Optimization:'))
+        self.traj_opt_mode_combo = QComboBox()
+        self.traj_opt_mode_combo.addItem('Normal')
+        self.traj_opt_mode_combo.addItem('Minimum time')
+        self.traj_opt_mode_combo.setToolTip(
+            'Normal and Minimum time are separate trajectories for each slot.\n'
+            'Each mode has its own saved CSV/NPZ; switching modes reloads or clears the plots.'
+        )
+        self.traj_opt_mode_combo.currentIndexChanged.connect(self._on_traj_opt_mode_changed)
+        traj_mode_row.addWidget(self.traj_opt_mode_combo, 1)
+        waypoint_layout.addLayout(traj_mode_row)
+        self._normal_method_index = METHOD_NORMAL_DEFAULT_INDEX
+        self._traj_opt_mode_guard = False
+
+        self.trajectory_storage_path_label = QLabel()
+        self.trajectory_storage_path_label.setWordWrap(True)
+        self.trajectory_storage_path_label.setStyleSheet('color: #555;')
+        waypoint_layout.addWidget(self.trajectory_storage_path_label)
+
+        self.waypoint_table = QTableWidget()
+        self.waypoint_table.setColumnCount(len(WP_TABLE_HEADERS))
+        self.waypoint_table.setHorizontalHeaderLabels(list(WP_TABLE_HEADERS))
+        self.waypoint_table.verticalHeader().setVisible(False)
+        self.waypoint_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.waypoint_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.waypoint_table.setAlternatingRowColors(True)
+        self.waypoint_table.setMinimumHeight(120)
+        self.waypoint_table.setMaximumHeight(220)
+        hdr = self.waypoint_table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.Stretch)
+        hdr.setSectionResizeMode(WP_COL_IDX, QHeaderView.ResizeToContents)
+        self.waypoint_table.itemChanged.connect(self._on_waypoint_table_item_changed)
+        waypoint_layout.addWidget(self.waypoint_table)
+
         waypoint_btn_layout = QHBoxLayout()
-        self.add_waypoint_btn = QPushButton('Add Waypoint')
+        self.add_waypoint_btn = QPushButton('Add row')
         self.add_waypoint_btn.clicked.connect(self.add_waypoint)
-        self.remove_waypoint_btn = QPushButton('Remove Selected')
+        self.remove_waypoint_btn = QPushButton('Remove row')
         self.remove_waypoint_btn.clicked.connect(self.remove_waypoint)
         waypoint_btn_layout.addWidget(self.add_waypoint_btn)
         waypoint_btn_layout.addWidget(self.remove_waypoint_btn)
         waypoint_layout.addLayout(waypoint_btn_layout)
-        
-        # Current waypoint editor - arrange in 2 rows to save space
-        current_wp_group = QGroupBox('Edit Waypoint')
-        current_wp_layout = QGridLayout()
-        current_wp_layout.setSpacing(3)  # Reduce spacing
-        
-        self.wp_x = QDoubleSpinBox()
-        self.wp_x.setRange(-100, 100)
-        self.wp_x.setValue(0.0)
-        self.wp_x.setDecimals(2)
-        self.wp_x.setMaximumWidth(80)
-        
-        self.wp_y = QDoubleSpinBox()
-        self.wp_y.setRange(-100, 100)
-        self.wp_y.setValue(0.0)
-        self.wp_y.setDecimals(2)
-        self.wp_y.setMaximumWidth(80)
-        
-        self.wp_z = QDoubleSpinBox()
-        self.wp_z.setRange(-100, 100)
-        self.wp_z.setValue(10.0)
-        self.wp_z.setDecimals(2)
-        self.wp_z.setMaximumWidth(80)
-        
-        self.wp_yaw = QDoubleSpinBox()
-        self.wp_yaw.setRange(-180, 180)
-        self.wp_yaw.setValue(0.0)
-        self.wp_yaw.setDecimals(1)
-        self.wp_yaw.setMaximumWidth(80)
-        
-        self.wp_time = QDoubleSpinBox()
-        self.wp_time.setRange(0.0, 1000.0)
-        self.wp_time.setValue(5.0)
-        self.wp_time.setDecimals(2)
-        self.wp_time.setMaximumWidth(80)
-        
-        # Two pairs per row (4 grid cols)
-        current_wp_layout.addWidget(QLabel('X (m):'), 0, 0)
-        current_wp_layout.addWidget(self.wp_x, 0, 1)
-        current_wp_layout.addWidget(QLabel('Y (m):'), 0, 2)
-        current_wp_layout.addWidget(self.wp_y, 0, 3)
-        current_wp_layout.addWidget(QLabel('Z (m):'), 1, 0)
-        current_wp_layout.addWidget(self.wp_z, 1, 1)
-        current_wp_layout.addWidget(QLabel('Yaw (°):'), 1, 2)
-        current_wp_layout.addWidget(self.wp_yaw, 1, 3)
-        current_wp_layout.addWidget(QLabel('Arrival Time (s):'), 2, 0)
-        current_wp_layout.addWidget(self.wp_time, 2, 1)
-        
-        self.update_waypoint_btn = QPushButton('Update Selected')
-        self.update_waypoint_btn.clicked.connect(self.update_waypoint)
-        current_wp_layout.addWidget(self.update_waypoint_btn, 2, 2, 1, 2)
-        
-        current_wp_group.setLayout(current_wp_layout)
-        waypoint_layout.addWidget(current_wp_group)
-        
-        # Connect waypoint list selection
-        self.waypoint_list.itemSelectionChanged.connect(self.on_waypoint_selected)
-        
+
         waypoint_group.setLayout(waypoint_layout)
         layout.addWidget(waypoint_group)
-        
-        # Default: Grasshopper preset. Format: [x, y, z, yaw_deg, arrival_time]
+
+        self._waypoint_table_updating = False
         _, grass = TRAJECTORY_PRESETS[0]
         self.waypoints = [_normalize_waypoint_row(w) for w in grass]
-        self.update_waypoint_list()
+        self._populate_waypoint_table()
         self.trajectory_preset_combo.setCurrentIndex(0)
+        self._refresh_trajectory_storage_path_label()
+        self._traj_combo_prev_index = 0
+        self._traj_opt_mode_prev_index = TRAJ_OPT_MODE_NORMAL
         self.trajectory_preset_combo.currentIndexChanged.connect(self.on_trajectory_preset_changed)
         
         # Optimization method (Trajectory tab; synced with Parameters tab)
@@ -986,11 +1225,15 @@ class MainWindow(QMainWindow):
         self.dt_spin.setSingleStep(0.01)
         self.dt_spin.setDecimals(3)
         self.dt_spin.setMaximumWidth(100)
-        
+        self.dt_spin.setToolTip('Discretization step [s] for shooting methods.')
+
         self.N_spin = QSpinBox()
         self.N_spin.setRange(10, 500)
         self.N_spin.setValue(100)
         self.N_spin.setMaximumWidth(100)
+        self.N_spin.setToolTip('Number of shooting intervals per segment (when not overridden by leg duration / dt).')
+        self.dt_spin.valueChanged.connect(self._on_default_leg_duration_hint_changed)
+        self.N_spin.valueChanged.connect(self._on_default_leg_duration_hint_changed)
         
         self.max_iter_spin = QSpinBox()
         self.max_iter_spin.setRange(10, 1000)
@@ -1167,7 +1410,7 @@ class MainWindow(QMainWindow):
         self.min_time_T_max_scale_spin.setSingleStep(0.05)
         self.min_time_T_max_scale_spin.setMaximumWidth(100)
         self.min_time_T_max_scale_spin.setToolTip(
-            'Upper bound scale: T_max = (waypoint time gap) × this factor [—]. '
+            'Upper bound scale: T_max = (waypoint leg Δt) × this factor [—]. '
             'Larger allows longer segment; 1.0 uses nominal schedule gap as cap.'
         )
         mt_dur_layout.addWidget(QLabel('T_min (s):'), 0, 0)
@@ -1491,13 +1734,22 @@ class MainWindow(QMainWindow):
         # Default optimization method: Method 4 (Acados); applied after all widgets exist
         self._set_method_combo_index(3)
         self.on_method_changed(3)
+        self._update_method_combo_enabled_for_traj_mode()
         
-        # Start optimization + load parameters (one row)
+        # Start optimization + save + load parameters (one row)
         button_layout = QHBoxLayout()
         self.run_btn = QPushButton('Start Optimization')
         self.run_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
         self.run_btn.clicked.connect(self.start_optimization)
         button_layout.addWidget(self.run_btn)
+        self.btn_save_trajectory = QPushButton('Save Trajectory')
+        self.btn_save_trajectory.setToolTip(
+            'Save waypoints, optimized CSV, and optimization summary for the '
+            'currently selected trajectory slot (run optimization first).'
+        )
+        self.btn_save_trajectory.setEnabled(False)
+        self.btn_save_trajectory.clicked.connect(self.save_trajectory)
+        button_layout.addWidget(self.btn_save_trajectory)
         self.btn_load_params = QPushButton('Load parameters...')
         self.btn_load_params.setToolTip('Load settings from a JSON file; subsequent Save writes to this file')
         self.btn_load_params.clicked.connect(self.load_parameters)
@@ -1522,7 +1774,7 @@ class MainWindow(QMainWindow):
 
         # Trajectory export row: quick save + save-as dialog
         traj_io_layout = QHBoxLayout()
-        self.btn_save_traj = QPushButton('Save trajectory')
+        self.btn_save_traj = QPushButton('Save traj CSV')
         self.btn_save_traj.setToolTip(
             f'Write the latest optimized trajectory to the default path:\n{DEFAULT_TRAJ_CSV_PATH}'
         )
@@ -1530,7 +1782,7 @@ class MainWindow(QMainWindow):
         self.btn_save_traj.clicked.connect(self.save_trajectory_default)
         traj_io_layout.addWidget(self.btn_save_traj)
 
-        self.btn_save_traj_csv = QPushButton('Save trajectory (CSV)...')
+        self.btn_save_traj_csv = QPushButton('Save traj CSV...')
         self.btn_save_traj_csv.setToolTip(
             'Export the most recent optimized trajectory as a CSV file '
             '(time, position, velocity, quaternion, body rates, Euler, control). '
@@ -1594,12 +1846,12 @@ class MainWindow(QMainWindow):
         sim_layout.addWidget(self.lbl_tracking_status, 1, 3)
 
         self.tracking_source_combo = QComboBox()
-        self.tracking_source_combo.addItem('Last saved trajectory')
+        self.tracking_source_combo.addItem('Current trajectory')
         self.tracking_source_combo.addItem('CSV file')
         self.tracking_source_combo.addItem('GUI waypoints')
         self.tracking_source_combo.setToolTip(
             'Trajectory source for tvc_traj_player:\n'
-            'Last saved — default CSV from Save trajectory;\n'
+            'Current trajectory — CSV saved for the selected trajectory slot;\n'
             'CSV file — pick an existing trajectory CSV;\n'
             'GUI waypoints — GotoSetpoint through current waypoint list.'
         )
@@ -1626,6 +1878,17 @@ class MainWindow(QMainWindow):
         self.lbl_tracking_source_info.setWordWrap(True)
         self.lbl_tracking_source_info.setStyleSheet('color: #555;')
         sim_layout.addWidget(self.lbl_tracking_source_info, 4, 0, 1, 4)
+
+        self.btn_clear_rviz_traj = QPushButton('Clear executed path')
+        self.btn_clear_rviz_traj.setToolTip(
+            'Clear RViz executed setpoint trail (/tvc_traj_player/executed_path) and '
+            'current setpoint marker. Planned trajectory is kept; it is (re)loaded when '
+            'you start the tracking node.'
+        )
+        self.btn_clear_rviz_traj.clicked.connect(
+            lambda: self.clear_rviz_trajectory_display(quiet=False)
+        )
+        sim_layout.addWidget(self.btn_clear_rviz_traj, 5, 0, 1, 4)
         self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
 
         sim_group.setLayout(sim_layout)
@@ -1646,13 +1909,19 @@ class MainWindow(QMainWindow):
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.setMinimumSize(400, 300)
-        gs = GridSpec(3, 4, figure=self.fig, hspace=0.35, wspace=0.3)
+        gs = GridSpec(
+            4, 4, figure=self.fig, height_ratios=[0.28, 1.0, 1.0, 1.0],
+            hspace=0.38, wspace=0.3,
+        )
         self.fig.suptitle('TVC Rocket Trajectory Optimization', 
                          fontsize=16, fontweight='bold', y=0.995)
+
+        self.ax_opt_info = self.fig.add_subplot(gs[0, :])
+        self.ax_opt_info.axis('off')
         
-        # First row: 3D trajectory and convergence curve
+        # Second row: 3D trajectory and convergence curve
         # 1. 3D position trajectory (occupies 2 positions)
-        self.ax_3d = self.fig.add_subplot(gs[0, 0:2], projection='3d')
+        self.ax_3d = self.fig.add_subplot(gs[1, 0:2], projection='3d')
         self.ax_3d.set_xlabel('X (m)', fontsize=10)
         self.ax_3d.set_ylabel('Y (m)', fontsize=10)
         self.ax_3d.set_zlabel('Z (m)', fontsize=10)
@@ -1660,65 +1929,65 @@ class MainWindow(QMainWindow):
         self.ax_3d.grid(True, alpha=0.3)
         
         # 2. Cost convergence curve (occupies 2 positions)
-        self.ax_cost = self.fig.add_subplot(gs[0, 2:4])
+        self.ax_cost = self.fig.add_subplot(gs[1, 2:4])
         self.ax_cost.set_xlabel('Iteration', fontsize=10)
         self.ax_cost.set_ylabel('Cost (log scale)', fontsize=10)
         self.ax_cost.set_title('Optimization Cost Convergence', fontsize=11, fontweight='bold')
         self.ax_cost.grid(True, alpha=0.3)
         
-        # Second row: position states
+        # Third row: position states
         # 3. Position
-        self.ax_pos = self.fig.add_subplot(gs[1, 0])
+        self.ax_pos = self.fig.add_subplot(gs[2, 0])
         self.ax_pos.set_xlabel('Time (s)', fontsize=9)
         self.ax_pos.set_ylabel('Position (m)', fontsize=9)
         self.ax_pos.set_title('Position', fontsize=10, fontweight='bold')
         self.ax_pos.grid(True, alpha=0.3)
         
         # 4. Velocity
-        self.ax_vel = self.fig.add_subplot(gs[1, 1])
+        self.ax_vel = self.fig.add_subplot(gs[2, 1])
         self.ax_vel.set_xlabel('Time (s)', fontsize=9)
         self.ax_vel.set_ylabel('Velocity (m/s)', fontsize=9)
         self.ax_vel.set_title('Linear Velocity', fontsize=10, fontweight='bold')
         self.ax_vel.grid(True, alpha=0.3)
         
         # 5. Euler angles (left of angular velocity)
-        self.ax_euler = self.fig.add_subplot(gs[1, 2])
+        self.ax_euler = self.fig.add_subplot(gs[2, 2])
         self.ax_euler.set_xlabel('Time (s)', fontsize=9)
         self.ax_euler.set_ylabel('Euler Angles (deg)', fontsize=9)
         self.ax_euler.set_title('Attitude (Euler)', fontsize=10, fontweight='bold')
         self.ax_euler.grid(True, alpha=0.3)
         
         # 6. Angular velocity
-        self.ax_angvel = self.fig.add_subplot(gs[1, 3])
+        self.ax_angvel = self.fig.add_subplot(gs[2, 3])
         self.ax_angvel.set_xlabel('Time (s)', fontsize=9)
         self.ax_angvel.set_ylabel('Angular Vel (°/s)', fontsize=9)
         self.ax_angvel.set_title('Angular Velocity', fontsize=10, fontweight='bold')
         self.ax_angvel.grid(True, alpha=0.3)
         
-        # Third row: control inputs
+        # Fourth row: control inputs
         # 7. TVC Pitch angle
-        self.ax_pitch = self.fig.add_subplot(gs[2, 0])
+        self.ax_pitch = self.fig.add_subplot(gs[3, 0])
         self.ax_pitch.set_xlabel('Time (s)', fontsize=9)
         self.ax_pitch.set_ylabel('Angle (deg)', fontsize=9)
         self.ax_pitch.set_title('TVC Pitch Angle', fontsize=10, fontweight='bold')
         self.ax_pitch.grid(True, alpha=0.3)
         
         # 8. TVC Roll angle
-        self.ax_roll = self.fig.add_subplot(gs[2, 1])
+        self.ax_roll = self.fig.add_subplot(gs[3, 1])
         self.ax_roll.set_xlabel('Time (s)', fontsize=9)
         self.ax_roll.set_ylabel('Angle (deg)', fontsize=9)
         self.ax_roll.set_title('TVC Roll Angle', fontsize=10, fontweight='bold')
         self.ax_roll.grid(True, alpha=0.3)
         
         # 9. Thrust
-        self.ax_thrust = self.fig.add_subplot(gs[2, 2])
+        self.ax_thrust = self.fig.add_subplot(gs[3, 2])
         self.ax_thrust.set_xlabel('Time (s)', fontsize=9)
         self.ax_thrust.set_ylabel('Thrust (N)', fontsize=9)
         self.ax_thrust.set_title('Thrust', fontsize=10, fontweight='bold')
         self.ax_thrust.grid(True, alpha=0.3)
         
         # 10. Yaw torque
-        self.ax_yaw = self.fig.add_subplot(gs[2, 3])
+        self.ax_yaw = self.fig.add_subplot(gs[3, 3])
         self.ax_yaw.set_xlabel('Time (s)', fontsize=9)
         self.ax_yaw.set_ylabel('Torque (N·m)', fontsize=9)
         self.ax_yaw.set_title('Yaw Torque', fontsize=10, fontweight='bold')
@@ -1745,6 +2014,7 @@ class MainWindow(QMainWindow):
         self.segment_iterations = {}  # {segment_idx: [iterations]}
         self.current_segment_idx = 0
         self._last_figure_save_path = ''
+        self._refresh_opt_info_display()
 
         return panel
 
@@ -1794,10 +2064,150 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(idx)
             combo.blockSignals(False)
 
+    def _current_traj_opt_mode_key(self):
+        if not hasattr(self, 'traj_opt_mode_combo'):
+            return 'normal'
+        return traj_opt_mode_key(self.traj_opt_mode_combo.currentIndex())
+
+    def _mode_cache_key(self, combo_index=None, mode_key=None):
+        if combo_index is None:
+            combo_index = self.trajectory_preset_combo.currentIndex()
+        if mode_key is None:
+            mode_key = self._current_traj_opt_mode_key()
+        return (int(combo_index), str(mode_key))
+
+    def _clone_trajectory_for_cache(self, traj, summary):
+        if not traj or traj.get('xs') is None:
+            return None
+        cloned = {}
+        for key, val in traj.items():
+            if val is None:
+                cloned[key] = None
+            elif isinstance(val, np.ndarray):
+                cloned[key] = np.asarray(val, dtype=float).copy()
+            elif isinstance(val, list):
+                cloned[key] = list(val)
+            else:
+                cloned[key] = val
+        return {
+            'last_trajectory': cloned,
+            'opt_summary': dict(summary) if summary else None,
+        }
+
+    def _cache_results_for_slot_mode(self, combo_index, mode_key):
+        """Store in-memory results under an explicit trajectory slot + mode key."""
+        if not hasattr(self, '_trajectory_mode_cache'):
+            self._trajectory_mode_cache = {}
+        entry = self._clone_trajectory_for_cache(self.last_trajectory, self.opt_summary)
+        if entry is not None:
+            if not optimization_summary_matches_mode(entry.get('opt_summary'), mode_key):
+                return
+            self._trajectory_mode_cache[(int(combo_index), str(mode_key))] = entry
+
+    def _cache_current_mode_results(self):
+        """Keep in-memory results for the current trajectory slot + mode."""
+        self._cache_results_for_slot_mode(
+            self.trajectory_preset_combo.currentIndex(),
+            self._current_traj_opt_mode_key(),
+        )
+
+    def _enable_trajectory_export_buttons(self, enabled=True):
+        if hasattr(self, 'btn_save_trajectory'):
+            self.btn_save_trajectory.setEnabled(enabled)
+        if hasattr(self, 'btn_save_traj'):
+            self.btn_save_traj.setEnabled(enabled)
+        if hasattr(self, 'btn_save_traj_csv'):
+            self.btn_save_traj_csv.setEnabled(enabled)
+
+    def _set_traj_opt_mode_combo_index(self, mode_index):
+        if not hasattr(self, 'traj_opt_mode_combo'):
+            return
+        mode_index = max(0, min(self.traj_opt_mode_combo.count() - 1, int(mode_index)))
+        self.traj_opt_mode_combo.blockSignals(True)
+        self.traj_opt_mode_combo.setCurrentIndex(mode_index)
+        self.traj_opt_mode_combo.blockSignals(False)
+
+    def _update_method_combo_enabled_for_traj_mode(self):
+        """Lock method selector when Minimum time mode forces Method 5."""
+        if not hasattr(self, 'traj_opt_mode_combo'):
+            return
+        lock = self.traj_opt_mode_combo.currentIndex() == TRAJ_OPT_MODE_MIN_TIME
+        for combo in self._method_combos():
+            combo.setEnabled(not lock)
+
+    def _on_traj_opt_mode_changed(self, mode_index):
+        """Normal vs minimum-time; min-time selects Method 5 (Acados min-time)."""
+        if self._traj_opt_mode_guard:
+            return
+        self._traj_opt_mode_guard = True
+        try:
+            old_mode_key = traj_opt_mode_key(
+                getattr(self, '_traj_opt_mode_prev_index', TRAJ_OPT_MODE_NORMAL)
+            )
+            combo_idx = self.trajectory_preset_combo.currentIndex()
+            self._cache_results_for_slot_mode(combo_idx, old_mode_key)
+            if int(mode_index) == TRAJ_OPT_MODE_MIN_TIME:
+                cur = self.method_combo.currentIndex()
+                if cur != METHOD_MIN_TIME_INDEX:
+                    self._normal_method_index = cur
+                self._set_method_combo_index(METHOD_MIN_TIME_INDEX)
+                self.on_method_changed(METHOD_MIN_TIME_INDEX)
+            else:
+                restore = getattr(self, '_normal_method_index', METHOD_NORMAL_DEFAULT_INDEX)
+                if restore == METHOD_MIN_TIME_INDEX:
+                    restore = METHOD_NORMAL_DEFAULT_INDEX
+                self._set_method_combo_index(restore)
+                self.on_method_changed(restore)
+            self._update_method_combo_enabled_for_traj_mode()
+            combo_idx = self.trajectory_preset_combo.currentIndex()
+            if not self._restore_optimization_for_slot_and_mode(combo_idx, quiet=True):
+                self._clear_optimization_results(clear_plots=True)
+            self._traj_opt_mode_prev_index = int(mode_index)
+            self._refresh_trajectory_storage_path_label()
+            if hasattr(self, 'tracking_source_combo'):
+                self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
+        finally:
+            self._traj_opt_mode_guard = False
+
+    def _apply_traj_opt_mode_from_json(self, data):
+        """Restore Normal / Minimum time from trajectory JSON."""
+        if not isinstance(data, dict) or not hasattr(self, 'traj_opt_mode_combo'):
+            return
+        mode = data.get('traj_opt_mode')
+        if mode == 'min_time':
+            target = TRAJ_OPT_MODE_MIN_TIME
+        elif mode == 'normal':
+            target = TRAJ_OPT_MODE_NORMAL
+        else:
+            opt = data.get('optimization') or {}
+            method_idx = opt.get('method')
+            target = (
+                TRAJ_OPT_MODE_MIN_TIME
+                if method_idx == METHOD_MIN_TIME_INDEX
+                else TRAJ_OPT_MODE_NORMAL
+            )
+        if self.traj_opt_mode_combo.currentIndex() != target:
+            self._set_traj_opt_mode_combo_index(target)
+            self._on_traj_opt_mode_changed(target)
+        else:
+            self._update_method_combo_enabled_for_traj_mode()
+
     def _on_method_combo_changed(self, index, source):
         """Keep Trajectory / Parameters method combos in sync and apply defaults."""
         if self._method_sync_guard:
             return
+        if (
+            hasattr(self, 'traj_opt_mode_combo')
+            and self.traj_opt_mode_combo.currentIndex() == TRAJ_OPT_MODE_MIN_TIME
+            and index != METHOD_MIN_TIME_INDEX
+        ):
+            self._set_method_combo_index(METHOD_MIN_TIME_INDEX)
+            return
+        if (
+            hasattr(self, 'traj_opt_mode_combo')
+            and self.traj_opt_mode_combo.currentIndex() == TRAJ_OPT_MODE_NORMAL
+        ):
+            self._normal_method_index = int(index)
         self._method_sync_guard = True
         try:
             for combo in self._method_combos():
@@ -1890,123 +2300,737 @@ class MainWindow(QMainWindow):
             )
         self._refresh_min_time_duration_group_visible(index)
     
-    def update_waypoint_list(self):
-        """Update waypoint list display"""
-        self.waypoint_list.clear()
-        for i, wp in enumerate(self.waypoints):
-            # Ensure waypoint has all required fields (for backward compatibility)
-            # Format: [x, y, z, yaw_deg, time]
-            if len(wp) < 5:
-                # Old format: [x, y, z, time] -> add yaw=0
-                if len(wp) == 4:
-                    wp = [wp[0], wp[1], wp[2], 0.0, wp[3]]  # Insert yaw=0 before time
+    def _default_leg_duration(self):
+        if hasattr(self, 'dt_spin') and hasattr(self, 'N_spin'):
+            return nominal_segment_duration(self.dt_spin.value(), self.N_spin.value())
+        return 5.0
+
+    def _on_default_leg_duration_hint_changed(self, *_args):
+        """No-op placeholder; new rows use dt×N as default Δt."""
+        pass
+
+    def _refresh_trajectory_storage_path_label(self):
+        if not hasattr(self, 'trajectory_storage_path_label'):
+            return
+        idx = self.trajectory_preset_combo.currentIndex() if hasattr(self, 'trajectory_preset_combo') else 0
+        mode_key = self._current_traj_opt_mode_key()
+        mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
+        paths = resolve_trajectory_artifact_paths(idx, mode_key)
+        label = trajectory_combo_label(idx)
+        self.trajectory_storage_path_label.setText(
+            f'{label} ({mode_label}) — waypoints: {paths["json"]}\n'
+            f'  CSV: {paths["csv"]}'
+        )
+
+    def _opt_info_empty_message(self):
+        mode_key = self._current_traj_opt_mode_key()
+        mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
+        return (
+            f'No saved {mode_label} result for this trajectory — '
+            f'run Start Optimization, then Save Trajectory.'
+        )
+
+    def _make_waypoint_table_item(self, text, editable=True):
+        item = QTableWidgetItem(str(text))
+        if editable:
+            item.setFlags(item.flags() | Qt.ItemIsEditable)
+        else:
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        return item
+
+    def _populate_waypoint_table(self):
+        """Fill table from ``self.waypoints``."""
+        if not hasattr(self, 'waypoint_table'):
+            return
+        self._waypoint_table_updating = True
+        self.waypoint_table.blockSignals(True)
+        try:
+            self.waypoint_table.setRowCount(len(self.waypoints))
+            for i, wp in enumerate(self.waypoints):
+                row = _normalize_waypoint_row(wp)
+                x, y, z, yaw, t_arr = row
+                leg = leg_duration_s(self.waypoints, i)
+                self.waypoint_table.setItem(i, WP_COL_IDX, self._make_waypoint_table_item(i, editable=False))
+                self.waypoint_table.setItem(i, WP_COL_X, self._make_waypoint_table_item(f'{x:.3f}'))
+                self.waypoint_table.setItem(i, WP_COL_Y, self._make_waypoint_table_item(f'{y:.3f}'))
+                self.waypoint_table.setItem(i, WP_COL_Z, self._make_waypoint_table_item(f'{z:.3f}'))
+                self.waypoint_table.setItem(i, WP_COL_YAW, self._make_waypoint_table_item(f'{yaw:.1f}'))
+                if i == 0:
+                    self.waypoint_table.setItem(
+                        i, WP_COL_LEG_DT, self._make_waypoint_table_item('—', editable=False),
+                    )
                 else:
-                    wp = list(wp) + [0.0] * (5 - len(wp))
-            
-            yaw = wp[3] if len(wp) > 3 else 0.0
-            time = wp[4] if len(wp) > 4 else (wp[3] if len(wp) > 3 else 0.0)
-            
-            if i == 0:
-                item_text = f"Start: [{wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}] yaw={yaw:.1f}° @ t={time:.2f}s"
-            else:
-                item_text = f"WP {i}: [{wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}] yaw={yaw:.1f}° @ t={time:.2f}s"
-            try:
-                from PyQt5.QtWidgets import QListWidgetItem
-            except ImportError:
-                from PySide2.QtWidgets import QListWidgetItem
-            item = QListWidgetItem(item_text)
-            self.waypoint_list.addItem(item)
+                    self.waypoint_table.setItem(
+                        i, WP_COL_LEG_DT, self._make_waypoint_table_item(f'{leg:.3f}'),
+                    )
+                self.waypoint_table.setItem(
+                    i, WP_COL_T_ARR, self._make_waypoint_table_item(f'{t_arr:.3f}', editable=(i > 0)),
+                )
+        finally:
+            self.waypoint_table.blockSignals(False)
+            self._waypoint_table_updating = False
         if (
             hasattr(self, 'tracking_source_combo')
             and self.tracking_source_combo.currentIndex() == 2
         ):
             self._on_tracking_source_changed(2)
-    
-    def add_waypoint(self):
-        """Add a new waypoint"""
-        new_wp = [self.wp_x.value(), self.wp_y.value(), self.wp_z.value(), 
-                  self.wp_yaw.value(), self.wp_time.value()]
-        self.waypoints.append(new_wp)
-        self.update_waypoint_list()
-        # Select the newly added waypoint
-        self.waypoint_list.setCurrentRow(len(self.waypoints) - 1)
-        self._sync_trajectory_preset_combo_from_waypoints()
-    
-    def remove_waypoint(self):
-        """Remove selected waypoint (cannot remove start point)"""
-        current_row = self.waypoint_list.currentRow()
-        if current_row >= 0 and current_row < len(self.waypoints):
-            if current_row == 0:
-                QMessageBox.warning(self, 'Warning', 'Cannot remove start point')
+
+    def _sync_waypoints_from_table(self):
+        """Read table into ``self.waypoints`` (used before optimize/save)."""
+        if not hasattr(self, 'waypoint_table'):
+            return
+        self._waypoint_table_updating = True
+        try:
+            rows = []
+            n = self.waypoint_table.rowCount()
+            for i in range(n):
+                def _cell(col, default='0'):
+                    it = self.waypoint_table.item(i, col)
+                    return it.text().strip() if it else default
+
+                x = float(_cell(WP_COL_X))
+                y = float(_cell(WP_COL_Y))
+                z = float(_cell(WP_COL_Z))
+                yaw = float(_cell(WP_COL_YAW))
+                t_item = self.waypoint_table.item(i, WP_COL_T_ARR)
+                t_arr = float(t_item.text()) if t_item and i > 0 else 0.0
+                rows.append([x, y, z, yaw, t_arr])
+            self.waypoints = [_normalize_waypoint_row(r) for r in rows]
+        finally:
+            self._waypoint_table_updating = False
+
+    def _on_waypoint_table_item_changed(self, item):
+        if self._waypoint_table_updating or item is None:
+            return
+        row = item.row()
+        col = item.column()
+        if row < 0 or row >= len(self.waypoints):
+            return
+        self._sync_waypoints_from_table()
+        try:
+            if col in (WP_COL_X, WP_COL_Y, WP_COL_Z, WP_COL_YAW):
+                pass
+            elif col == WP_COL_LEG_DT:
+                if row <= 0:
+                    return
+                leg = float(item.text())
+                if leg <= 0:
+                    raise ValueError('leg duration must be positive')
+                prev_t = self.waypoints[row - 1][4]
+                old_t = self.waypoints[row][4]
+                shift = (prev_t + leg) - old_t
+                self.waypoints[row][4] = prev_t + leg
+                for j in range(row + 1, len(self.waypoints)):
+                    self.waypoints[j][4] += shift
+            elif col == WP_COL_T_ARR:
+                if row <= 0:
+                    return
+                new_t = float(item.text())
+                if new_t <= self.waypoints[row - 1][4]:
+                    raise ValueError('arrival time must increase')
+                old_t = self.waypoints[row][4]
+                shift = new_t - old_t
+                self.waypoints[row][4] = new_t
+                for j in range(row + 1, len(self.waypoints)):
+                    self.waypoints[j][4] += shift
+            else:
                 return
-            self.waypoints.pop(current_row)
-            self.update_waypoint_list()
-            # Select previous item if available
-            if current_row > 0:
-                self.waypoint_list.setCurrentRow(current_row - 1)
-            self._sync_trajectory_preset_combo_from_waypoints()
+        except ValueError:
+            self._populate_waypoint_table()
+            return
+        self._populate_waypoint_table()
+        self.waypoint_table.selectRow(row)
 
-    def update_waypoint(self):
-        """Update selected waypoint with current values"""
-        current_row = self.waypoint_list.currentRow()
-        if current_row >= 0 and current_row < len(self.waypoints):
-            self.waypoints[current_row] = [self.wp_x.value(), self.wp_y.value(), self.wp_z.value(), 
-                                          self.wp_yaw.value(), self.wp_time.value()]
-            self.update_waypoint_list()
-            self.waypoint_list.setCurrentRow(current_row)
-            self._sync_trajectory_preset_combo_from_waypoints()
+    def add_waypoint(self):
+        """Append a waypoint row (default Δt = dt×N)."""
+        self._sync_waypoints_from_table()
+        leg = self._default_leg_duration()
+        if self.waypoints:
+            last = _normalize_waypoint_row(self.waypoints[-1])
+            new_t = last[4] + leg
+            new_wp = [last[0], last[1], last[2] + 1.0, last[3], new_t]
+        else:
+            new_wp = [0.0, 0.0, 1.0, 0.0, leg]
+        self.waypoints.append(new_wp)
+        self._populate_waypoint_table()
+        self.waypoint_table.selectRow(len(self.waypoints) - 1)
 
-    def on_waypoint_selected(self):
-        """Handle waypoint selection"""
-        current_row = self.waypoint_list.currentRow()
-        if current_row >= 0 and current_row < len(self.waypoints):
-            wp = self.waypoints[current_row]
-            # Ensure waypoint has all required fields (for backward compatibility)
-            # Format: [x, y, z, yaw_deg, time]
-            if len(wp) < 5:
-                # Old format: [x, y, z, time] -> add yaw=0
-                if len(wp) == 4:
-                    wp = [wp[0], wp[1], wp[2], 0.0, wp[3]]  # Insert yaw=0 before time
-                else:
-                    wp = list(wp) + [0.0] * (5 - len(wp))
-            self.wp_x.setValue(wp[0])
-            self.wp_y.setValue(wp[1])
-            self.wp_z.setValue(wp[2])
-            self.wp_yaw.setValue(wp[3] if len(wp) > 3 else 0.0)
-            self.wp_time.setValue(wp[4] if len(wp) > 4 else (wp[3] if len(wp) > 3 else 0.0))
+    def remove_waypoint(self):
+        """Remove selected table row (cannot remove start)."""
+        self._sync_waypoints_from_table()
+        row = self.waypoint_table.currentRow()
+        if row < 0 or row >= len(self.waypoints):
+            return
+        if row == 0:
+            QMessageBox.warning(self, 'Warning', 'Cannot remove start point')
+            return
+        self.waypoints.pop(row)
+        self._populate_waypoint_table()
+        if row > 0:
+            self.waypoint_table.selectRow(row - 1)
 
     def on_trajectory_preset_changed(self, index):
-        """Apply built-in waypoint sequence for the selected trajectory preset."""
-        if index < 0 or index >= len(TRAJECTORY_PRESETS):
-            return
-        _, wps = TRAJECTORY_PRESETS[index]
-        self.waypoints = [_normalize_waypoint_row(w) for w in wps]
-        self.update_waypoint_list()
-        if self.waypoints:
-            self.waypoint_list.setCurrentRow(0)
-            self.on_waypoint_selected()
+        """Load waypoints and saved optimization for the selected slot + current mode."""
+        old_combo = getattr(self, '_traj_combo_prev_index', int(index))
+        old_mode_key = traj_opt_mode_key(
+            getattr(self, '_traj_opt_mode_prev_index', TRAJ_OPT_MODE_NORMAL)
+        )
+        self._cache_results_for_slot_mode(old_combo, old_mode_key)
+        self._load_trajectory_for_combo_index(index)
+        self._traj_combo_prev_index = int(index)
+        self._refresh_trajectory_storage_path_label()
+        if hasattr(self, 'tracking_source_combo'):
+            self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
+        if hasattr(self, 'tracking_source_combo'):
+            self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
 
-    def _sync_trajectory_preset_combo_from_waypoints(self):
-        """Align trajectory combo with current waypoints after load (or leave index 0 if no preset matches)."""
+    def _apply_waypoints_from_list(self, waypoints):
+        """Replace GUI waypoints and refresh the table."""
+        self.waypoints = [_normalize_waypoint_row(w) for w in waypoints]
+        self._populate_waypoint_table()
+        if self.waypoints:
+            self.waypoint_table.selectRow(0)
+
+    def _builtin_waypoints_for_combo_index(self, combo_index):
+        preset_id = combo_index_to_trajectory_preset_id(combo_index)
+        if 0 <= preset_id < len(TRAJECTORY_PRESETS):
+            _, wps = TRAJECTORY_PRESETS[preset_id]
+            return [_normalize_waypoint_row(w) for w in wps]
+        return []
+
+    def _load_trajectory_for_combo_index(self, combo_index, quiet=False):
+        """Load waypoints from the JSON file for a slot, or built-in defaults."""
+        combo_index = int(combo_index)
+        preset_id = combo_index_to_trajectory_preset_id(combo_index)
+        path = trajectory_waypoints_path_for_preset_id(preset_id)
+        if preset_id == TRAJECTORY_PRESET_CUSTOM:
+            if os.path.isfile(path):
+                if not self._load_waypoints_file(path, quiet=quiet):
+                    return False
+            elif not quiet and hasattr(self, 'status_text'):
+                self.status_text.append('Custom waypoints — edit table or save to create file.')
+            self._restore_optimization_for_slot_and_mode(combo_index, quiet=quiet)
+            return True
+        if os.path.isfile(path):
+            if not self._load_waypoints_file(path, quiet=quiet):
+                return False
+            self._restore_optimization_for_slot_and_mode(combo_index, quiet=quiet)
+            return True
+        builtin = self._builtin_waypoints_for_combo_index(combo_index)
+        if builtin:
+            self._apply_waypoints_from_list(builtin)
+            self._restore_optimization_for_slot_and_mode(combo_index, quiet=quiet)
+            if not quiet and hasattr(self, 'status_text'):
+                self.status_text.append(
+                    f'Loaded built-in defaults for {trajectory_combo_label(combo_index)} '
+                    f'(no saved file at {path}).'
+                )
+            return True
+        if not quiet:
+            QMessageBox.warning(self, 'Load failed', f'No waypoints for slot index {combo_index}')
+        return False
+
+    def _load_waypoints_file(self, path, quiet=False, combo_index=None):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            if not quiet:
+                QMessageBox.critical(self, 'Load failed', f'Could not read {path}:\n{e}')
+            return False
+        raw = data.get('waypoints', data if isinstance(data, list) else [])
+        if not raw:
+            if not quiet:
+                QMessageBox.warning(self, 'Load failed', f'No waypoints in {path}')
+            return False
+        self._apply_waypoints_from_list(raw)
+        if not quiet and hasattr(self, 'status_text'):
+            self.status_text.append(
+                f'Loaded trajectory ({len(self.waypoints)} pts) from:\n  {path}'
+            )
+        return True
+
+    def _format_opt_summary_lines(self, summary):
+        """Multi-line optimization summary for the plot info bar."""
+        if not summary:
+            return ['No optimization results yet.']
+        method = summary.get('method_name') or f"method {summary.get('method', '?')}"
+        total_time = float(summary.get('total_time_s', 0.0))
+        total_iters = int(summary.get('total_iters', 0))
+        avg_ms = float(summary.get('avg_time_per_iter_ms', 0.0))
+        path_len = float(summary.get('path_length_m', 0.0))
+        duration = float(summary.get('trajectory_duration_s', 0.0))
+        line1 = (
+            f'Method: {method}   |   Total: {total_time:.2f} s   |   '
+            f'Iters: {total_iters}   |   Avg: {avg_ms:.1f} ms/iter   |   '
+            f'Path: {path_len:.2f} m   |   Duration: {duration:.2f} s'
+        )
+        seg_iters = summary.get('segment_iters') or []
+        seg_costs = summary.get('segment_final_costs') or []
+        seg_parts = []
+        for i, n in enumerate(seg_iters):
+            part = f'Seg {i + 1}: {int(n)} opt'
+            if i < len(seg_costs):
+                part += f' (cost {float(seg_costs[i]):.3e})'
+            seg_parts.append(part)
+        ots = summary.get('optimal_segment_times')
+        if ots:
+            seg_parts.append('Seg times [s]: ' + ', '.join(f'{float(t):.3f}' for t in ots))
+        line2 = '   |   '.join(seg_parts) if seg_parts else ''
+        saved_at = summary.get('saved_at')
+        line3 = f'Saved: {saved_at}' if saved_at else ''
+        lines = [line1]
+        if line2:
+            lines.append(line2)
+        if line3:
+            lines.append(line3)
+        return lines
+
+    def _refresh_opt_info_display(self):
+        """Update the top plot row with optimization statistics."""
+        if not hasattr(self, 'ax_opt_info'):
+            return
+        self.ax_opt_info.clear()
+        self.ax_opt_info.axis('off')
+        summary = getattr(self, 'opt_summary', None)
+        if not summary:
+            self.ax_opt_info.text(
+                0.5, 0.5,
+                self._opt_info_empty_message(),
+                ha='center', va='center', fontsize=10, color='#666',
+                transform=self.ax_opt_info.transAxes,
+            )
+        else:
+            lines = self._format_opt_summary_lines(summary)
+            self.ax_opt_info.text(
+                0.01, 0.92, '\n'.join(lines),
+                ha='left', va='top', fontsize=9.5, family='monospace',
+                transform=self.ax_opt_info.transAxes,
+            )
+        if hasattr(self, 'canvas'):
+            self.canvas.draw_idle()
+
+    def _clear_optimization_plots(self):
+        """Clear trajectory / cost axes (keep titles)."""
+        if not hasattr(self, 'ax_3d'):
+            return
+        plot_axes = (
+            self.ax_3d, self.ax_cost, self.ax_pos, self.ax_vel, self.ax_euler,
+            self.ax_angvel, self.ax_pitch, self.ax_roll, self.ax_thrust, self.ax_yaw,
+        )
+        for ax in plot_axes:
+            ax.clear()
+        self.ax_cost.set_xlabel('Iteration', fontsize=10)
+        self.ax_cost.set_ylabel('Cost (log scale)', fontsize=10)
+        self.ax_cost.set_title('Optimization Cost Convergence', fontsize=11, fontweight='bold')
+        self.ax_cost.grid(True, alpha=0.3)
+        if hasattr(self, 'canvas'):
+            self.canvas.draw_idle()
+
+    def _clear_optimization_results(self, clear_plots=False):
+        """Drop cached optimization; optionally clear plot panels."""
+        self.last_trajectory = None
+        self.opt_summary = None
+        self._enable_trajectory_export_buttons(False)
+        self._refresh_opt_info_display()
+        if clear_plots:
+            self._clear_optimization_plots()
+
+    def _apply_cached_trajectory_entry(self, entry, combo_index, mode_key, quiet=False):
+        self.last_trajectory = entry['last_trajectory']
+        self.opt_summary = entry.get('opt_summary')
+        paths = resolve_trajectory_artifact_paths(combo_index, mode_key)
+        if os.path.isfile(paths['csv']):
+            self.last_csv_path = paths['csv']
+        self._enable_trajectory_export_buttons(True)
+        self._restore_plot_from_last_trajectory()
+        if not quiet and hasattr(self, 'status_text'):
+            label = trajectory_combo_label(combo_index)
+            mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
+            iters = (self.opt_summary or {}).get('total_iters', '?')
+            path_len = (self.opt_summary or {}).get('path_length_m', 0.0)
+            self.status_text.append(
+                f'Loaded {label} ({mode_label}): {iters} iters, {path_len:.2f} m path.'
+            )
+        return True
+
+    def _restore_optimization_for_slot_and_mode(self, combo_index, mode_key=None, quiet=False):
+        """Load in-memory or on-disk optimization for one trajectory slot + mode."""
+        combo_index = int(combo_index)
+        mode_key = mode_key or self._current_traj_opt_mode_key()
+        cache_key = (combo_index, mode_key)
+        cached = self._trajectory_mode_cache.get(cache_key)
+        if cached and cached.get('last_trajectory', {}).get('xs') is not None:
+            if optimization_summary_matches_mode(cached.get('opt_summary'), mode_key):
+                return self._apply_cached_trajectory_entry(
+                    cached, combo_index, mode_key, quiet=quiet,
+                )
+            self._trajectory_mode_cache.pop(cache_key, None)
+        return self._try_restore_saved_optimization(
+            combo_index, mode_key=mode_key, quiet=quiet,
+        )
+
+    def _load_trajectory_arrays_from_paths(self, paths, summary, mode_key):
+        """Load trajectory arrays from NPZ, else from exported CSV."""
+        npz_path = paths['npz']
+        csv_path = paths['csv']
+        if os.path.isfile(npz_path):
+            z = np.load(npz_path, allow_pickle=False)
+            xs = np.asarray(z['xs'], dtype=float)
+            us = np.asarray(z['us'], dtype=float) if 'us' in z.files else None
+            us_actual = np.asarray(z['us_actual'], dtype=float) if 'us_actual' in z.files else None
+            time_states = (
+                np.asarray(z['time_states'], dtype=float) if 'time_states' in z.files else None
+            )
+            sbo = z['segment_boundary_indices'] if 'segment_boundary_indices' in z.files else None
+            if sbo is not None:
+                sbo = [int(x) for x in np.asarray(sbo).reshape(-1)]
+            ots = z['optimal_segment_times'] if 'optimal_segment_times' in z.files else None
+            if ots is not None:
+                ots = [float(x) for x in np.asarray(ots).reshape(-1)]
+            return {
+                'xs': xs,
+                'us': us,
+                'us_actual': us_actual,
+                'plot_dt': summary.get('plot_dt'),
+                'dt': summary.get('dt', self.dt_spin.value()),
+                'time_states': time_states,
+                'segment_boundary_indices': sbo or summary.get('segment_boundary_indices'),
+                'optimal_segment_times': ots or summary.get('optimal_segment_times'),
+                'method': summary.get('method'),
+                'method_name': summary.get('method_name', ''),
+            }
+        if os.path.isfile(csv_path):
+            loaded = load_trajectory_from_export_csv(csv_path)
+            if loaded is None:
+                return None
+            loaded['method'] = summary.get('method')
+            loaded['method_name'] = summary.get('method_name', '')
+            loaded['plot_dt'] = summary.get('plot_dt') or loaded.get('plot_dt')
+            loaded['dt'] = summary.get('dt') or loaded.get('dt')
+            loaded['segment_boundary_indices'] = summary.get('segment_boundary_indices')
+            loaded['optimal_segment_times'] = summary.get('optimal_segment_times')
+            return loaded
+        alt_csv = (summary or {}).get('csv_path')
+        if alt_csv and alt_csv != csv_path and os.path.isfile(alt_csv):
+            loaded = load_trajectory_from_export_csv(alt_csv)
+            if loaded is None:
+                return None
+            loaded['method'] = summary.get('method')
+            loaded['method_name'] = summary.get('method_name', '')
+            loaded['plot_dt'] = summary.get('plot_dt') or loaded.get('plot_dt')
+            loaded['dt'] = summary.get('dt') or loaded.get('dt')
+            loaded['segment_boundary_indices'] = summary.get('segment_boundary_indices')
+            loaded['optimal_segment_times'] = summary.get('optimal_segment_times')
+            return loaded
+        return None
+
+    def _make_optimization_summary(self, xs, us, all_loggers, timing_info=None):
+        """Build JSON-serializable optimization summary dict."""
+        timing_info = timing_info or {}
+        xs_arr = np.asarray(xs, dtype=float) if xs is not None else np.zeros((0, 17))
+        segment_iters = []
+        segment_final_costs = []
+        segment_cost_histories = []
+        if all_loggers:
+            for logger in all_loggers:
+                costs = [float(c) for c in (getattr(logger, 'costs', []) or [])]
+                segment_cost_histories.append(costs)
+                segment_iters.append(len(costs))
+                if costs:
+                    segment_final_costs.append(float(costs[-1]))
+        total_iters = int(timing_info.get('total_iters', sum(segment_iters)))
+        total_time = float(timing_info.get('total_time', 0.0))
+        avg_ms = float(timing_info.get('avg_time_per_iter', 0.0)) * 1000.0
+        if total_iters > 0 and avg_ms <= 0.0 and total_time > 0:
+            avg_ms = (total_time / total_iters) * 1000.0
+        traj_duration = 0.0
+        ots = timing_info.get('optimal_segment_times')
+        if ots:
+            traj_duration = float(sum(float(t) for t in ots))
+        elif xs_arr.shape[0] > 1:
+            traj_duration = float(
+                (xs_arr.shape[0] - 1) * float(timing_info.get('plot_dt') or self.dt_spin.value())
+            )
+        return {
+            'method': int(self.method_combo.currentIndex()),
+            'method_name': timing_info.get('method', ''),
+            'total_time_s': total_time,
+            'total_iters': total_iters,
+            'avg_time_per_iter_ms': avg_ms,
+            'path_length_m': trajectory_path_length_m(xs_arr),
+            'trajectory_duration_s': traj_duration,
+            'segment_iters': segment_iters,
+            'segment_final_costs': segment_final_costs,
+            'segment_cost_histories': segment_cost_histories,
+            'optimal_segment_times': [float(t) for t in ots] if ots else None,
+            'segment_boundary_indices': timing_info.get('segment_boundary_indices'),
+            'plot_dt': timing_info.get('plot_dt'),
+            'dt': float(self.dt_spin.value()),
+        }
+
+    def _restore_plot_from_last_trajectory(self):
+        """Redraw all panels from ``self.last_trajectory``."""
+        traj = self.last_trajectory
+        if not traj or traj.get('xs') is None:
+            return
+        xs = traj['xs']
+        us = traj.get('us')
+        histories = (self.opt_summary or {}).get('segment_cost_histories') or []
+        if histories:
+            loggers = [_SavedCostLogger(h) for h in histories]
+            draw_cost_panel(self.ax_cost, loggers)
+        self._refresh_opt_info_display()
+        self.update_state(
+            xs,
+            us,
+            traj.get('us_actual'),
+            plot_dt=traj.get('plot_dt'),
+            segment_boundaries_override=traj.get('segment_boundary_indices'),
+            time_states=traj.get('time_states'),
+        )
+
+    def _try_restore_saved_optimization(
+        self, combo_index, json_data=None, mode_key=None, quiet=False,
+    ):
+        """Load saved CSV/NPZ optimization for one trajectory slot + mode."""
+        combo_index = int(combo_index)
+        mode_key = mode_key or self._current_traj_opt_mode_key()
+        paths = resolve_trajectory_artifact_paths(combo_index, mode_key)
+        if json_data is None:
+            if not os.path.isfile(paths['json']):
+                self._clear_optimization_results(clear_plots=True)
+                return False
+            try:
+                with open(paths['json'], 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                self._clear_optimization_results(clear_plots=True)
+                return False
+        summary = optimization_summary_from_json(json_data, mode_key)
+        if not summary or not optimization_summary_matches_mode(summary, mode_key):
+            self._trajectory_mode_cache.pop((combo_index, mode_key), None)
+            self._clear_optimization_results(clear_plots=True)
+            return False
+        loaded = self._load_trajectory_arrays_from_paths(paths, summary, mode_key)
+        if loaded is None or loaded.get('xs') is None:
+            self._trajectory_mode_cache.pop((combo_index, mode_key), None)
+            self._clear_optimization_results(clear_plots=True)
+            return False
+        try:
+            self.opt_summary = dict(summary)
+            self.last_trajectory = loaded
+            if os.path.isfile(paths['csv']):
+                self.last_csv_path = paths['csv']
+            self._cache_results_for_slot_mode(combo_index, mode_key)
+            return self._apply_cached_trajectory_entry(
+                self._trajectory_mode_cache[(combo_index, mode_key)],
+                combo_index,
+                mode_key,
+                quiet=quiet,
+            )
+        except (OSError, ValueError, KeyError) as e:
+            if not quiet and hasattr(self, 'status_text'):
+                self.status_text.append(f'Could not load saved trajectory: {e}')
+            self._trajectory_mode_cache.pop((combo_index, mode_key), None)
+            self._clear_optimization_results(clear_plots=True)
+            return False
+
+    def _current_trajectory_csv_path(self):
+        """CSV path for the current trajectory slot + optimization mode."""
+        if not hasattr(self, 'trajectory_preset_combo'):
+            return DEFAULT_TRAJ_CSV_PATH
+        return resolve_trajectory_artifact_paths(
+            self.trajectory_preset_combo.currentIndex(),
+            self._current_traj_opt_mode_key(),
+        )['csv']
+
+    def save_trajectory(self):
+        """Save waypoints, optimized CSV, NPZ, and summary for the current trajectory slot."""
+        self._sync_waypoints_from_table()
+        if len(self.waypoints) < 2:
+            QMessageBox.warning(
+                self,
+                'Not enough waypoints',
+                'Need at least 2 waypoints (start + one target) before saving.',
+            )
+            return
+        for i in range(len(self.waypoints) - 1):
+            if self.waypoints[i][4] >= self.waypoints[i + 1][4]:
+                QMessageBox.warning(
+                    self,
+                    'Invalid times',
+                    f'Waypoint {i + 1} arrival time must be greater than waypoint {i}.',
+                )
+                return
+        if not self.last_trajectory or self.last_trajectory.get('xs') is None:
+            QMessageBox.warning(
+                self,
+                'No optimization',
+                'Run Start Optimization first, then click Save Trajectory.',
+            )
+            return
+        payload = self._build_trajectory_csv_payload()
+        if payload is None:
+            QMessageBox.warning(self, 'No trajectory', 'Could not build trajectory export.')
+            return
+
+        combo_index = self.trajectory_preset_combo.currentIndex()
+        mode_key = self._current_traj_opt_mode_key()
+        paths = trajectory_artifact_paths(combo_index, mode_key)
+        label = trajectory_combo_label(combo_index)
+        mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
+        summary = dict(self.opt_summary or self._make_optimization_summary(
+            self.last_trajectory['xs'],
+            self.last_trajectory.get('us'),
+            [],
+            {'total_time': 0.0, 'total_iters': 0, 'method': self.last_trajectory.get('method_name', '')},
+        ))
+        summary['saved_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        summary['mode_key'] = mode_key
+        summary['csv_path'] = paths['csv']
+        summary['npz_path'] = paths['npz']
+        self.opt_summary = summary
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(paths['json'])), exist_ok=True)
+            self._write_trajectory_csv(paths['csv'], payload)
+            traj = self.last_trajectory
+            npz_kw = {'xs': np.asarray(traj['xs'], dtype=float)}
+            if traj.get('us') is not None:
+                npz_kw['us'] = np.asarray(traj['us'], dtype=float)
+            if traj.get('us_actual') is not None:
+                npz_kw['us_actual'] = np.asarray(traj['us_actual'], dtype=float)
+            if traj.get('time_states') is not None:
+                npz_kw['time_states'] = np.asarray(traj['time_states'], dtype=float)
+            if traj.get('segment_boundary_indices') is not None:
+                npz_kw['segment_boundary_indices'] = np.asarray(
+                    traj['segment_boundary_indices'], dtype=int
+                )
+            if traj.get('optimal_segment_times') is not None:
+                npz_kw['optimal_segment_times'] = np.asarray(
+                    traj['optimal_segment_times'], dtype=float
+                )
+            np.savez_compressed(paths['npz'], **npz_kw)
+            optimizations = {}
+            if os.path.isfile(paths['json']):
+                try:
+                    with open(paths['json'], 'r', encoding='utf-8') as f:
+                        existing = json.load(f)
+                    opts = existing.get('optimizations')
+                    if isinstance(opts, dict):
+                        optimizations.update(opts)
+                    legacy = existing.get('optimization')
+                    if legacy and 'normal' not in optimizations and 'min_time' not in optimizations:
+                        if legacy.get('method') == METHOD_MIN_TIME_INDEX:
+                            optimizations['min_time'] = legacy
+                        else:
+                            optimizations['normal'] = legacy
+                except (OSError, json.JSONDecodeError, TypeError):
+                    pass
+            optimizations[mode_key] = summary
+            json_payload = {
+                'version': TRAJ_JSON_VERSION,
+                'name': label,
+                'waypoints': waypoints_to_json_list(self.waypoints),
+                'optimizations': optimizations,
+            }
+            with open(paths['json'], 'w', encoding='utf-8') as f:
+                json.dump(json_payload, f, indent=2, ensure_ascii=False, default=str)
+        except OSError as e:
+            QMessageBox.critical(self, 'Save failed', f'Could not write trajectory files:\n{e}')
+            return
+
+        self.last_csv_path = paths['csv']
+        self.default_traj_csv_path = paths['csv']
+        self._cache_current_mode_results()
+        self._refresh_trajectory_storage_path_label()
+        self._refresh_opt_info_display()
+        if hasattr(self, 'tracking_source_combo'):
+            self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
+        self.status_text.append(
+            f'Saved {label} ({mode_label}): waypoints + optimization to\n'
+            f'  JSON: {paths["json"]}\n'
+            f'  CSV:  {paths["csv"]}'
+        )
+
+    def _load_saved_waypoints_from_file(self, quiet=False):
+        """Load waypoints from the Saved trajectory file."""
+        path = DEFAULT_SAVED_WAYPOINTS_PATH
+        if not os.path.isfile(path):
+            if not quiet:
+                QMessageBox.warning(
+                    self,
+                    'No saved trajectory',
+                    f'File not found:\n{path}\n\n'
+                    'Edit waypoints and click Save trajectory first.',
+                )
+            return False
+        return self._load_waypoints_file(path, quiet=quiet)
+
+    def _set_trajectory_preset_combo_index(self, combo_index):
+        """Set Trajectory combo without firing preset replacement."""
         if not hasattr(self, 'trajectory_preset_combo'):
             return
-        idx = trajectory_preset_match_index(self.waypoints)
+        combo_index = max(0, min(self.trajectory_preset_combo.count() - 1, int(combo_index)))
         self.trajectory_preset_combo.blockSignals(True)
-        self.trajectory_preset_combo.setCurrentIndex(idx if idx is not None else 0)
+        self.trajectory_preset_combo.setCurrentIndex(combo_index)
         self.trajectory_preset_combo.blockSignals(False)
 
+    def _sync_trajectory_preset_combo_from_waypoints(self):
+        """Align Trajectory combo with waypoints (preset / saved file / custom)."""
+        if not hasattr(self, 'trajectory_preset_combo'):
+            return
+        if (
+            os.path.isfile(self.saved_waypoints_path)
+            and trajectory_preset_match_index(self.waypoints)
+            is None
+        ):
+            try:
+                with open(self.saved_waypoints_path, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                saved_wps = waypoints_to_json_list(saved.get('waypoints', []))
+                current_wps = waypoints_to_json_list(self.waypoints)
+                if saved_wps == current_wps:
+                    self._set_trajectory_preset_combo_index(trajectory_saved_combo_index())
+                    return
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        idx = trajectory_preset_match_index(self.waypoints)
+        self._set_trajectory_preset_combo_index(
+            idx if idx is not None else trajectory_custom_combo_index()
+        )
+
+    def _apply_trajectory_from_config(self, cfg):
+        """Load waypoints according to ``trajectory_preset`` in a params file."""
+        preset_raw = cfg.get('trajectory_preset', TRAJECTORY_PRESET_CUSTOM)
+        try:
+            preset_id = int(preset_raw)
+        except (TypeError, ValueError):
+            preset_id = TRAJECTORY_PRESET_CUSTOM
+
+        combo_idx = trajectory_preset_id_to_combo_index(preset_id)
+        self._set_trajectory_preset_combo_index(combo_idx)
+        if not self._load_trajectory_for_combo_index(combo_idx, quiet=True):
+            if 'waypoints' in cfg:
+                self._apply_waypoints_from_list(cfg['waypoints'])
+        self._refresh_trajectory_storage_path_label()
+
     def gui_config_to_dict(self):
-        """Serialize GUI settings to a JSON-friendly dict (waypoints + all parameters)."""
-        wp = []
-        for w in self.waypoints:
-            w = list(w)
-            while len(w) < 5:
-                w.append(0.0)
-            wp.append([float(w[0]), float(w[1]), float(w[2]), float(w[3]), float(w[4])])
-        return {
+        """Serialize GUI settings to a JSON-friendly dict."""
+        preset_id = combo_index_to_trajectory_preset_id(
+            self.trajectory_preset_combo.currentIndex()
+        )
+        cfg = {
             'version': GUI_PARAMS_VERSION,
-            'waypoints': wp,
-            'trajectory_preset': self.trajectory_preset_combo.currentIndex(),
+            'trajectory_preset': preset_id,
+            'traj_opt_mode': (
+                'min_time'
+                if hasattr(self, 'traj_opt_mode_combo')
+                and self.traj_opt_mode_combo.currentIndex() == TRAJ_OPT_MODE_MIN_TIME
+                else 'normal'
+            ),
+            'normal_method': getattr(self, '_normal_method_index', METHOD_NORMAL_DEFAULT_INDEX),
             'method': self.method_combo.currentIndex(),
             'unified': self.unified_checkbox.isChecked(),
             'unified_interp_initial_guess': self.unified_interp_guess_checkbox.isChecked(),
@@ -2036,6 +3060,9 @@ class MainWindow(QMainWindow):
             'min_time_T_min': self.min_time_T_min_spin.value(),
             'min_time_T_max_scale': self.min_time_T_max_scale_spin.value(),
         }
+        if preset_id == TRAJECTORY_PRESET_CUSTOM:
+            cfg['waypoints'] = waypoints_to_json_list(self.waypoints)
+        return cfg
 
     def apply_gui_config(self, cfg):
         """Apply settings from dict (e.g. loaded JSON). Does not call on_method_changed."""
@@ -2044,17 +3071,7 @@ class MainWindow(QMainWindow):
         for combo in self._method_combos():
             combo.blockSignals(True)
         try:
-            if 'waypoints' in cfg:
-                self.waypoints = []
-                for w in cfg['waypoints']:
-                    w = list(w)
-                    while len(w) < 5:
-                        w.append(0.0)
-                    self.waypoints.append([float(w[0]), float(w[1]), float(w[2]), float(w[3]), float(w[4])])
-                self.update_waypoint_list()
-                if self.waypoints:
-                    self.waypoint_list.setCurrentRow(0)
-                    self.on_waypoint_selected()
+            self._apply_trajectory_from_config(cfg)
 
             def _set_spin(spin, key):
                 if key in cfg:
@@ -2078,6 +3095,15 @@ class MainWindow(QMainWindow):
                 idx = max(0, min(self.method_combo.count() - 1, idx))
                 for combo in self._method_combos():
                     combo.setCurrentIndex(idx)
+            if 'normal_method' in cfg:
+                self._normal_method_index = int(cfg['normal_method'])
+            if 'traj_opt_mode' in cfg:
+                mode = TRAJ_OPT_MODE_MIN_TIME if cfg['traj_opt_mode'] == 'min_time' else TRAJ_OPT_MODE_NORMAL
+                self._set_traj_opt_mode_combo_index(mode)
+                self._on_traj_opt_mode_changed(mode)
+                self._traj_opt_mode_prev_index = int(mode)
+            elif 'method' in cfg:
+                self._update_method_combo_enabled_for_traj_mode()
             _set_check(self.unified_checkbox, 'unified')
             _set_check(self.unified_interp_guess_checkbox, 'unified_interp_initial_guess')
 
@@ -2122,7 +3148,6 @@ class MainWindow(QMainWindow):
                 combo.blockSignals(False)
         self._update_unified_checkbox_state(self.method_combo.currentIndex())
         self._refresh_min_time_duration_group_visible(self.method_combo.currentIndex())
-        self._sync_trajectory_preset_combo_from_waypoints()
 
     def _update_params_file_label(self):
         if hasattr(self, 'params_file_label'):
@@ -2178,6 +3203,7 @@ class MainWindow(QMainWindow):
 
     def get_parameters(self):
         """Get optimization parameters"""
+        self._sync_waypoints_from_table()
         # Initial / goal pose from waypoints (requires ≥2 waypoints to run optimization)
         x0 = np.zeros(17)
         if len(self.waypoints) > 0:
@@ -2328,31 +3354,32 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'Warning', 'Optimization already in progress')
             return
         
-        # Validate waypoints and times
+        self._sync_waypoints_from_table()
         if len(self.waypoints) < 2:
             QMessageBox.warning(self, 'Warning', 'Need at least 2 waypoints (start and at least one waypoint)')
             return
-        
-        # Ensure all waypoints have all required fields and validate time order
-        # Format: [x, y, z, yaw_deg, time]
-        for i, wp in enumerate(self.waypoints):
-            if len(wp) == 4:
-                # Old format: [x, y, z, time] -> convert to [x, y, z, yaw=0, time]
-                self.waypoints[i] = [wp[0], wp[1], wp[2], 0.0, wp[3]]
-            elif len(wp) < 5:
-                self.waypoints[i] = list(wp) + [0.0] * (5 - len(wp))
-        
-        # Check time order (time is at index 4)
+
         for i in range(len(self.waypoints) - 1):
-            if self.waypoints[i][4] >= self.waypoints[i+1][4]:
-                QMessageBox.warning(self, 'Warning', 
-                                  f'Waypoint {i+1} arrival time ({self.waypoints[i+1][4]:.2f}s) must be greater than waypoint {i} time ({self.waypoints[i][4]:.2f}s)')
+            if self.waypoints[i][4] >= self.waypoints[i + 1][4]:
+                QMessageBox.warning(
+                    self,
+                    'Warning',
+                    f'Waypoint {i + 1} arrival time ({self.waypoints[i + 1][4]:.2f}s) must be '
+                    f'greater than waypoint {i} time ({self.waypoints[i][4]:.2f}s)',
+                )
                 return
+
+        self.waypoints = [_normalize_waypoint_row(w) for w in self.waypoints]
+
+        self._trajectory_mode_cache.pop(self._mode_cache_key(), None)
+        self.last_trajectory = None
         
         # Reset display
         self.iterations = []
         self.costs = []
         self.stops = []
+        self.opt_summary = None
+        self._refresh_opt_info_display()
         # Reset segment tracking
         self.segment_costs = {}
         self.segment_iterations = {}
@@ -2396,6 +3423,11 @@ class MainWindow(QMainWindow):
         # Start optimization
         self.status_text.append('Starting optimization...')
         wps = params.get('waypoints', [])
+        if wps:
+            legs = [
+                f'{wps[i + 1][4] - wps[i][4]:.2f}s' for i in range(len(wps) - 1)
+            ]
+            self.status_text.append(f'Segment Δt [s]: {legs}')
         if (params.get('method') == 3 and len(wps) > 2 and params.get('unified') and
                 params.get('weights', {}).get('waypoint_terminal_cost', True)):
             self.status_text.append('(Multi-WP + waypoint terminal cost: using segment mode)')
@@ -2486,7 +3518,10 @@ class MainWindow(QMainWindow):
             return
         
         dt = self.dt_spin.value()
-        waypoints = self.waypoints if hasattr(self, 'waypoints') else None
+        self._sync_waypoints_from_table()
+        waypoints = waypoints_for_optimizer(
+            self.waypoints if hasattr(self, 'waypoints') else []
+        )
         bd = self._bounds_display_from_widgets()
         draw_trajectory_panels({
             'ax_3d': self.ax_3d, 'ax_pos': self.ax_pos, 'ax_vel': self.ax_vel,
@@ -2590,10 +3625,12 @@ class MainWindow(QMainWindow):
             'method': self.method_combo.currentIndex(),
             'method_name': (timing_info or {}).get('method', ''),
         }
-        if hasattr(self, 'btn_save_traj_csv'):
-            self.btn_save_traj_csv.setEnabled(True)
-        if hasattr(self, 'btn_save_traj'):
-            self.btn_save_traj.setEnabled(True)
+        self.opt_summary = self._make_optimization_summary(xs, us, all_loggers, timing_info)
+        self._cache_current_mode_results()
+        self._refresh_opt_info_display()
+        self._enable_trajectory_export_buttons(True)
+        if hasattr(self, 'tracking_source_combo') and self.tracking_source_combo.currentIndex() == 0:
+            self._on_tracking_source_changed(0)
     
     def _frame_is_ned(self):
         return hasattr(self, 'frame_combo') and self.frame_combo.currentIndex() == 1
@@ -2690,6 +3727,31 @@ class MainWindow(QMainWindow):
             'method_name': method_name,
         }
 
+    def _execution_waypoints_csv_line(self, payload):
+        """Segment-end poses on the saved trajectory (matches executed CSV, not GUI table)."""
+        traj = self.last_trajectory
+        if not traj:
+            return ''
+        p = payload['p']
+        euler_deg = payload['euler_deg']
+        n = int(p.shape[0])
+        idxs = [0]
+        sbo = traj.get('segment_boundary_indices') or []
+        for bi in sbo:
+            bi = int(bi)
+            if 0 <= bi < n and bi not in idxs:
+                idxs.append(bi)
+        last = n - 1
+        if last >= 0 and last not in idxs:
+            idxs.append(last)
+        idxs.sort()
+        parts = []
+        for i in idxs:
+            parts.append(
+                f'{p[i, 0]:.6f},{p[i, 1]:.6f},{p[i, 2]:.6f},{euler_deg[i, 2]:.6f}'
+            )
+        return ';'.join(parts)
+
     def _write_trajectory_csv(self, path, payload):
         """Write prepared trajectory payload to ``path``."""
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -2712,10 +3774,15 @@ class MainWindow(QMainWindow):
             f"# frame: {frame_tag} "
             f"({'x N, y E, z D (PX4)' if frame_tag == 'NED' else 'x E, y N, z U (planner native)'})",
             f'# N_states: {N_states}, duration: {float(t[-1] - t[0]):.6f} s',
+        ]
+        wp_line = self._execution_waypoints_csv_line(payload)
+        if wp_line:
+            header_lines.append(f'# waypoints_enu: {wp_line}')
+        header_lines.extend([
             '# Commands repeat the last row (zero-order hold) so all columns have length N_states.',
             '# th_p, th_r: gimbal pitch/roll angles [rad]; T: thrust [N]; tau_yaw: reaction-wheel torque [N*m].',
             '# *_act columns are the actuator actual states (NaN when the method has no actuator dynamics).',
-        ]
+        ])
         columns = [
             't', 'x', 'y', 'z', 'vx', 'vy', 'vz',
             'qw', 'qx', 'qy', 'qz', 'wx', 'wy', 'wz',
@@ -2814,28 +3881,19 @@ class MainWindow(QMainWindow):
         self._after_trajectory_saved(path, payload)
 
     def _effective_last_saved_csv_path(self):
-        """Path used for 'Last saved trajectory' tracking mode."""
-        if self.last_csv_path and os.path.isfile(self.last_csv_path):
-            return self.last_csv_path
-        if os.path.isfile(self.default_traj_csv_path):
-            return self.default_traj_csv_path
-        if os.path.isfile(DEFAULT_TRAJ_CSV_PATH):
-            return DEFAULT_TRAJ_CSV_PATH
-        return self.default_traj_csv_path
+        """CSV path for the current trajectory slot (legacy alias)."""
+        return self._current_trajectory_csv_path()
 
     def _encode_waypoints_for_tracking(self):
         """Encode GUI waypoint list as tvc_traj_player waypoints_enu string."""
+        self._sync_waypoints_from_table()
         if not self.waypoints:
             return ''
         parts = []
         for i, wp in enumerate(self.waypoints):
             row = _normalize_waypoint_row(wp)
-            x, y, z, yaw, t_arr = row
-            if i == 0:
-                hover_s = 2.0
-            else:
-                prev_t = float(_normalize_waypoint_row(self.waypoints[i - 1])[4])
-                hover_s = max(0.5, float(t_arr) - prev_t)
+            x, y, z, yaw, _t = row
+            hover_s = 2.0 if i == 0 else max(0.5, leg_duration_s(self.waypoints, i))
             parts.append(f'{x},{y},{z},{yaw},{hover_s:.3f}')
         return ';'.join(parts)
 
@@ -2851,11 +3909,29 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'lbl_tracking_source_info'):
             return
         if index == 0:
-            path = self._effective_last_saved_csv_path()
-            exists = os.path.isfile(path)
-            self.lbl_tracking_source_info.setText(
-                f'CSV: {path}' + ('' if exists else ' (not saved yet — run Save trajectory first)')
+            label = trajectory_combo_label(
+                self.trajectory_preset_combo.currentIndex()
+                if hasattr(self, 'trajectory_preset_combo') else 0
             )
+            mode_label = (
+                'Minimum time' if self._current_traj_opt_mode_key() == 'min_time' else 'Normal'
+            )
+            path = self._current_trajectory_csv_path()
+            exists = os.path.isfile(path)
+            slot_label = f'{label} ({mode_label})'
+            if exists:
+                self.lbl_tracking_source_info.setText(f'{slot_label}: {path}')
+            elif (
+                getattr(self, 'last_trajectory', None)
+                and self.last_trajectory.get('xs') is not None
+            ):
+                self.lbl_tracking_source_info.setText(
+                    f'{slot_label}: optimized in memory — click Save Trajectory before tracking.'
+                )
+            else:
+                self.lbl_tracking_source_info.setText(
+                    f'{slot_label}: not saved — run Start Optimization, then Save Trajectory.'
+                )
             if hasattr(self, 'tracking_csv_edit'):
                 self.tracking_csv_edit.setText(path)
         elif index == 1:
@@ -2902,6 +3978,67 @@ class MainWindow(QMainWindow):
         if os.path.isfile(setup):
             return ['bash', '-lc', f'source "{setup}" && {launch_cmd}']
         return ['ros2', 'launch', 'tvc_controller', launch_file] + (extra_args or [])
+
+    def _ros2_shell_run_script(self, script_path, *script_args):
+        """Run a Python script with workspace ROS env (one-shot)."""
+        ws = self._ros2_workspace_root()
+        setup = os.path.join(ws, 'install', 'setup.bash')
+        py = sys.executable
+        quoted_args = ' '.join(f'"{a}"' for a in script_args)
+        run = f'{py} "{script_path}"'
+        if quoted_args:
+            run = f'{run} {quoted_args}'
+        if os.path.isfile(setup):
+            return ['bash', '-lc', f'source "{setup}" && {run}']
+        return [py, script_path, *script_args]
+
+    def clear_rviz_trajectory_display(self, quiet=False, include_planned=False):
+        """Clear RViz trajectory display (executed only, or planned + executed)."""
+        script = os.path.join(script_dir, 'tvc_clear_traj_viz.py')
+        if not os.path.isfile(script):
+            if not quiet:
+                QMessageBox.warning(self, 'Clear failed', f'Script not found:\n{script}')
+            return False
+        mode = 'all' if include_planned else 'executed'
+        script_args = ['world', '--mode', mode]
+        if include_planned:
+            script_args.extend(['--hold', '2.0'])
+        cmd = self._ros2_shell_run_script(script, *script_args)
+        timeout = 12.0 if include_planned else 10.0
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self._ros2_workspace_root(),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            if not quiet:
+                QMessageBox.warning(self, 'Clear failed', str(e))
+                self.status_text.append(f'Clear RViz trajectory failed: {e}')
+            return False
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or '').strip()
+            if not quiet:
+                QMessageBox.warning(
+                    self,
+                    'Clear failed',
+                    err or f'Exit code {result.returncode}',
+                )
+                self.status_text.append(f'Clear RViz trajectory failed: {err}')
+            return False
+        if not quiet:
+            if include_planned:
+                self.status_text.append(
+                    'Cleared RViz planned path, waypoint markers, executed path, '
+                    'and current setpoint.'
+                )
+            else:
+                self.status_text.append(
+                    'Cleared RViz executed path and current setpoint.'
+                )
+        return True
 
     def _start_background_process(self, attr_name, cmd, label):
         """Start a detached process group; store handle on self.<attr_name>."""
@@ -2989,6 +4126,9 @@ class MainWindow(QMainWindow):
             self._ros2_shell_command('tvc.launch.py'),
             'PX4 SITL (tvc.launch.py)',
         )
+        self.status_text.append(
+            'PX4 SITL starting — planned trajectory appears only after Tracking starts.'
+        )
 
     def stop_px4_sitl(self):
         """Stop tvc.launch.py process group."""
@@ -2996,23 +4136,45 @@ class MainWindow(QMainWindow):
 
     def start_tracking_node(self):
         """Launch tvc_traj_player with the selected tracking source."""
+        if (
+            self._traj_player_proc is not None
+            and self._traj_player_proc.poll() is None
+        ):
+            self.stop_tracking_node()
+
+        self.clear_rviz_trajectory_display(quiet=True)
+
         source = self.tracking_source_combo.currentIndex()
         extra = []
 
         if source == 0:
-            path = self._effective_last_saved_csv_path()
+            label = trajectory_combo_label(self.trajectory_preset_combo.currentIndex())
+            path = self._current_trajectory_csv_path()
             if not os.path.isfile(path):
-                QMessageBox.warning(
-                    self,
-                    'No trajectory CSV',
-                    'Save a trajectory first (Save trajectory), or choose another track source.',
-                )
+                if (
+                    getattr(self, 'last_trajectory', None)
+                    and self.last_trajectory.get('xs') is not None
+                ):
+                    QMessageBox.warning(
+                        self,
+                        'Save required',
+                        f'"{label}" is optimized but not saved yet.\n\n'
+                        'Click Save Trajectory, then start Tracking again.',
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        'Trajectory not optimized',
+                        f'No saved optimization CSV for "{label}".\n\n'
+                        'Run Start Optimization, then Save Trajectory, '
+                        'or choose CSV file / GUI waypoints.',
+                    )
                 return
-            extra = [
+            extra.extend([
                 self._launch_arg('play_mode', 'trajectory'),
                 self._launch_arg('csv_path', path),
-            ]
-            self.status_text.append(f'Tracking: last saved CSV\n  {path}')
+            ])
+            self.status_text.append(f'Tracking: {label}\n  {path}')
         elif source == 1:
             path = self.tracking_csv_edit.text().strip()
             if not path or not os.path.isfile(path):
@@ -3022,10 +4184,10 @@ class MainWindow(QMainWindow):
                     'Select a valid trajectory CSV file for tracking.',
                 )
                 return
-            extra = [
+            extra.extend([
                 self._launch_arg('play_mode', 'trajectory'),
                 self._launch_arg('csv_path', path),
-            ]
+            ])
             self.status_text.append(f'Tracking: CSV file\n  {path}')
         else:
             if len(self.waypoints) < 1:
@@ -3036,10 +4198,10 @@ class MainWindow(QMainWindow):
                 )
                 return
             wp_str = self._encode_waypoints_for_tracking()
-            extra = [
+            extra.extend([
                 self._launch_arg('play_mode', 'waypoint'),
                 self._launch_arg('waypoints_enu', wp_str),
-            ]
+            ])
             self.status_text.append(
                 f'Tracking: GUI waypoints ({len(self.waypoints)} pts, GotoSetpoint mode)'
             )
@@ -3051,8 +4213,10 @@ class MainWindow(QMainWindow):
         )
 
     def stop_tracking_node(self):
-        """Stop tvc_traj_player.launch.py process group."""
+        """Stop tvc_traj_player and clear all trajectory layers in RViz."""
         self._stop_background_process('_traj_player_proc', 'Tracking node')
+        self.clear_rviz_trajectory_display(quiet=True, include_planned=True)
+        self.status_text.append('RViz planned and executed trajectories cleared.')
 
     def closeEvent(self, event):
         """Terminate background ROS2 launches when the GUI exits."""

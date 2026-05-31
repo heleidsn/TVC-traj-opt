@@ -314,7 +314,6 @@ def draw_trajectory_panels(axes, xs, us, dt, waypoints, bounds_display, quat_to_
     ax_3d.set_ylabel('Y (m)', fontsize=10)
     ax_3d.set_zlabel('Z (m)', fontsize=10)
     ax_3d.set_title('3D Position Trajectory', fontsize=11, fontweight='bold')
-    ax_3d.legend(fontsize=8)
     ax_3d.grid(True, alpha=0.3)
 
     # 2. Position
