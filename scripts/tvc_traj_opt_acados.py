@@ -527,6 +527,8 @@ def solve_with_acados_waypoints_min_time(
         "plot_dt": plot_dt,
         "segment_boundary_indices": boundary_acc,
         "optimal_segment_times": optimal_T_list,
+        "total_sqp_iters": int(total_sqp_iters),
+        "total_solve_time": float(total_solve_time),
     }
     return combined_xs, combined_us, all_loggers, u_actual_out, meta
 
@@ -862,6 +864,8 @@ def solve_with_acados_waypoints_free_tf(
         "plot_dt": plot_dt,
         "segment_boundary_indices": boundary_acc,
         "optimal_segment_times": optimal_T_list,
+        "total_sqp_iters": int(total_sqp_iters),
+        "total_solve_time": float(total_solve_time),
     }
     return combined_xs, combined_us, all_loggers, u_actual_out, meta
 
@@ -1205,7 +1209,11 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
                 u_blocks.append(np.asarray(all_u_actual[i][1:], dtype=float))
     u_actual_out = np.vstack(u_blocks) if has_u_actual and u_blocks else None
 
-    return combined_xs, combined_us, all_loggers, u_actual_out, {}
+    meta = {
+        "total_sqp_iters": int(total_sqp_iters),
+        "total_solve_time": float(total_solve_time),
+    }
+    return combined_xs, combined_us, all_loggers, u_actual_out, meta
 
 
 def solve_with_acados_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, bounds, max_iter=100,
