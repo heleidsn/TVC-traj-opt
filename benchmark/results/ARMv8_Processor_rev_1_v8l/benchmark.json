@@ -1,0 +1,323 @@
+{
+  "timestamp": "20260601_125721",
+  "cpu_info": {
+    "hostname": "nautilus",
+    "system": "Linux",
+    "release": "5.15.148-tegra",
+    "machine": "aarch64",
+    "processor": "aarch64",
+    "python_version": "3.10.20",
+    "cpu_count_logical": 4,
+    "cpu_model": "ARMv8 Processor rev 1 (v8l)",
+    "cpu_mhz_current_avg": null,
+    "cpu_mhz_max": 1984.0,
+    "cpu_mhz_min": 115.2
+  },
+  "config": {
+    "start": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "goal": [
+      1.0,
+      1.0,
+      1.0,
+      0.0
+    ],
+    "duration": 5.0,
+    "nodes": [
+      20,
+      50,
+      100,
+      200
+    ],
+    "methods": [
+      3,
+      4,
+      5
+    ],
+    "max_iter": 100,
+    "warmup": false,
+    "bounds_human": {
+      "th_p_max_deg": 10.0,
+      "th_r_max_deg": 10.0,
+      "T_max": 25.0,
+      "tau_yaw_max": 1.0,
+      "k_bound": 200.0,
+      "v_horizontal_max": 1.0,
+      "v_vertical_max": 0.5,
+      "roll_max_deg": 10.0,
+      "pitch_max_deg": 10.0,
+      "yaw_max_deg": 30.0,
+      "w_max": 2.0,
+      "k_state_bound": 20.0
+    },
+    "phys": {
+      "m": 0.6,
+      "I": [
+        0.02,
+        0.02,
+        0.01
+      ],
+      "r_thrust": [
+        0.0,
+        0.0,
+        -0.2
+      ],
+      "g": 9.81
+    },
+    "config_path": null
+  },
+  "results": [
+    {
+      "method": 3,
+      "method_name": "Method 3 (BoxFDDP)",
+      "N": 20,
+      "dt": 0.25,
+      "duration": 5.0,
+      "total_time_s": 1.5114468680003483,
+      "setup_time_s": 0.0,
+      "solve_time_s": 1.5114468680003483,
+      "total_iters": 16,
+      "avg_time_per_iter_ms": 94.46542925002177,
+      "final_cost": 1743.935830735503,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {}
+    },
+    {
+      "method": 3,
+      "method_name": "Method 3 (BoxFDDP)",
+      "N": 50,
+      "dt": 0.1,
+      "duration": 5.0,
+      "total_time_s": 4.18906459199934,
+      "setup_time_s": 0.0,
+      "solve_time_s": 4.18906459199934,
+      "total_iters": 17,
+      "avg_time_per_iter_ms": 246.41556423525532,
+      "final_cost": 1742.3050152248886,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {}
+    },
+    {
+      "method": 3,
+      "method_name": "Method 3 (BoxFDDP)",
+      "N": 100,
+      "dt": 0.05,
+      "duration": 5.0,
+      "total_time_s": 7.935270923999269,
+      "setup_time_s": 0.0,
+      "solve_time_s": 7.935270923999269,
+      "total_iters": 17,
+      "avg_time_per_iter_ms": 466.7806425881923,
+      "final_cost": 1744.459517811341,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {}
+    },
+    {
+      "method": 3,
+      "method_name": "Method 3 (BoxFDDP)",
+      "N": 200,
+      "dt": 0.025,
+      "duration": 5.0,
+      "total_time_s": 15.92603667700132,
+      "setup_time_s": 0.0,
+      "solve_time_s": 15.92603667700132,
+      "total_iters": 17,
+      "avg_time_per_iter_ms": 936.8256868824307,
+      "final_cost": 1744.1315809788116,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {}
+    },
+    {
+      "method": 4,
+      "method_name": "Method 4 (Acados)",
+      "N": 20,
+      "dt": 0.25,
+      "duration": 5.0,
+      "total_time_s": 7.924434851000115,
+      "setup_time_s": 7.907050916999651,
+      "solve_time_s": 0.01738393400046334,
+      "total_iters": 7,
+      "avg_time_per_iter_ms": 2.4834191429233345,
+      "final_cost": 1.7528611116490629,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "total_sqp_iters": 7,
+        "total_solve_time": 0.01738393400046334
+      }
+    },
+    {
+      "method": 4,
+      "method_name": "Method 4 (Acados)",
+      "N": 50,
+      "dt": 0.1,
+      "duration": 5.0,
+      "total_time_s": 8.112628347000282,
+      "setup_time_s": 8.05808132400125,
+      "solve_time_s": 0.05454702299903147,
+      "total_iters": 6,
+      "avg_time_per_iter_ms": 9.091170499838578,
+      "final_cost": 1.543718987526073,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "total_sqp_iters": 6,
+        "total_solve_time": 0.05454702299903147
+      }
+    },
+    {
+      "method": 4,
+      "method_name": "Method 4 (Acados)",
+      "N": 100,
+      "dt": 0.05,
+      "duration": 5.0,
+      "total_time_s": 8.251746216001266,
+      "setup_time_s": 8.134138879000602,
+      "solve_time_s": 0.11760733700066339,
+      "total_iters": 7,
+      "avg_time_per_iter_ms": 16.801048142951913,
+      "final_cost": 1.4728577710676851,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "total_sqp_iters": 7,
+        "total_solve_time": 0.11760733700066339
+      }
+    },
+    {
+      "method": 4,
+      "method_name": "Method 4 (Acados)",
+      "N": 200,
+      "dt": 0.025,
+      "duration": 5.0,
+      "total_time_s": 8.803403142999741,
+      "setup_time_s": 8.14294417200108,
+      "solve_time_s": 0.6604589709986612,
+      "total_iters": 20,
+      "avg_time_per_iter_ms": 33.02294854993306,
+      "final_cost": 1.4385471182821254,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "total_sqp_iters": 20,
+        "total_solve_time": 0.6604589709986612
+      }
+    },
+    {
+      "method": 5,
+      "method_name": "Method 5 (Acados min-time)",
+      "N": 20,
+      "dt": 0.04040076477372171,
+      "duration": 2.0200382386860856,
+      "total_time_s": 8.731163943000865,
+      "setup_time_s": 8.616157270000258,
+      "solve_time_s": 0.1150066730006074,
+      "total_iters": 9,
+      "avg_time_per_iter_ms": 12.778519222289711,
+      "final_cost": 2.819508741160064,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "min_time": true,
+        "plot_dt": 0.04040076477372171,
+        "segment_boundary_indices": [
+          50
+        ],
+        "optimal_segment_times": [
+          2.0200382386860856
+        ],
+        "total_sqp_iters": 9,
+        "total_solve_time": 0.1150066730006074
+      }
+    },
+    {
+      "method": 5,
+      "method_name": "Method 5 (Acados min-time)",
+      "N": 50,
+      "dt": 0.04040076477372171,
+      "duration": 2.0200382386860856,
+      "total_time_s": 8.84797943599915,
+      "setup_time_s": 8.73097260599934,
+      "solve_time_s": 0.11700682999980927,
+      "total_iters": 9,
+      "avg_time_per_iter_ms": 13.000758888867695,
+      "final_cost": 2.819508741160064,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "min_time": true,
+        "plot_dt": 0.04040076477372171,
+        "segment_boundary_indices": [
+          50
+        ],
+        "optimal_segment_times": [
+          2.0200382386860856
+        ],
+        "total_sqp_iters": 9,
+        "total_solve_time": 0.11700682999980927
+      }
+    },
+    {
+      "method": 5,
+      "method_name": "Method 5 (Acados min-time)",
+      "N": 100,
+      "dt": 0.020083076889123714,
+      "duration": 2.0083076889123714,
+      "total_time_s": 9.24717368200072,
+      "setup_time_s": 8.932825402000162,
+      "solve_time_s": 0.3143482800005586,
+      "total_iters": 10,
+      "avg_time_per_iter_ms": 31.434828000055855,
+      "final_cost": 2.7857050938831542,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "min_time": true,
+        "plot_dt": 0.020083076889123714,
+        "segment_boundary_indices": [
+          100
+        ],
+        "optimal_segment_times": [
+          2.0083076889123714
+        ],
+        "total_sqp_iters": 10,
+        "total_solve_time": 0.3143482800005586
+      }
+    },
+    {
+      "method": 5,
+      "method_name": "Method 5 (Acados min-time)",
+      "N": 200,
+      "dt": 0.01003118870548961,
+      "duration": 2.0062377410979217,
+      "total_time_s": 9.495006146999003,
+      "setup_time_s": 8.767921403999935,
+      "solve_time_s": 0.7270847429990681,
+      "total_iters": 10,
+      "avg_time_per_iter_ms": 72.70847429990681,
+      "final_cost": 2.7749771744079013,
+      "status": "ok",
+      "error_msg": "",
+      "extra": {
+        "min_time": true,
+        "plot_dt": 0.01003118870548961,
+        "segment_boundary_indices": [
+          200
+        ],
+        "optimal_segment_times": [
+          2.0062377410979217
+        ],
+        "total_sqp_iters": 10,
+        "total_solve_time": 0.7270847429990681
+      }
+    }
+  ]
+}

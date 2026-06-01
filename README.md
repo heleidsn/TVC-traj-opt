@@ -70,7 +70,7 @@ git submodule update --recursive --init
 
 mkdir -p build
 cd build
-cmake -DACADOS_WITH_QPOASES=ON -DBUILD_SHARED_LIBS=ON ..
+cmake -DACADOS_WITH_QPOASES=ON -DBUILD_SHARED_LIBS=ON -DACADOS_WITH_OPENMP=ON ..
 make install -j4
 ```
 

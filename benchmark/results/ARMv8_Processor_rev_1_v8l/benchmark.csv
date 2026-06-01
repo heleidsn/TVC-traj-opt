@@ -1,0 +1,13 @@
+timestamp,cpu_model,cpu_mhz_max,cpu_mhz_current_avg,cpu_count_logical,system,release,python_version,method,method_name,N,dt,duration,total_time_s,setup_time_s,solve_time_s,total_iters,avg_time_per_iter_ms,final_cost,status,error_msg
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,3,Method 3 (BoxFDDP),20,0.250000,5.0000,1.511447,0.000000,1.511447,16,94.4654,1.743936e+03,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,3,Method 3 (BoxFDDP),50,0.100000,5.0000,4.189065,0.000000,4.189065,17,246.4156,1.742305e+03,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,3,Method 3 (BoxFDDP),100,0.050000,5.0000,7.935271,0.000000,7.935271,17,466.7806,1.744460e+03,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,3,Method 3 (BoxFDDP),200,0.025000,5.0000,15.926037,0.000000,15.926037,17,936.8257,1.744132e+03,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,4,Method 4 (Acados),20,0.250000,5.0000,7.924435,7.907051,0.017384,7,2.4834,1.752861e+00,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,4,Method 4 (Acados),50,0.100000,5.0000,8.112628,8.058081,0.054547,6,9.0912,1.543719e+00,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,4,Method 4 (Acados),100,0.050000,5.0000,8.251746,8.134139,0.117607,7,16.8010,1.472858e+00,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,4,Method 4 (Acados),200,0.025000,5.0000,8.803403,8.142944,0.660459,20,33.0229,1.438547e+00,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,5,Method 5 (Acados min-time),20,0.040401,2.0200,8.731164,8.616157,0.115007,9,12.7785,2.819509e+00,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,5,Method 5 (Acados min-time),50,0.040401,2.0200,8.847979,8.730973,0.117007,9,13.0008,2.819509e+00,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,5,Method 5 (Acados min-time),100,0.020083,2.0083,9.247174,8.932825,0.314348,10,31.4348,2.785705e+00,ok,
+20260601_125721,ARMv8 Processor rev 1 (v8l),1984.0,,4,Linux,5.15.148-tegra,3.10.20,5,Method 5 (Acados min-time),200,0.010031,2.0062,9.495006,8.767921,0.727085,10,72.7085,2.774977e+00,ok,
