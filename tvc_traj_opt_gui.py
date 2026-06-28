@@ -9,8 +9,7 @@ Create user interface using PyQt5, supports:
 - Real-time display of optimization process and results
 
 Usage:
-    python run_tvc_traj_opt.py          # preferred: project root entry
-    python scripts/tvc_traj_opt_gui.py  # legacy / direct
+    python tvc_traj_opt_gui.py
 
 Installation:
     If PyQt5 import error occurs, please install:
@@ -28,15 +27,16 @@ import time
 import signal
 import subprocess
 
-# Ensure tvc_traj_opt module can be imported
-script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
+# Project root (this file) and scripts/ (solver modules)
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS_DIR = os.path.join(ROOT_DIR, 'scripts')
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
 
 GUI_PARAMS_VERSION = 1
 DEFAULT_GUI_PARAMS_FILENAME = 'tvc_traj_opt_gui_params.json'
 LEFT_STATUS_TEXT_HEIGHT = 72
-DEFAULT_TRAJ_CSV_DIR = os.path.abspath(os.path.join(script_dir, '..', 'trajs'))
+DEFAULT_TRAJ_CSV_DIR = os.path.join(ROOT_DIR, 'trajs')
 DEFAULT_TRAJ_CSV_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'latest.csv')
 DEFAULT_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'saved_waypoints.json')
 TRAJ_PRESETS_DIR = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'presets')
@@ -946,7 +946,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.opt_thread = None
-        self.params_file_path = os.path.join(script_dir, DEFAULT_GUI_PARAMS_FILENAME)
+        self.params_file_path = os.path.join(ROOT_DIR, DEFAULT_GUI_PARAMS_FILENAME)
         # Cached most-recent optimized trajectory for CSV export
         self.last_trajectory = None
         self.opt_summary = None
@@ -3965,7 +3965,7 @@ class MainWindow(QMainWindow):
 
     def _ros2_workspace_root(self):
         """Resolve TVC_ws root (parent of TVC-traj-opt)."""
-        return os.path.abspath(os.path.join(script_dir, '..', '..'))
+        return os.path.abspath(os.path.join(ROOT_DIR, '..'))
 
     def _ros2_shell_command(self, launch_file, extra_args=None):
         """Build a bash command that sources the workspace then runs ros2 launch."""
@@ -3994,7 +3994,7 @@ class MainWindow(QMainWindow):
 
     def clear_rviz_trajectory_display(self, quiet=False, include_planned=False):
         """Clear RViz trajectory display (executed only, or planned + executed)."""
-        script = os.path.join(script_dir, 'tvc_clear_traj_viz.py')
+        script = os.path.join(SCRIPTS_DIR, 'tvc_clear_traj_viz.py')
         if not os.path.isfile(script):
             if not quiet:
                 QMessageBox.warning(self, 'Clear failed', f'Script not found:\n{script}')
@@ -4255,7 +4255,10 @@ def run_gui(argv=None) -> int:
 
 
 def main() -> int:
-    """Backward-compatible alias for :func:`run_gui`."""
+    """Bootstrap acados/runtime, then launch the GUI."""
+    from tvc_runtime import bootstrap
+
+    bootstrap()
     return run_gui()
 
 

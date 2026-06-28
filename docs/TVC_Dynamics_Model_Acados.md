@@ -222,7 +222,7 @@ Sections **1–9** focus on the **continuous-time ODE**. **§11** summarizes how
 
 ## 11. GUI Acados costs: Method 4, Method 5, and Method 7
 
-In the **TVC Trajectory Optimization GUI** (`scripts/tvc_traj_opt_gui.py`), **Method 4**, **Method 5**, and **Method 7** are **combo indices 3, 4, and 6** respectively. All three use the same **plant** as §1–§6; they differ in **time parametrization** and **cost**.
+In the **TVC Trajectory Optimization GUI** (`tvc_traj_opt_gui.py`), **Method 4**, **Method 5**, and **Method 7** are **combo indices 3, 4, and 6** respectively. All three use the same **plant** as §1–§6; they differ in **time parametrization** and **cost**.
 
 | GUI label | Combo index | Acados driver | Horizon in solver time |
 |-----------|-------------|---------------|-------------------------|

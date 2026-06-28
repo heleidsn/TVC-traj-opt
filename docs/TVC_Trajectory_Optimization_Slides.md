@@ -45,10 +45,10 @@
 
 ```
 TVC-traj-opt/
+├── tvc_traj_opt_gui.py        # Main entry — GUI application
 ├── scripts/
 │   ├── tvc_traj_opt.py        # Method 1: Custom calcDiff (numerical diff)
-│   ├── tvc_traj_opt_pinocchio.py  # Method 2/3: Pinocchio + FDDP/BoxFDDP
-│   └── tvc_traj_opt_gui.py    # GUI application
+│   └── tvc_traj_opt_pinocchio.py  # Method 2/3: Pinocchio + FDDP/BoxFDDP
 ├── models/tvc/                # URDF model
 ├── config/                    # YAML config
 └── results/                   # Trajectories, plots, videos
@@ -233,7 +233,7 @@ Each waypoint: `[x, y, z, yaw_deg, arrival_time]`
 
 **GUI** (recommended):
 ```bash
-python scripts/tvc_traj_opt_gui.py
+python tvc_traj_opt_gui.py
 ```
 
 **CLI**:

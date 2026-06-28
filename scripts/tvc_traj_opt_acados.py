@@ -313,7 +313,7 @@ def solve_with_acados_waypoints_min_time(
                     f"Acados solver failed: {e}\n\n"
                     "Fix: set ACADOS_SOURCE_DIR (so the libraries can be preloaded), e.g.:\n"
                     "  export ACADOS_SOURCE_DIR=/path/to/acados\n"
-                    "Or launch via ``python run_tvc_traj_opt.py`` which preloads the libs automatically."
+                    "Or launch via ``python tvc_traj_opt_gui.py`` which preloads the libs automatically."
                 ) from e
             raise
         except Exception as e:
@@ -673,7 +673,7 @@ def solve_with_acados_waypoints_free_tf(
                     f"Acados solver failed: {e}\n\n"
                     "Fix: set ACADOS_SOURCE_DIR (so the libraries can be preloaded), e.g.:\n"
                     "  export ACADOS_SOURCE_DIR=/path/to/acados\n"
-                    "Or launch via ``python run_tvc_traj_opt.py`` which preloads the libs automatically."
+                    "Or launch via ``python tvc_traj_opt_gui.py`` which preloads the libs automatically."
                 ) from e
             raise
         except Exception as e:
@@ -1014,7 +1014,7 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
                     f"Acados solver failed: {e}\n\n"
                     "Fix: set ACADOS_SOURCE_DIR (so the libraries can be preloaded), e.g.:\n"
                     "  export ACADOS_SOURCE_DIR=/path/to/acados\n"
-                    "Or launch via ``python run_tvc_traj_opt.py`` which preloads the libs automatically."
+                    "Or launch via ``python tvc_traj_opt_gui.py`` which preloads the libs automatically."
                 ) from e
             raise
         except Exception as e:

@@ -56,8 +56,8 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Path / acados setup. This file lives at ``<repo>/benchmark/benchmark_traj_opt.py``;
 # we expose the project's ``scripts/`` and root directory on ``sys.path`` so the
-# solver modules can be imported, and we piggy-back on ``run_tvc_traj_opt.py``
-# to preload acados libs (avoids LD_LIBRARY_PATH gymnastics).
+# solver modules can be imported, and preload acados libs via ``tvc_runtime``
+# (avoids LD_LIBRARY_PATH gymnastics).
 # ---------------------------------------------------------------------------
 _BENCH_DIR = Path(__file__).resolve().parent
 _PROJ_DIR = _BENCH_DIR.parent
@@ -68,7 +68,7 @@ for _p in (_SCRIPTS_DIR, _PROJ_DIR):
         sys.path.insert(0, _sp)
 
 try:
-    from run_tvc_traj_opt import _preload_acados_libs  # type: ignore
+    from tvc_runtime import preload_acados_libs as _preload_acados_libs  # type: ignore
 except Exception:
     _preload_acados_libs = None
 

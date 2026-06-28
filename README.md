@@ -97,9 +97,9 @@ See [acados installation docs](https://docs.acados.org/installation/) for more d
 
 ```
 TVC-traj-opt/
-├── run_tvc_traj_opt.py         # **Main entry** — launches trajectory optimization GUI
-├── scripts/                    # Implementation (called by GUI / CLI)
-│   ├── tvc_traj_opt_gui.py     # GUI implementation (Methods 1–7)
+├── tvc_traj_opt_gui.py         # **Main entry** — trajectory optimization GUI (Methods 1–7)
+├── tvc_runtime.py              # Shared path/acados bootstrap (GUI + benchmark)
+├── scripts/                    # Solver implementations (imported by GUI / CLI)
 │   ├── tvc_traj_opt.py         # Method 1: Crocoddyl custom calcDiff
 │   ├── tvc_traj_opt_pinocchio.py
 │   ├── tvc_traj_opt_acados.py  # Methods 4–5–7 (Acados)
@@ -118,7 +118,13 @@ TVC-traj-opt/
 ### GUI Application (main entry)
 
 ```bash
-python run_tvc_traj_opt.py
+python tvc_traj_opt_gui.py
+```
+
+Or after `pip install -e .`:
+
+```bash
+tvc-traj-opt
 ```
 
 All optimization methods (Crocoddyl Methods 1–3, Acados Methods 4–7) are selected inside the GUI; solvers live under `scripts/`.
