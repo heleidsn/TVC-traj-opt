@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TVC Real Platform (20 kg) — optimization / inertia model only.
+     SITL and RViz use the simplified multi-link tvc_real.urdf in tvc_controller (same as proxy visuals). -->
+<robot name="tvc_real">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="20.0"/>
+      <!-- Uniform solid cylinder: r=0.08 m, L=1.40 m -->
+      <inertia
+        ixx="3.2987" ixy="0.0" ixz="0.0"
+        iyy="3.2987" iyz="0.0"
+        izz="0.0640"/>
+    </inertial>
+
+    <!-- Main body cylinder (z-aligned, centred on link origin) -->
+    <visual name="body_cylinder">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.08" length="1.40"/>
+      </geometry>
+      <material name="body_gray">
+        <color rgba="0.25 0.28 0.32 1"/>
+      </material>
+    </visual>
+    <collision name="body_cylinder_collision">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.08" length="1.40"/>
+      </geometry>
+    </collision>
+
+    <!-- Nose cone: base at top of cylinder (z = +0.70 m), tip at z = +1.05 m -->
+    <visual name="nose_cone">
+      <origin xyz="0 0 0.875" rpy="0 0 0"/>
+      <geometry>
+        <cone length="0.35" radius="0.08"/>
+      </geometry>
+      <material name="nose_white">
+        <color rgba="0.85 0.85 0.88 1"/>
+      </material>
+    </visual>
+
+    <!-- Four landing legs (struts), 45° apart at body radius -->
+    <visual name="leg_1">
+      <origin xyz="0.10 0.10 -0.78" rpy="0.55 0 0.785"/>
+      <geometry><cylinder radius="0.012" length="0.32"/></geometry>
+      <material name="leg_dark"><color rgba="0.15 0.15 0.18 1"/></material>
+    </visual>
+    <visual name="leg_2">
+      <origin xyz="-0.10 0.10 -0.78" rpy="0.55 0 -0.785"/>
+      <geometry><cylinder radius="0.012" length="0.32"/></geometry>
+      <material name="leg_dark"/>
+    </visual>
+    <visual name="leg_3">
+      <origin xyz="-0.10 -0.10 -0.78" rpy="0.55 0 0.785"/>
+      <geometry><cylinder radius="0.012" length="0.32"/></geometry>
+      <material name="leg_dark"/>
+    </visual>
+    <visual name="leg_4">
+      <origin xyz="0.10 -0.10 -0.78" rpy="0.55 0 -0.785"/>
+      <geometry><cylinder radius="0.012" length="0.32"/></geometry>
+      <material name="leg_dark"/>
+    </visual>
+
+    <!-- TVC nozzle marker (visual only) -->
+    <visual name="nozzle">
+      <origin xyz="0 0 -0.72" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.035" length="0.06"/></geometry>
+      <material name="nozzle_orange"><color rgba="0.9 0.45 0.1 1"/></material>
+    </visual>
+  </link>
+</robot>

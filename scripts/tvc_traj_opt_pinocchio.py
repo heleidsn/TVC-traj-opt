@@ -24,6 +24,15 @@ from matplotlib.gridspec import GridSpec
 import crocoddyl
 import pinocchio as pin
 from pathlib import Path
+
+from tvc_rocket_platforms import urdf_path as platform_urdf_path, normalize_platform_id
+
+
+def resolve_tvc_urdf_path(rocket_platform=None, urdf_path=None):
+    """URDF for Pinocchio/Crocoddil (visual geometry; m/I come from GUI)."""
+    if urdf_path is not None:
+        return Path(urdf_path)
+    return platform_urdf_path(normalize_platform_id(rocket_platform))
 import time
 
 # Import from tvc_common and tvc_traj_opt
@@ -791,7 +800,7 @@ def solve_with_pinocchio(dt=0.02, N=100, max_iter=100, use_box_solver=False):
     r_thrust = np.array([0.0, 0.0, -0.2])
     
     # Load URDF model
-    urdf_path = Path(__file__).parent.parent / 'models' / 'tvc' / 'tvc_simple.urdf'
+    urdf_path = resolve_tvc_urdf_path()
     
     # Build Pinocchio model
     robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
@@ -945,7 +954,7 @@ def solve_with_pinocchio(dt=0.02, N=100, max_iter=100, use_box_solver=False):
 
 def solve_with_pinocchio_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, max_iter=100, 
                                    use_box_solver=False, callback=None, running_flag=None,
-                                   terminal_weights=None):
+                                   terminal_weights=None, rocket_platform=None):
     """
     Solve trajectory optimization with multiple waypoints using Pinocchio + Crocoddyl
     
@@ -970,7 +979,7 @@ def solve_with_pinocchio_waypoints(dt, waypoints, m, I, r_thrust, weights, bound
         all_loggers: List of loggers for each segment
     """
     # Load URDF model
-    urdf_path = Path(__file__).parent.parent / 'models' / 'tvc' / 'tvc_simple.urdf'
+    urdf_path = resolve_tvc_urdf_path(rocket_platform)
     
     # Build Pinocchio model
     robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
@@ -1137,7 +1146,7 @@ def solve_with_pinocchio_waypoints(dt, waypoints, m, I, r_thrust, weights, bound
 
 def solve_with_pinocchio_waypoints_unified(dt, waypoints, m, I, r_thrust, weights, bounds, max_iter=100,
                                           use_box_solver=False, callback=None, running_flag=None,
-                                          terminal_weights=None):
+                                          terminal_weights=None, rocket_platform=None):
     """
     Solve trajectory optimization with multiple waypoints using a SINGLE unified problem.
     
@@ -1163,7 +1172,7 @@ def solve_with_pinocchio_waypoints_unified(dt, waypoints, m, I, r_thrust, weight
         combined_us: Trajectory controls
         all_loggers: List with single logger [logger]
     """
-    urdf_path = Path(__file__).parent.parent / 'models' / 'tvc' / 'tvc_simple.urdf'
+    urdf_path = resolve_tvc_urdf_path(rocket_platform)
     robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
     state = crocoddyl.StateMultibody(robot_model)
     actuation = TVCActuationModel(state)
@@ -1338,7 +1347,7 @@ def run_both_methods_simulation(dt=0.05, N=100, max_iter=100, verbose=True):
         dict with keys: fddp_xs, fddp_us, boxfddp_xs, boxfddp_us,
                         fddp_sim_xs, boxfddp_sim_xs, fddp_logger, boxfddp_logger
     """
-    urdf_path = Path(__file__).parent.parent / 'models' / 'tvc' / 'tvc_simple.urdf'
+    urdf_path = resolve_tvc_urdf_path()
     robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
     r_thrust = np.array([0.0, 0.0, -0.2])
     m, I = 0.6, np.diag([0.02, 0.02, 0.01])  # Same as solve_with_pinocchio
@@ -1476,7 +1485,7 @@ if __name__ == "__main__":
         print("x0 =", xs[0][:7], "...")
         print("xN =", xs[-1][:7], "...")
         # Simulate to verify (waypoints return Method 1 format; simulate needs Pinocchio)
-        urdf_path = Path(__file__).parent.parent / 'models' / 'tvc' / 'tvc_simple.urdf'
+        urdf_path = resolve_tvc_urdf_path()
         robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
         x0_pin = convert_method1_state_to_pinocchio(xs[0]) if len(xs[0]) == 17 else xs[0]
         sim_xs = simulate_tvc_trajectory(x0_pin, us, args.dt, robot_model, r_thrust, m=m, I=I)
@@ -1497,7 +1506,7 @@ if __name__ == "__main__":
         print("x0 =", xs[0][:7], "...")
         print("xN =", xs[-1][:7], "...")
         # Simulate to verify
-        urdf_path = Path(__file__).parent.parent / 'models' / 'tvc' / 'tvc_simple.urdf'
+        urdf_path = resolve_tvc_urdf_path()
         robot_model = pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
         m, I = 0.6, np.diag([0.02, 0.02, 0.01])
         sim_xs = simulate_tvc_trajectory(xs[0], us, args.dt, robot_model, np.array([0, 0, -0.2]), m=m, I=I)

@@ -26,6 +26,7 @@ import json
 import time
 import signal
 import subprocess
+import hashlib
 
 # Project root (this file) and scripts/ (solver modules)
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -65,7 +66,7 @@ try:
                                  QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                  QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
                                  QFileDialog, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
-                                 QAbstractItemView, QHeaderView)
+                                 QAbstractItemView, QHeaderView, QRadioButton, QButtonGroup)
     from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
     from PyQt5.QtGui import QFont
     QT_AVAILABLE = True
@@ -79,7 +80,7 @@ except ImportError:
                                       QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                       QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
                                       QFileDialog, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
-                                      QAbstractItemView, QHeaderView)
+                                      QAbstractItemView, QHeaderView, QRadioButton, QButtonGroup)
         from PySide2.QtCore import QThread, Signal as pyqtSignal, Qt, QTimer
         from PySide2.QtGui import QFont
         QT_AVAILABLE = True
@@ -106,6 +107,18 @@ import crocoddyl
 from tvc_traj_opt import TVCRocketActionModel
 from tvc_common import quat_to_euler, yaw_to_quaternion
 from tvc_traj_gui_plots import draw_trajectory_panels, draw_cost_panel
+from tvc_rocket_platforms import (
+    PLATFORM_REAL,
+    PLATFORM_PROXY,
+    default_constraints,
+    default_physics,
+    normalize_platform_id,
+    constraint_spin_ranges,
+    physics_spin_ranges,
+    sitl_launch_kwargs,
+    platform_description,
+    platform_label,
+)
 from tvc_traj_opt_pinocchio import (solve_with_pinocchio_waypoints, solve_with_pinocchio_waypoints_unified,
                                     convert_pinocchio_state_to_method1)
 try:
@@ -228,7 +241,163 @@ def trajectory_combo_label(combo_index):
     return 'Custom waypoints'
 
 
-TRAJ_JSON_VERSION = 3
+TRAJ_JSON_VERSION = 4
+
+
+def _normalize_platform_id_for_cache(platform_id):
+    pid = (platform_id or 'proxy').strip().lower()
+    if pid in ('flight',):
+        return 'real'
+    return pid if pid in ('proxy', 'real') else 'proxy'
+
+
+def optimization_cache_key(platform_id, combo_index, mode_key, method_index):
+    """In-memory cache key: platform × trajectory slot × mode × method."""
+    return (
+        _normalize_platform_id_for_cache(platform_id),
+        int(combo_index),
+        str(mode_key),
+        int(method_index),
+    )
+
+
+def _artifact_name_suffix(platform_id, mode_key, method_index):
+    """Filename suffix for per-platform / per-method optimization artifacts."""
+    pid = _normalize_platform_id_for_cache(platform_id)
+    mk = mode_key if mode_key in ('normal', 'min_time') else traj_opt_mode_key(mode_key)
+    return f'_{pid}_{mk}_m{int(method_index)}'
+
+
+def trajectory_artifact_paths(combo_index, mode_key='normal', platform_id='proxy', method_index=0):
+    """JSON / CSV / NPZ paths for platform + trajectory slot + mode + method."""
+    json_path = trajectory_waypoints_path_for_combo_index(combo_index)
+    base, _ = os.path.splitext(json_path)
+    if mode_key not in ('normal', 'min_time'):
+        mode_key = traj_opt_mode_key(mode_key)
+    suffix = _artifact_name_suffix(platform_id, mode_key, method_index)
+    return {
+        'json': json_path,
+        'csv': f'{base}{suffix}.csv',
+        'npz': f'{base}{suffix}_traj.npz',
+        'mode_key': mode_key,
+        'platform_id': _normalize_platform_id_for_cache(platform_id),
+        'method_index': int(method_index),
+    }
+
+
+def resolve_trajectory_artifact_paths(
+    combo_index, mode_key='normal', platform_id='proxy', method_index=0,
+):
+    """Resolve artifact paths; fall back to older naming schemes when present."""
+    paths = trajectory_artifact_paths(combo_index, mode_key, platform_id, method_index)
+    if os.path.isfile(paths['npz']) or os.path.isfile(paths['csv']):
+        return paths
+    base, _ = os.path.splitext(paths['json'])
+    mk = paths['mode_key']
+    # Previous naming: only mode suffix (no platform / method).
+    leg_csv = f'{base}_{mk}.csv'
+    leg_npz = f'{base}_{mk}_traj.npz'
+    if os.path.isfile(leg_npz) or os.path.isfile(leg_csv):
+        return {**paths, 'csv': leg_csv, 'npz': leg_npz}
+    if mk == 'normal':
+        leg_csv, leg_npz = f'{base}.csv', f'{base}_traj.npz'
+        if os.path.isfile(leg_npz):
+            return {**paths, 'csv': leg_csv, 'npz': leg_npz}
+        if os.path.isfile(leg_csv):
+            return {**paths, 'csv': leg_csv, 'npz': leg_npz if os.path.isfile(leg_npz) else paths['npz']}
+    return paths
+
+
+def _json_safe_for_fingerprint(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {str(k): _json_safe_for_fingerprint(v) for k, v in sorted(obj.items())}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe_for_fingerprint(v) for v in obj]
+    return obj
+
+
+def optimization_input_fingerprint(params):
+    """Stable hash of optimization inputs (for cache validity)."""
+    weights = dict(params.get('weights') or {})
+    bounds = dict(params.get('bounds') or {})
+    I = params.get('I')
+    r_thrust = params.get('r_thrust')
+    payload = {
+        'rocket_platform': _normalize_platform_id_for_cache(params.get('rocket_platform')),
+        'waypoints': waypoints_to_json_list(params.get('waypoints') or []),
+        'method': int(params.get('method', 0)),
+        'dt': float(params.get('dt', 0.0)),
+        'N': int(params.get('N', 0)),
+        'max_iter': int(params.get('max_iter', 0)),
+        'unified': bool(params.get('unified', False)),
+        'm': float(params.get('m', 0.0)),
+        'I': np.asarray(I, dtype=float).reshape(-1).tolist() if I is not None else None,
+        'r_thrust': np.asarray(r_thrust, dtype=float).reshape(-1).tolist() if r_thrust is not None else None,
+        'weights': _json_safe_for_fingerprint(weights),
+        'terminal_weights': _json_safe_for_fingerprint(params.get('terminal_weights') or {}),
+        'bounds': _json_safe_for_fingerprint(bounds),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+
+def optimization_summary_lookup(data, platform_id, mode_key, method_index):
+    """Read optimization summary for platform + mode + method from trajectory JSON."""
+    if not isinstance(data, dict):
+        return None
+    pid = _normalize_platform_id_for_cache(platform_id)
+    mk = mode_key if mode_key in ('normal', 'min_time') else traj_opt_mode_key(mode_key)
+    mid = str(int(method_index))
+    v2 = data.get('optimizations_v2')
+    if isinstance(v2, dict):
+        plat = v2.get(pid)
+        if isinstance(plat, dict):
+            mode_bucket = plat.get(mk)
+            if isinstance(mode_bucket, dict) and mid in mode_bucket:
+                return mode_bucket[mid]
+    return optimization_summary_from_json(data, mk, method_index=int(method_index))
+
+
+def optimization_summary_matches_context(summary, platform_id, mode_key, method_index):
+    """True when summary belongs to the requested optimization context."""
+    if not summary:
+        return False
+    pid = _normalize_platform_id_for_cache(platform_id)
+    mk = mode_key if mode_key in ('normal', 'min_time') else traj_opt_mode_key(mode_key)
+    mid = int(method_index)
+    if summary.get('platform_id') and summary.get('platform_id') != pid:
+        return False
+    if not optimization_summary_matches_mode(summary, mk):
+        return False
+    saved_method = summary.get('method')
+    if saved_method is not None and int(saved_method) != mid:
+        return False
+    return True
+
+
+def merge_optimization_summary_into_json(
+    existing_data, platform_id, mode_key, method_index, summary,
+):
+    """Insert/update one optimization summary in trajectory JSON (v2 schema)."""
+    data = dict(existing_data) if isinstance(existing_data, dict) else {}
+    pid = _normalize_platform_id_for_cache(platform_id)
+    mk = mode_key if mode_key in ('normal', 'min_time') else traj_opt_mode_key(mode_key)
+    mid = str(int(method_index))
+    v2 = data.get('optimizations_v2')
+    if not isinstance(v2, dict):
+        v2 = {}
+    plat = dict(v2.get(pid) or {})
+    mode_bucket = dict(plat.get(mk) or {})
+    mode_bucket[mid] = dict(summary)
+    plat[mk] = mode_bucket
+    v2[pid] = plat
+    data['optimizations_v2'] = v2
+    data['version'] = max(int(data.get('version', 0)), TRAJ_JSON_VERSION)
+    return data
 
 
 def traj_opt_mode_key(mode_index=None):
@@ -240,46 +409,25 @@ def traj_opt_mode_key(mode_index=None):
     return 'normal'
 
 
-def trajectory_artifact_paths(combo_index, mode_key='normal'):
-    """JSON / CSV / NPZ paths for a trajectory slot + optimization mode."""
-    json_path = trajectory_waypoints_path_for_combo_index(combo_index)
-    base, _ = os.path.splitext(json_path)
-    if mode_key not in ('normal', 'min_time'):
-        mode_key = traj_opt_mode_key(mode_key)
-    return {
-        'json': json_path,
-        'csv': f'{base}_{mode_key}.csv',
-        'npz': f'{base}_{mode_key}_traj.npz',
-        'mode_key': mode_key,
-    }
-
-
-def resolve_trajectory_artifact_paths(combo_index, mode_key='normal'):
-    """Like ``trajectory_artifact_paths`` but fall back to legacy unsuffixed files."""
-    paths = trajectory_artifact_paths(combo_index, mode_key)
-    if os.path.isfile(paths['npz']) or os.path.isfile(paths['csv']):
-        return paths
-    if mode_key == 'normal':
-        base, _ = os.path.splitext(paths['json'])
-        leg_csv, leg_npz = f'{base}.csv', f'{base}_traj.npz'
-        if os.path.isfile(leg_npz):
-            return {**paths, 'csv': leg_csv, 'npz': leg_npz}
-        if os.path.isfile(leg_csv):
-            return {**paths, 'csv': leg_csv, 'npz': leg_npz if os.path.isfile(leg_npz) else paths['npz']}
-    return paths
-
-
-def optimization_summary_from_json(data, mode_key='normal'):
-    """Extract saved optimization summary for one mode from trajectory JSON."""
+def optimization_summary_from_json(data, mode_key='normal', method_index=None):
+    """Extract saved optimization summary (legacy JSON schema)."""
     if not isinstance(data, dict):
         return None
     opts = data.get('optimizations')
     if isinstance(opts, dict) and opts.get(mode_key):
-        return opts[mode_key]
+        legacy_summary = opts[mode_key]
+        if method_index is None:
+            return legacy_summary
+        saved_method = legacy_summary.get('method') if legacy_summary else None
+        if saved_method is None or int(saved_method) == int(method_index):
+            return legacy_summary
+        return None
     legacy = data.get('optimization')
     if not legacy:
         return None
     method_idx = legacy.get('method')
+    if method_index is not None and method_idx is not None and int(method_idx) != int(method_index):
+        return None
     if mode_key == 'min_time':
         return legacy if method_idx == METHOD_MIN_TIME_INDEX else None
     if method_idx is None or method_idx != METHOD_MIN_TIME_INDEX:
@@ -705,7 +853,8 @@ class OptimizationThread(QThread):
                     max_iter=max_iter,
                     use_box_solver=use_box_solver,
                     callback=callback_func,
-                    running_flag=lambda: self.running
+                    running_flag=lambda: self.running,
+                    rocket_platform=self.params.get('rocket_platform', PLATFORM_PROXY),
                 )
                 total_time = time.perf_counter() - t0
                 total_iters = sum(len(logger.costs) for logger in all_loggers) if all_loggers else 0
@@ -957,10 +1106,14 @@ class MainWindow(QMainWindow):
         self._tvc_launch_proc = None
         self._traj_player_proc = None
         self._method_sync_guard = False
+        self._platform_phys_cache = {}
+        self._cached_platform_id = PLATFORM_PROXY
+        self._rocket_platform_guard = False
         self.init_ui()
         self._update_params_file_label()
         if os.path.isfile(self.params_file_path):
             self._load_params_from_path(self.params_file_path, quiet=True)
+        self._restore_optimization_for_current_context(quiet=True)
         
     def init_ui(self):
         """Initialize UI"""
@@ -1091,6 +1244,30 @@ class MainWindow(QMainWindow):
         adv_layout = QVBoxLayout(params_tab)
         adv_layout.setSpacing(4)
         adv_layout.setContentsMargins(4, 4, 4, 4)
+
+        # Rocket platform (Proxy validation rig vs real 20 kg vehicle)
+        platform_group = QGroupBox('Rocket platform')
+        platform_layout = QVBoxLayout()
+        platform_radio_row = QHBoxLayout()
+        self.rocket_proxy_radio = QRadioButton(platform_label(PLATFORM_PROXY))
+        self.rocket_real_radio = QRadioButton(platform_label(PLATFORM_REAL))
+        self.rocket_proxy_radio.setChecked(True)
+        self.rocket_proxy_radio.setToolTip(platform_description(PLATFORM_PROXY))
+        self.rocket_real_radio.setToolTip(platform_description(PLATFORM_REAL))
+        self._rocket_platform_button_group = QButtonGroup(self)
+        self._rocket_platform_button_group.addButton(self.rocket_proxy_radio, 0)
+        self._rocket_platform_button_group.addButton(self.rocket_real_radio, 1)
+        self._rocket_platform_button_group.buttonClicked.connect(self._on_rocket_platform_changed)
+        platform_radio_row.addWidget(self.rocket_proxy_radio)
+        platform_radio_row.addWidget(self.rocket_real_radio)
+        platform_radio_row.addStretch(1)
+        platform_layout.addLayout(platform_radio_row)
+        self.rocket_platform_desc_label = QLabel(platform_description(PLATFORM_PROXY))
+        self.rocket_platform_desc_label.setWordWrap(True)
+        self.rocket_platform_desc_label.setStyleSheet('color: #555;')
+        platform_layout.addWidget(self.rocket_platform_desc_label)
+        platform_group.setLayout(platform_layout)
+        layout.addWidget(platform_group)
         
         # Waypoints management
         waypoint_group = QGroupBox('Waypoints')
@@ -1163,7 +1340,6 @@ class MainWindow(QMainWindow):
         self.waypoints = [_normalize_waypoint_row(w) for w in grass]
         self._populate_waypoint_table()
         self.trajectory_preset_combo.setCurrentIndex(0)
-        self._refresh_trajectory_storage_path_label()
         self._traj_combo_prev_index = 0
         self._traj_opt_mode_prev_index = TRAJ_OPT_MODE_NORMAL
         self.trajectory_preset_combo.currentIndexChanged.connect(self.on_trajectory_preset_changed)
@@ -1174,6 +1350,7 @@ class MainWindow(QMainWindow):
         self.method_combo.currentIndexChanged.connect(
             lambda idx: self._on_method_combo_changed(idx, self.method_combo)
         )
+        self._refresh_trajectory_storage_path_label()
 
         # Parameters tab: duplicate method selector at top (linked to Trajectory tab)
         self.method_combo_params = QComboBox()
@@ -1474,14 +1651,21 @@ class MainWindow(QMainWindow):
         self.th_r_max.setDecimals(1)
         self.th_r_max.setMaximumWidth(100)
 
+        self.T_min_thrust = QDoubleSpinBox()
+        self.T_min_thrust.setRange(0, 500)
+        self.T_min_thrust.setValue(0.0)
+        self.T_min_thrust.setDecimals(1)
+        self.T_min_thrust.setMaximumWidth(100)
+        self.T_min_thrust.setToolTip('Minimum thrust magnitude [N]')
+
         self.T_max = QDoubleSpinBox()
-        self.T_max.setRange(0, 100)
+        self.T_max.setRange(0, 500)
         self.T_max.setValue(25.0)
         self.T_max.setDecimals(2)
         self.T_max.setMaximumWidth(100)
 
         self.tau_yaw_max = QDoubleSpinBox()
-        self.tau_yaw_max.setRange(0, 10)
+        self.tau_yaw_max.setRange(0, 20)
         self.tau_yaw_max.setValue(1.0)
         self.tau_yaw_max.setDecimals(2)
         self.tau_yaw_max.setMaximumWidth(100)
@@ -1528,10 +1712,13 @@ class MainWindow(QMainWindow):
         constraints_layout.addWidget(QLabel('TVC Roll (°):'), row, 2)
         constraints_layout.addWidget(self.th_r_max, row, 3)
         row += 1
-        constraints_layout.addWidget(QLabel('Thrust (N):'), row, 0)
-        constraints_layout.addWidget(self.T_max, row, 1)
-        constraints_layout.addWidget(QLabel('Yaw torque (N·m):'), row, 2)
-        constraints_layout.addWidget(self.tau_yaw_max, row, 3)
+        constraints_layout.addWidget(QLabel('Thrust min (N):'), row, 0)
+        constraints_layout.addWidget(self.T_min_thrust, row, 1)
+        constraints_layout.addWidget(QLabel('Thrust max (N):'), row, 2)
+        constraints_layout.addWidget(self.T_max, row, 3)
+        row += 1
+        constraints_layout.addWidget(QLabel('Yaw torque (N·m):'), row, 0)
+        constraints_layout.addWidget(self.tau_yaw_max, row, 1)
         row += 1
         constraints_layout.addWidget(QLabel('V_xy (m/s):'), row, 0)
         constraints_layout.addWidget(self.v_horizontal_max, row, 1)
@@ -1622,6 +1809,11 @@ class MainWindow(QMainWindow):
         physics_layout.addWidget(self.r_thrust_y, 2, 3)
         physics_layout.addWidget(QLabel('Thrust Z (m):'), 3, 0)
         physics_layout.addWidget(self.r_thrust_z, 3, 1)
+
+        self.physics_platform_hint = QLabel()
+        self.physics_platform_hint.setWordWrap(True)
+        self.physics_platform_hint.setStyleSheet('color: #555;')
+        physics_layout.addWidget(self.physics_platform_hint, 4, 0, 1, 4)
         
         physics_group.setLayout(physics_layout)
 
@@ -1633,6 +1825,8 @@ class MainWindow(QMainWindow):
         params_tabs.insertTab(1, physics_tab, 'Physical')
 
         adv_layout.addWidget(params_tabs)
+        self._update_platform_spin_ranges(PLATFORM_PROXY)
+        self._refresh_physics_platform_hint()
         
         # Default parameters per method (state/control constraints equal across all methods)
         self.DEFAULT_PARAMS = {
@@ -1815,7 +2009,10 @@ class MainWindow(QMainWindow):
         sim_layout.setSpacing(3)
 
         self.btn_start_px4_sitl = QPushButton('Start')
-        self.btn_start_px4_sitl.setToolTip('ros2 launch tvc_controller tvc.launch.py')
+        self.btn_start_px4_sitl.setToolTip(
+            'ros2 launch tvc_controller tvc.launch.py rocket_platform:=<proxy|real>\n'
+            'PX4 SITL + Gazebo (PX4 built-in controller). LQR is off unless launch_controller:=true.'
+        )
         self.btn_start_px4_sitl.clicked.connect(self.start_px4_sitl)
         self.btn_stop_px4_sitl = QPushButton('Stop')
         self.btn_stop_px4_sitl.setToolTip('Terminate the TVC launch stack (PX4 SITL + agents)')
@@ -2069,12 +2266,51 @@ class MainWindow(QMainWindow):
             return 'normal'
         return traj_opt_mode_key(self.traj_opt_mode_combo.currentIndex())
 
-    def _mode_cache_key(self, combo_index=None, mode_key=None):
+    def _current_optimization_context(self):
+        """Active platform × trajectory × mode × method."""
+        combo_index = (
+            int(self.trajectory_preset_combo.currentIndex())
+            if hasattr(self, 'trajectory_preset_combo')
+            else 0
+        )
+        method_index = (
+            int(self.method_combo.currentIndex())
+            if hasattr(self, 'method_combo')
+            else getattr(self, '_normal_method_index', METHOD_NORMAL_DEFAULT_INDEX)
+        )
+        return {
+            'platform_id': self._current_rocket_platform_id(),
+            'combo_index': combo_index,
+            'mode_key': self._current_traj_opt_mode_key(),
+            'method_index': method_index,
+        }
+
+    def _mode_cache_key(
+        self, combo_index=None, mode_key=None, platform_id=None, method_index=None,
+    ):
+        ctx = self._current_optimization_context()
         if combo_index is None:
-            combo_index = self.trajectory_preset_combo.currentIndex()
+            combo_index = ctx['combo_index']
         if mode_key is None:
-            mode_key = self._current_traj_opt_mode_key()
-        return (int(combo_index), str(mode_key))
+            mode_key = ctx['mode_key']
+        if platform_id is None:
+            platform_id = ctx['platform_id']
+        if method_index is None:
+            method_index = ctx['method_index']
+        return optimization_cache_key(platform_id, combo_index, mode_key, method_index)
+
+    def _restore_optimization_for_current_context(
+        self, quiet=False, required_fingerprint=None,
+    ):
+        ctx = self._current_optimization_context()
+        return self._restore_optimization_for_slot_and_mode(
+            ctx['combo_index'],
+            mode_key=ctx['mode_key'],
+            platform_id=ctx['platform_id'],
+            method_index=ctx['method_index'],
+            quiet=quiet,
+            required_fingerprint=required_fingerprint,
+        )
 
     def _clone_trajectory_for_cache(self, traj, summary):
         if not traj or traj.get('xs') is None:
@@ -2094,21 +2330,35 @@ class MainWindow(QMainWindow):
             'opt_summary': dict(summary) if summary else None,
         }
 
-    def _cache_results_for_slot_mode(self, combo_index, mode_key):
-        """Store in-memory results under an explicit trajectory slot + mode key."""
+    def _cache_results_for_slot_mode(
+        self, combo_index, mode_key, platform_id=None, method_index=None,
+    ):
+        """Store in-memory results under platform × slot × mode × method."""
         if not hasattr(self, '_trajectory_mode_cache'):
             self._trajectory_mode_cache = {}
+        ctx = self._current_optimization_context()
+        if platform_id is None:
+            platform_id = ctx['platform_id']
+        if method_index is None:
+            method_index = ctx['method_index']
         entry = self._clone_trajectory_for_cache(self.last_trajectory, self.opt_summary)
         if entry is not None:
-            if not optimization_summary_matches_mode(entry.get('opt_summary'), mode_key):
+            if not optimization_summary_matches_context(
+                entry.get('opt_summary'), platform_id, mode_key, method_index,
+            ):
                 return
-            self._trajectory_mode_cache[(int(combo_index), str(mode_key))] = entry
+            self._trajectory_mode_cache[
+                optimization_cache_key(platform_id, combo_index, mode_key, method_index)
+            ] = entry
 
     def _cache_current_mode_results(self):
-        """Keep in-memory results for the current trajectory slot + mode."""
+        """Keep in-memory results for the current optimization context."""
+        ctx = self._current_optimization_context()
         self._cache_results_for_slot_mode(
-            self.trajectory_preset_combo.currentIndex(),
-            self._current_traj_opt_mode_key(),
+            ctx['combo_index'],
+            ctx['mode_key'],
+            platform_id=ctx['platform_id'],
+            method_index=ctx['method_index'],
         )
 
     def _enable_trajectory_export_buttons(self, enabled=True):
@@ -2145,7 +2395,11 @@ class MainWindow(QMainWindow):
                 getattr(self, '_traj_opt_mode_prev_index', TRAJ_OPT_MODE_NORMAL)
             )
             combo_idx = self.trajectory_preset_combo.currentIndex()
-            self._cache_results_for_slot_mode(combo_idx, old_mode_key)
+            self._cache_results_for_slot_mode(
+                combo_idx, old_mode_key,
+                platform_id=self._current_rocket_platform_id(),
+                method_index=self.method_combo.currentIndex(),
+            )
             if int(mode_index) == TRAJ_OPT_MODE_MIN_TIME:
                 cur = self.method_combo.currentIndex()
                 if cur != METHOD_MIN_TIME_INDEX:
@@ -2160,7 +2414,7 @@ class MainWindow(QMainWindow):
                 self.on_method_changed(restore)
             self._update_method_combo_enabled_for_traj_mode()
             combo_idx = self.trajectory_preset_combo.currentIndex()
-            if not self._restore_optimization_for_slot_and_mode(combo_idx, quiet=True):
+            if not self._restore_optimization_for_current_context(quiet=True):
                 self._clear_optimization_results(clear_plots=True)
             self._traj_opt_mode_prev_index = int(mode_index)
             self._refresh_trajectory_storage_path_label()
@@ -2242,9 +2496,17 @@ class MainWindow(QMainWindow):
             index = self.method_combo.currentIndex()
         self.min_time_duration_group.setVisible(index in (4, 5, 6))
     
+    def _method_params_for_platform(self, index):
+        """Method defaults with thrust limits taken from the active rocket platform."""
+        params = dict(self.DEFAULT_PARAMS.get(index, self.DEFAULT_PARAMS[0]))
+        plat = default_constraints(self._current_rocket_platform_id())
+        for key in ('T_min', 'T_max', 'tau_yaw_max', 'v_horizontal_max', 'v_vertical_max'):
+            params[key] = plat[key]
+        return params
+
     def on_method_changed(self, index):
         """Load parameter defaults when optimization method changes"""
-        params = self.DEFAULT_PARAMS.get(index, self.DEFAULT_PARAMS[0])
+        params = self._method_params_for_platform(index)
         self.w_p.setValue(params["w_p"])
         self.w_v.setValue(params["w_v"])
         self.w_R.setValue(params["w_R"])
@@ -2256,6 +2518,7 @@ class MainWindow(QMainWindow):
         self.k_state_bound.setValue(params["k_state_bound"])
         self.th_p_max.setValue(params["th_p_max"])
         self.th_r_max.setValue(params["th_r_max"])
+        self.T_min_thrust.setValue(params.get("T_min", 0.0))
         self.T_max.setValue(params["T_max"])
         self.tau_yaw_max.setValue(params["tau_yaw_max"])
         self.v_horizontal_max.setValue(params["v_horizontal_max"])
@@ -2299,7 +2562,9 @@ class MainWindow(QMainWindow):
                 f"Parameters loaded for {method_names[index] if index < len(method_names) else 'Unknown'}"
             )
         self._refresh_min_time_duration_group_visible(index)
-    
+        if not self._restore_optimization_for_current_context(quiet=True):
+            self._clear_optimization_results(clear_plots=True)
+
     def _default_leg_duration(self):
         if hasattr(self, 'dt_spin') and hasattr(self, 'N_spin'):
             return nominal_segment_duration(self.dt_spin.value(), self.N_spin.value())
@@ -2312,22 +2577,26 @@ class MainWindow(QMainWindow):
     def _refresh_trajectory_storage_path_label(self):
         if not hasattr(self, 'trajectory_storage_path_label'):
             return
-        idx = self.trajectory_preset_combo.currentIndex() if hasattr(self, 'trajectory_preset_combo') else 0
-        mode_key = self._current_traj_opt_mode_key()
-        mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
-        paths = resolve_trajectory_artifact_paths(idx, mode_key)
-        label = trajectory_combo_label(idx)
+        ctx = self._current_optimization_context()
+        mode_label = 'Minimum time' if ctx['mode_key'] == 'min_time' else 'Normal'
+        paths = resolve_trajectory_artifact_paths(
+            ctx['combo_index'], ctx['mode_key'], ctx['platform_id'], ctx['method_index'],
+        )
+        label = trajectory_combo_label(ctx['combo_index'])
         self.trajectory_storage_path_label.setText(
-            f'{label} ({mode_label}) — waypoints: {paths["json"]}\n'
+            f'{label} / {platform_label(ctx["platform_id"])} / method {ctx["method_index"] + 1} '
+            f'({mode_label})\n'
+            f'  waypoints: {paths["json"]}\n'
             f'  CSV: {paths["csv"]}'
         )
 
     def _opt_info_empty_message(self):
-        mode_key = self._current_traj_opt_mode_key()
-        mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
+        ctx = self._current_optimization_context()
+        mode_label = 'Minimum time' if ctx['mode_key'] == 'min_time' else 'Normal'
         return (
-            f'No saved {mode_label} result for this trajectory — '
-            f'run Start Optimization, then Save Trajectory.'
+            f'No saved result for {platform_label(ctx["platform_id"])} / '
+            f'method {ctx["method_index"] + 1} ({mode_label}) — '
+            f'run Start Optimization (cached automatically when inputs match).'
         )
 
     def _make_waypoint_table_item(self, text, editable=True):
@@ -2475,7 +2744,11 @@ class MainWindow(QMainWindow):
         old_mode_key = traj_opt_mode_key(
             getattr(self, '_traj_opt_mode_prev_index', TRAJ_OPT_MODE_NORMAL)
         )
-        self._cache_results_for_slot_mode(old_combo, old_mode_key)
+        self._cache_results_for_slot_mode(
+            old_combo, old_mode_key,
+            platform_id=self._current_rocket_platform_id(),
+            method_index=self.method_combo.currentIndex(),
+        )
         self._load_trajectory_for_combo_index(index)
         self._traj_combo_prev_index = int(index)
         self._refresh_trajectory_storage_path_label()
@@ -2612,6 +2885,8 @@ class MainWindow(QMainWindow):
 
     def _clear_optimization_plots(self):
         """Clear trajectory / cost axes (keep titles)."""
+        if not self._display_panels_ready():
+            return
         if not hasattr(self, 'ax_3d'):
             return
         plot_axes = (
@@ -2636,10 +2911,19 @@ class MainWindow(QMainWindow):
         if clear_plots:
             self._clear_optimization_plots()
 
-    def _apply_cached_trajectory_entry(self, entry, combo_index, mode_key, quiet=False):
+    def _apply_cached_trajectory_entry(
+        self, entry, combo_index, mode_key, platform_id=None, method_index=None, quiet=False,
+    ):
         self.last_trajectory = entry['last_trajectory']
         self.opt_summary = entry.get('opt_summary')
-        paths = resolve_trajectory_artifact_paths(combo_index, mode_key)
+        ctx = self._current_optimization_context()
+        if platform_id is None:
+            platform_id = ctx['platform_id']
+        if method_index is None:
+            method_index = ctx['method_index']
+        paths = resolve_trajectory_artifact_paths(
+            combo_index, mode_key, platform_id, method_index,
+        )
         if os.path.isfile(paths['csv']):
             self.last_csv_path = paths['csv']
         self._enable_trajectory_export_buttons(True)
@@ -2647,27 +2931,49 @@ class MainWindow(QMainWindow):
         if not quiet and hasattr(self, 'status_text'):
             label = trajectory_combo_label(combo_index)
             mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
+            plat = platform_label(platform_id)
             iters = (self.opt_summary or {}).get('total_iters', '?')
             path_len = (self.opt_summary or {}).get('path_length_m', 0.0)
+            method_idx = (self.opt_summary or {}).get('method', method_index)
             self.status_text.append(
-                f'Loaded {label} ({mode_label}): {iters} iters, {path_len:.2f} m path.'
+                f'Loaded {label} / {plat} / method {int(method_idx) + 1} ({mode_label}): '
+                f'{iters} iters, {path_len:.2f} m path.'
             )
         return True
 
-    def _restore_optimization_for_slot_and_mode(self, combo_index, mode_key=None, quiet=False):
-        """Load in-memory or on-disk optimization for one trajectory slot + mode."""
+    def _restore_optimization_for_slot_and_mode(
+        self,
+        combo_index,
+        mode_key=None,
+        platform_id=None,
+        method_index=None,
+        quiet=False,
+        required_fingerprint=None,
+    ):
+        """Load in-memory or on-disk optimization for one full context."""
         combo_index = int(combo_index)
-        mode_key = mode_key or self._current_traj_opt_mode_key()
-        cache_key = (combo_index, mode_key)
+        ctx = self._current_optimization_context()
+        mode_key = mode_key or ctx['mode_key']
+        platform_id = platform_id if platform_id is not None else ctx['platform_id']
+        method_index = int(method_index if method_index is not None else ctx['method_index'])
+        cache_key = optimization_cache_key(platform_id, combo_index, mode_key, method_index)
         cached = self._trajectory_mode_cache.get(cache_key)
         if cached and cached.get('last_trajectory', {}).get('xs') is not None:
-            if optimization_summary_matches_mode(cached.get('opt_summary'), mode_key):
-                return self._apply_cached_trajectory_entry(
-                    cached, combo_index, mode_key, quiet=quiet,
-                )
+            summary = cached.get('opt_summary')
+            if optimization_summary_matches_context(summary, platform_id, mode_key, method_index):
+                fp = (summary or {}).get('input_fingerprint')
+                if required_fingerprint is None or fp == required_fingerprint:
+                    return self._apply_cached_trajectory_entry(
+                        cached, combo_index, mode_key, platform_id, method_index, quiet=quiet,
+                    )
             self._trajectory_mode_cache.pop(cache_key, None)
         return self._try_restore_saved_optimization(
-            combo_index, mode_key=mode_key, quiet=quiet,
+            combo_index,
+            mode_key=mode_key,
+            platform_id=platform_id,
+            method_index=method_index,
+            quiet=quiet,
+            required_fingerprint=required_fingerprint,
         )
 
     def _load_trajectory_arrays_from_paths(self, paths, summary, mode_key):
@@ -2755,6 +3061,9 @@ class MainWindow(QMainWindow):
         return {
             'method': int(self.method_combo.currentIndex()),
             'method_name': timing_info.get('method', ''),
+            'mode_key': self._current_traj_opt_mode_key(),
+            'platform_id': self._current_rocket_platform_id(),
+            'input_fingerprint': optimization_input_fingerprint(self.get_parameters()),
             'total_time_s': total_time,
             'total_iters': total_iters,
             'avg_time_per_iter_ms': avg_ms,
@@ -2769,8 +3078,14 @@ class MainWindow(QMainWindow):
             'dt': float(self.dt_spin.value()),
         }
 
+    def _display_panels_ready(self):
+        """True once the matplotlib trajectory/cost axes exist."""
+        return hasattr(self, 'ax_cost') and hasattr(self, 'ax_3d')
+
     def _restore_plot_from_last_trajectory(self):
         """Redraw all panels from ``self.last_trajectory``."""
+        if not self._display_panels_ready():
+            return
         traj = self.last_trajectory
         if not traj or traj.get('xs') is None:
             return
@@ -2791,12 +3106,25 @@ class MainWindow(QMainWindow):
         )
 
     def _try_restore_saved_optimization(
-        self, combo_index, json_data=None, mode_key=None, quiet=False,
+        self,
+        combo_index,
+        json_data=None,
+        mode_key=None,
+        platform_id=None,
+        method_index=None,
+        quiet=False,
+        required_fingerprint=None,
     ):
-        """Load saved CSV/NPZ optimization for one trajectory slot + mode."""
+        """Load saved CSV/NPZ optimization for one platform × trajectory × mode × method."""
         combo_index = int(combo_index)
-        mode_key = mode_key or self._current_traj_opt_mode_key()
-        paths = resolve_trajectory_artifact_paths(combo_index, mode_key)
+        ctx = self._current_optimization_context()
+        mode_key = mode_key or ctx['mode_key']
+        platform_id = platform_id if platform_id is not None else ctx['platform_id']
+        method_index = int(method_index if method_index is not None else ctx['method_index'])
+        paths = resolve_trajectory_artifact_paths(
+            combo_index, mode_key, platform_id, method_index,
+        )
+        cache_key = optimization_cache_key(platform_id, combo_index, mode_key, method_index)
         if json_data is None:
             if not os.path.isfile(paths['json']):
                 self._clear_optimization_results(clear_plots=True)
@@ -2807,14 +3135,21 @@ class MainWindow(QMainWindow):
             except (OSError, json.JSONDecodeError):
                 self._clear_optimization_results(clear_plots=True)
                 return False
-        summary = optimization_summary_from_json(json_data, mode_key)
-        if not summary or not optimization_summary_matches_mode(summary, mode_key):
-            self._trajectory_mode_cache.pop((combo_index, mode_key), None)
+        summary = optimization_summary_lookup(json_data, platform_id, mode_key, method_index)
+        if not summary or not optimization_summary_matches_context(
+            summary, platform_id, mode_key, method_index,
+        ):
+            self._trajectory_mode_cache.pop(cache_key, None)
+            self._clear_optimization_results(clear_plots=True)
+            return False
+        fp = summary.get('input_fingerprint')
+        if required_fingerprint is not None and fp != required_fingerprint:
+            self._trajectory_mode_cache.pop(cache_key, None)
             self._clear_optimization_results(clear_plots=True)
             return False
         loaded = self._load_trajectory_arrays_from_paths(paths, summary, mode_key)
         if loaded is None or loaded.get('xs') is None:
-            self._trajectory_mode_cache.pop((combo_index, mode_key), None)
+            self._trajectory_mode_cache.pop(cache_key, None)
             self._clear_optimization_results(clear_plots=True)
             return False
         try:
@@ -2822,64 +3157,54 @@ class MainWindow(QMainWindow):
             self.last_trajectory = loaded
             if os.path.isfile(paths['csv']):
                 self.last_csv_path = paths['csv']
-            self._cache_results_for_slot_mode(combo_index, mode_key)
+            self._cache_results_for_slot_mode(
+                combo_index, mode_key, platform_id, method_index,
+            )
             return self._apply_cached_trajectory_entry(
-                self._trajectory_mode_cache[(combo_index, mode_key)],
+                self._trajectory_mode_cache[cache_key],
                 combo_index,
                 mode_key,
+                platform_id,
+                method_index,
                 quiet=quiet,
             )
         except (OSError, ValueError, KeyError) as e:
             if not quiet and hasattr(self, 'status_text'):
                 self.status_text.append(f'Could not load saved trajectory: {e}')
-            self._trajectory_mode_cache.pop((combo_index, mode_key), None)
+            self._trajectory_mode_cache.pop(cache_key, None)
             self._clear_optimization_results(clear_plots=True)
             return False
 
     def _current_trajectory_csv_path(self):
-        """CSV path for the current trajectory slot + optimization mode."""
+        """CSV path for the current optimization context."""
         if not hasattr(self, 'trajectory_preset_combo'):
             return DEFAULT_TRAJ_CSV_PATH
+        ctx = self._current_optimization_context()
         return resolve_trajectory_artifact_paths(
-            self.trajectory_preset_combo.currentIndex(),
-            self._current_traj_opt_mode_key(),
+            ctx['combo_index'],
+            ctx['mode_key'],
+            ctx['platform_id'],
+            ctx['method_index'],
         )['csv']
 
-    def save_trajectory(self):
-        """Save waypoints, optimized CSV, NPZ, and summary for the current trajectory slot."""
+    def _persist_optimization_artifacts(self, quiet=False):
+        """Write waypoints JSON + CSV + NPZ + summary for the current context."""
         self._sync_waypoints_from_table()
-        if len(self.waypoints) < 2:
-            QMessageBox.warning(
-                self,
-                'Not enough waypoints',
-                'Need at least 2 waypoints (start + one target) before saving.',
-            )
-            return
-        for i in range(len(self.waypoints) - 1):
-            if self.waypoints[i][4] >= self.waypoints[i + 1][4]:
-                QMessageBox.warning(
-                    self,
-                    'Invalid times',
-                    f'Waypoint {i + 1} arrival time must be greater than waypoint {i}.',
-                )
-                return
         if not self.last_trajectory or self.last_trajectory.get('xs') is None:
-            QMessageBox.warning(
-                self,
-                'No optimization',
-                'Run Start Optimization first, then click Save Trajectory.',
-            )
-            return
+            return False
         payload = self._build_trajectory_csv_payload()
         if payload is None:
-            QMessageBox.warning(self, 'No trajectory', 'Could not build trajectory export.')
-            return
+            return False
 
-        combo_index = self.trajectory_preset_combo.currentIndex()
-        mode_key = self._current_traj_opt_mode_key()
-        paths = trajectory_artifact_paths(combo_index, mode_key)
+        ctx = self._current_optimization_context()
+        combo_index = ctx['combo_index']
+        mode_key = ctx['mode_key']
+        platform_id = ctx['platform_id']
+        method_index = ctx['method_index']
+        paths = trajectory_artifact_paths(combo_index, mode_key, platform_id, method_index)
         label = trajectory_combo_label(combo_index)
         mode_label = 'Minimum time' if mode_key == 'min_time' else 'Normal'
+
         summary = dict(self.opt_summary or self._make_optimization_summary(
             self.last_trajectory['xs'],
             self.last_trajectory.get('us'),
@@ -2888,6 +3213,10 @@ class MainWindow(QMainWindow):
         ))
         summary['saved_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
         summary['mode_key'] = mode_key
+        summary['platform_id'] = platform_id
+        summary['method'] = int(method_index)
+        if not summary.get('input_fingerprint'):
+            summary['input_fingerprint'] = optimization_input_fingerprint(self.get_parameters())
         summary['csv_path'] = paths['csv']
         summary['npz_path'] = paths['npz']
         self.opt_summary = summary
@@ -2912,34 +3241,25 @@ class MainWindow(QMainWindow):
                     traj['optimal_segment_times'], dtype=float
                 )
             np.savez_compressed(paths['npz'], **npz_kw)
-            optimizations = {}
+
+            existing = {}
             if os.path.isfile(paths['json']):
                 try:
                     with open(paths['json'], 'r', encoding='utf-8') as f:
                         existing = json.load(f)
-                    opts = existing.get('optimizations')
-                    if isinstance(opts, dict):
-                        optimizations.update(opts)
-                    legacy = existing.get('optimization')
-                    if legacy and 'normal' not in optimizations and 'min_time' not in optimizations:
-                        if legacy.get('method') == METHOD_MIN_TIME_INDEX:
-                            optimizations['min_time'] = legacy
-                        else:
-                            optimizations['normal'] = legacy
                 except (OSError, json.JSONDecodeError, TypeError):
-                    pass
-            optimizations[mode_key] = summary
-            json_payload = {
-                'version': TRAJ_JSON_VERSION,
-                'name': label,
-                'waypoints': waypoints_to_json_list(self.waypoints),
-                'optimizations': optimizations,
-            }
+                    existing = {}
+            json_payload = merge_optimization_summary_into_json(
+                existing, platform_id, mode_key, method_index, summary,
+            )
+            json_payload['name'] = label
+            json_payload['waypoints'] = waypoints_to_json_list(self.waypoints)
             with open(paths['json'], 'w', encoding='utf-8') as f:
                 json.dump(json_payload, f, indent=2, ensure_ascii=False, default=str)
         except OSError as e:
-            QMessageBox.critical(self, 'Save failed', f'Could not write trajectory files:\n{e}')
-            return
+            if not quiet:
+                QMessageBox.critical(self, 'Save failed', f'Could not write trajectory files:\n{e}')
+            return False
 
         self.last_csv_path = paths['csv']
         self.default_traj_csv_path = paths['csv']
@@ -2948,11 +3268,41 @@ class MainWindow(QMainWindow):
         self._refresh_opt_info_display()
         if hasattr(self, 'tracking_source_combo'):
             self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
-        self.status_text.append(
-            f'Saved {label} ({mode_label}): waypoints + optimization to\n'
-            f'  JSON: {paths["json"]}\n'
-            f'  CSV:  {paths["csv"]}'
-        )
+        if not quiet and hasattr(self, 'status_text'):
+            self.status_text.append(
+                f'Saved {label} / {platform_label(platform_id)} / method {method_index + 1} '
+                f'({mode_label}):\n'
+                f'  JSON: {paths["json"]}\n'
+                f'  CSV:  {paths["csv"]}'
+            )
+        return True
+
+    def save_trajectory(self):
+        """Save waypoints, optimized CSV, NPZ, and summary for the current context."""
+        self._sync_waypoints_from_table()
+        if len(self.waypoints) < 2:
+            QMessageBox.warning(
+                self,
+                'Not enough waypoints',
+                'Need at least 2 waypoints (start + one target) before saving.',
+            )
+            return
+        for i in range(len(self.waypoints) - 1):
+            if self.waypoints[i][4] >= self.waypoints[i + 1][4]:
+                QMessageBox.warning(
+                    self,
+                    'Invalid times',
+                    f'Waypoint {i + 1} arrival time must be greater than waypoint {i}.',
+                )
+                return
+        if not self.last_trajectory or self.last_trajectory.get('xs') is None:
+            QMessageBox.warning(
+                self,
+                'No optimization',
+                'Run Start Optimization first, then click Save Trajectory.',
+            )
+            return
+        self._persist_optimization_artifacts(quiet=False)
 
     def _load_saved_waypoints_from_file(self, quiet=False):
         """Load waypoints from the Saved trajectory file."""
@@ -3016,6 +3366,127 @@ class MainWindow(QMainWindow):
                 self._apply_waypoints_from_list(cfg['waypoints'])
         self._refresh_trajectory_storage_path_label()
 
+    def _current_rocket_platform_id(self):
+        if hasattr(self, 'rocket_real_radio') and self.rocket_real_radio.isChecked():
+            return PLATFORM_REAL
+        return PLATFORM_PROXY
+
+    def _set_rocket_platform_radio(self, platform_id, block_signals=False):
+        platform_id = normalize_platform_id(platform_id)
+        if block_signals:
+            self._rocket_platform_button_group.blockSignals(True)
+        try:
+            if platform_id == PLATFORM_REAL:
+                self.rocket_real_radio.setChecked(True)
+            else:
+                self.rocket_proxy_radio.setChecked(True)
+        finally:
+            if block_signals:
+                self._rocket_platform_button_group.blockSignals(False)
+
+    def _snapshot_platform_settings(self):
+        """Capture Physical + thrust-related constraint fields for the active platform."""
+        return {
+            'mass': self.mass.value(),
+            'Ixx': self.Ixx.value(),
+            'Iyy': self.Iyy.value(),
+            'Izz': self.Izz.value(),
+            'r_thrust_x': self.r_thrust_x.value(),
+            'r_thrust_y': self.r_thrust_y.value(),
+            'r_thrust_z': self.r_thrust_z.value(),
+            'T_min': self.T_min_thrust.value(),
+            'T_max': self.T_max.value(),
+            'tau_yaw_max': self.tau_yaw_max.value(),
+            'v_horizontal_max': self.v_horizontal_max.value(),
+            'v_vertical_max': self.v_vertical_max.value(),
+        }
+
+    def _update_platform_spin_ranges(self, platform_id):
+        ranges = physics_spin_ranges(platform_id)
+        m_lo, m_hi, m_dec = ranges['mass']
+        i_lo, i_hi, i_dec = ranges['inertia']
+        r_lo, r_hi, r_dec = ranges['r_thrust']
+        self.mass.setRange(m_lo, m_hi)
+        self.mass.setDecimals(m_dec)
+        for spin in (self.Ixx, self.Iyy, self.Izz):
+            spin.setRange(i_lo, i_hi)
+            spin.setDecimals(i_dec)
+        for spin in (self.r_thrust_x, self.r_thrust_y, self.r_thrust_z):
+            spin.setRange(r_lo, r_hi)
+            spin.setDecimals(r_dec)
+
+        cr = constraint_spin_ranges(platform_id)
+        tmin_lo, tmin_hi, tmin_dec = cr['T_min']
+        self.T_min_thrust.setRange(tmin_lo, tmin_hi)
+        self.T_min_thrust.setDecimals(tmin_dec)
+        t_lo, t_hi, t_dec = cr['T_max']
+        self.T_max.setRange(t_lo, t_hi)
+        self.T_max.setDecimals(t_dec)
+        ty_lo, ty_hi, ty_dec = cr['tau_yaw_max']
+        self.tau_yaw_max.setRange(ty_lo, ty_hi)
+        self.tau_yaw_max.setDecimals(ty_dec)
+
+    def _refresh_physics_platform_hint(self):
+        if not hasattr(self, 'physics_platform_hint'):
+            return
+        pid = self._current_rocket_platform_id()
+        self.physics_platform_hint.setText(
+            f'Active platform: {platform_label(pid)} — {platform_description(pid)}'
+        )
+        if hasattr(self, 'rocket_platform_desc_label'):
+            self.rocket_platform_desc_label.setText(platform_description(pid))
+
+    def _apply_platform_settings(self, platform_id, settings=None):
+        """Apply physical (and thrust-related constraint) defaults for a platform."""
+        platform_id = normalize_platform_id(platform_id)
+        self._rocket_platform_guard = True
+        try:
+            self._update_platform_spin_ranges(platform_id)
+            physics = dict(default_physics(platform_id))
+            constraints = dict(default_constraints(platform_id))
+            if settings:
+                settings = dict(settings)
+                # Recover from older GUI spinbox cap (T_max range was 0–100 N).
+                if (
+                    platform_id == PLATFORM_REAL
+                    and float(settings.get('T_max', constraints['T_max'])) <= 100.0 + 1e-6
+                ):
+                    settings['T_max'] = constraints['T_max']
+                physics.update({k: settings[k] for k in physics if k in settings})
+                constraints.update({k: settings[k] for k in constraints if k in settings})
+
+            self.mass.setValue(float(physics['mass']))
+            self.Ixx.setValue(float(physics['Ixx']))
+            self.Iyy.setValue(float(physics['Iyy']))
+            self.Izz.setValue(float(physics['Izz']))
+            self.r_thrust_x.setValue(float(physics['r_thrust_x']))
+            self.r_thrust_y.setValue(float(physics['r_thrust_y']))
+            self.r_thrust_z.setValue(float(physics['r_thrust_z']))
+
+            self.T_min_thrust.setValue(float(constraints['T_min']))
+            self.T_max.setValue(float(constraints['T_max']))
+            self.tau_yaw_max.setValue(float(constraints['tau_yaw_max']))
+            self.v_horizontal_max.setValue(float(constraints['v_horizontal_max']))
+            self.v_vertical_max.setValue(float(constraints['v_vertical_max']))
+            self._refresh_physics_platform_hint()
+        finally:
+            self._rocket_platform_guard = False
+
+    def _on_rocket_platform_changed(self, _button=None):
+        if self._rocket_platform_guard:
+            return
+        previous_id = self._cached_platform_id
+        self._platform_phys_cache[previous_id] = self._snapshot_platform_settings()
+
+        new_id = self._current_rocket_platform_id()
+        cached = self._platform_phys_cache.get(new_id)
+        self._apply_platform_settings(new_id, settings=cached)
+        self._cached_platform_id = new_id
+        if hasattr(self, 'status_text'):
+            self.status_text.append(f'Rocket platform: {platform_label(new_id)}')
+        if not self._restore_optimization_for_current_context(quiet=True):
+            self._clear_optimization_results(clear_plots=True)
+
     def gui_config_to_dict(self):
         """Serialize GUI settings to a JSON-friendly dict."""
         preset_id = combo_index_to_trajectory_preset_id(
@@ -3023,6 +3494,7 @@ class MainWindow(QMainWindow):
         )
         cfg = {
             'version': GUI_PARAMS_VERSION,
+            'rocket_platform': self._current_rocket_platform_id(),
             'trajectory_preset': preset_id,
             'traj_opt_mode': (
                 'min_time'
@@ -3049,6 +3521,7 @@ class MainWindow(QMainWindow):
             'terminal_constraint': self.terminal_constraint_checkbox.isChecked(),
             'waypoint_terminal_cost': self.waypoint_terminal_checkbox.isChecked(),
             'th_p_max': self.th_p_max.value(), 'th_r_max': self.th_r_max.value(),
+            'T_min': self.T_min_thrust.value(),
             'T_max': self.T_max.value(), 'tau_yaw_max': self.tau_yaw_max.value(),
             'v_horizontal_max': self.v_horizontal_max.value(),
             'v_vertical_max': self.v_vertical_max.value(),
@@ -3072,6 +3545,12 @@ class MainWindow(QMainWindow):
             combo.blockSignals(True)
         try:
             self._apply_trajectory_from_config(cfg)
+
+            if 'rocket_platform' in cfg:
+                pid = normalize_platform_id(cfg['rocket_platform'])
+                self._set_rocket_platform_radio(pid, block_signals=True)
+                self._cached_platform_id = pid
+                self._update_platform_spin_ranges(pid)
 
             def _set_spin(spin, key):
                 if key in cfg:
@@ -3128,7 +3607,7 @@ class MainWindow(QMainWindow):
             _set_check(self.waypoint_terminal_checkbox, 'waypoint_terminal_cost')
 
             for k, sp in [('th_p_max', self.th_p_max), ('th_r_max', self.th_r_max),
-                          ('T_max', self.T_max), ('tau_yaw_max', self.tau_yaw_max),
+                          ('T_min', self.T_min_thrust), ('T_max', self.T_max), ('tau_yaw_max', self.tau_yaw_max),
                           ('v_horizontal_max', self.v_horizontal_max), ('v_vertical_max', self.v_vertical_max),
                           ('roll_max', self.roll_max), ('pitch_max', self.pitch_max),
                           ('yaw_max', self.yaw_max), ('w_max', self.w_max)]:
@@ -3143,11 +3622,25 @@ class MainWindow(QMainWindow):
                 _set_spin(sp, k)
             _set_spin(self.min_time_T_min_spin, 'min_time_T_min')
             _set_spin(self.min_time_T_max_scale_spin, 'min_time_T_max_scale')
+
+            if 'rocket_platform' in cfg:
+                pid = normalize_platform_id(cfg['rocket_platform'])
+                self._platform_phys_cache[pid] = self._snapshot_platform_settings()
+                self._refresh_physics_platform_hint()
         finally:
             for combo in self._method_combos():
                 combo.blockSignals(False)
         self._update_unified_checkbox_state(self.method_combo.currentIndex())
         self._refresh_min_time_duration_group_visible(self.method_combo.currentIndex())
+        self._cached_platform_id = self._current_rocket_platform_id()
+        self._refresh_physics_platform_hint()
+        if self._current_rocket_platform_id() == PLATFORM_REAL:
+            plat_def = default_constraints(PLATFORM_REAL)
+            if self.T_max.value() <= 100.0 + 1e-6:
+                self._update_platform_spin_ranges(PLATFORM_REAL)
+                self.T_max.setValue(plat_def['T_max'])
+            if self.T_min_thrust.value() < plat_def['T_min'] - 1e-6:
+                self.T_min_thrust.setValue(plat_def['T_min'])
 
     def _update_params_file_label(self):
         if hasattr(self, 'params_file_label'):
@@ -3309,10 +3802,14 @@ class MainWindow(QMainWindow):
         th_p_max_rad = np.radians(self.th_p_max.value())
         th_r_max_rad = np.radians(self.th_r_max.value())
         tau_yaw_max_val = self.tau_yaw_max.value()
+        t_min = float(self.T_min_thrust.value())
+        t_max = float(self.T_max.value())
+        if t_min > t_max:
+            t_min = t_max
         bounds = {
             "th_p": (-th_p_max_rad, th_p_max_rad),
             "th_r": (-th_r_max_rad, th_r_max_rad),
-            "T": (0.0, self.T_max.value()),
+            "T": (t_min, t_max),
             "tau_yaw": (-tau_yaw_max_val, tau_yaw_max_val),
             "k_bound": self.k_bound.value(),  # Control constraint penalty coefficient
             # State constraints - convert degrees to radians
@@ -3343,6 +3840,7 @@ class MainWindow(QMainWindow):
             'm': m,
             'I': I,
             'r_thrust': r_thrust,
+            'rocket_platform': self._current_rocket_platform_id(),
             'waypoints': self.waypoints.copy(),  # Include waypoints for plotting
             'method': self.method_combo.currentIndex(),  # 3–4,6 Acados; 5 Spannagl; 7=index6 free_tf
             'unified': self.unified_checkbox.isChecked()  # Merge segments (Method 2/3/4)
@@ -3370,6 +3868,20 @@ class MainWindow(QMainWindow):
                 return
 
         self.waypoints = [_normalize_waypoint_row(w) for w in self.waypoints]
+
+        params = self.get_parameters()
+        input_fp = optimization_input_fingerprint(params)
+        if self._restore_optimization_for_current_context(
+            quiet=True, required_fingerprint=input_fp,
+        ):
+            ctx = self._current_optimization_context()
+            self.status_text.append(
+                f'Loaded cached optimization — '
+                f'{platform_label(ctx["platform_id"])} / '
+                f'{trajectory_combo_label(ctx["combo_index"])} / '
+                f'method {ctx["method_index"] + 1} (inputs unchanged).'
+            )
+            return
 
         self._trajectory_mode_cache.pop(self._mode_cache_key(), None)
         self.last_trajectory = None
@@ -3546,6 +4058,7 @@ class MainWindow(QMainWindow):
             'w_max': self.w_max.value(),
             'th_p_max': self.th_p_max.value(),
             'th_r_max': self.th_r_max.value(),
+            'T_min': self.T_min_thrust.value(),
             'T_max': self.T_max.value(),
             'tau_yaw_max': self.tau_yaw_max.value(),
         }
@@ -3627,6 +4140,7 @@ class MainWindow(QMainWindow):
         }
         self.opt_summary = self._make_optimization_summary(xs, us, all_loggers, timing_info)
         self._cache_current_mode_results()
+        self._persist_optimization_artifacts(quiet=True)
         self._refresh_opt_info_display()
         self._enable_trajectory_export_buttons(True)
         if hasattr(self, 'tracking_source_combo') and self.tracking_source_combo.currentIndex() == 0:
@@ -4119,15 +4633,26 @@ class MainWindow(QMainWindow):
                 self.lbl_tracking_status.setText('Stopped')
                 self.lbl_tracking_status.setStyleSheet('color: #888;')
 
+    def _sitl_launch_extra_args(self):
+        """ROS launch overrides for the active rocket platform."""
+        kw = sitl_launch_kwargs(self._current_rocket_platform_id())
+        args = [self._launch_arg('rocket_platform', kw['rocket_platform'])]
+        if kw.get('launch_controller') is not None:
+            args.append(self._launch_arg('launch_controller', kw['launch_controller']))
+        return args
+
     def start_px4_sitl(self):
-        """Launch full TVC stack (PX4 SITL + micro-XRCE + controller)."""
+        """Launch TVC SITL stack (PX4 + Gazebo; external LQR optional)."""
+        platform_id = self._current_rocket_platform_id()
+        extra = self._sitl_launch_extra_args()
         self._start_background_process(
             '_tvc_launch_proc',
-            self._ros2_shell_command('tvc.launch.py'),
+            self._ros2_shell_command('tvc.launch.py', extra),
             'PX4 SITL (tvc.launch.py)',
         )
         self.status_text.append(
-            'PX4 SITL starting — planned trajectory appears only after Tracking starts.'
+            f'PX4 SITL starting ({platform_label(platform_id)}) — '
+            f'PX4 built-in control; Gazebo model follows the selected platform.'
         )
 
     def stop_px4_sitl(self):

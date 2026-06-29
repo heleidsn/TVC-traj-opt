@@ -66,6 +66,7 @@ DEFAULT_BOUNDS_DISPLAY = {
     'w_max': 2.0,
     'th_p_max': 10.0,
     'th_r_max': 10.0,
+    'T_min': 0.0,
     'T_max': 25.0,
     'tau_yaw_max': 1.0,
 }
@@ -81,6 +82,7 @@ def bounds_display_from_optimization_bounds(bounds):
     if bounds.get('th_r') is not None:
         d['th_r_max'] = float(np.degrees(abs(bounds['th_r'][1])))
     if bounds.get('T') is not None:
+        d['T_min'] = float(bounds['T'][0])
         d['T_max'] = float(bounds['T'][1])
     if bounds.get('tau_yaw') is not None:
         d['tau_yaw_max'] = float(abs(bounds['tau_yaw'][1]))
@@ -396,6 +398,7 @@ def draw_trajectory_panels(axes, xs, us, dt, waypoints, bounds_display, quat_to_
     # 6–9. Controls
     th_p_max_deg = bd['th_p_max']
     th_r_max_deg = bd['th_r_max']
+    T_min_val = bd.get('T_min', 0.0)
     T_max_val = bd['T_max']
     tau_yaw_max = bd['tau_yaw_max']
 
@@ -451,8 +454,8 @@ def draw_trajectory_panels(axes, xs, us, dt, waypoints, bounds_display, quat_to_
         )
     ax_thrust.axhline(y=T_max_val, color='r', linestyle='--',
                      linewidth=1.5, alpha=0.7, label=f'Max ({T_max_val:.1f} N)', zorder=_z_lim)
-    ax_thrust.axhline(y=0.0, color='r', linestyle='--',
-                     linewidth=1.5, alpha=0.7, label='Min (0 N)', zorder=_z_lim)
+    ax_thrust.axhline(y=T_min_val, color='r', linestyle='--',
+                     linewidth=1.5, alpha=0.7, label=f'Min ({T_min_val:.1f} N)', zorder=_z_lim)
     ax_thrust.set_xlabel('Time (s)', fontsize=9)
     ax_thrust.set_ylabel('Thrust (N)', fontsize=9)
     ax_thrust.set_title('Thrust', fontsize=10, fontweight='bold')
