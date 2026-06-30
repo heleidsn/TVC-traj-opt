@@ -1,0 +1,122 @@
+{
+  "controller": "px4_cascade",
+  "sim_mode": "numerical",
+  "numerical_sim": {
+    "sim_dt": 0.005,
+    "control_dt": 0.05
+  },
+  "actuator": {
+    "enabled": false,
+    "thrust_quant_enabled": true,
+    "thrust_resolution_N": 50.0,
+    "tau_gimbal": 0.05,
+    "tau_thrust": 0.05,
+    "tau_yaw_torque": 0.05
+  },
+  "params": {
+    "px4_cascade": {
+      "share_rp_gains": true,
+      "Kp_pos_xy": 1.0,
+      "Kp_vel_xy": 2.8,
+      "Ki_vel_xy": 0.0,
+      "Kd_vel_xy": 0.0,
+      "Kp_pos_z": 1.0,
+      "Kp_vel_z": 15.0,
+      "Ki_vel_z": 0.0,
+      "Kd_vel_z": 0.0,
+      "Kp_att_rp_deg": 6.5,
+      "Kp_rate_rp": 10.0,
+      "Ki_rate_rp": 0.0,
+      "Kd_rate_rp": 0.0,
+      "Kp_att_yaw_deg": 4.0,
+      "Kp_rate_yaw": 5.0,
+      "Ki_rate_yaw": 0.0,
+      "Kd_rate_yaw": 0.0,
+      "tilt_max_deg": 10.0,
+      "gimbal_max_deg": 5.0,
+      "use_feedforward": false,
+      "clip_pos_error": 0.5,
+      "clip_vel_error": 0.5,
+      "Kp_att_roll_deg": 6.5,
+      "Kp_att_pitch_deg": 6.5,
+      "Kp_rate_roll": 18.0,
+      "Kp_rate_pitch": 18.0,
+      "Ki_rate_roll": 0.2,
+      "Ki_rate_pitch": 0.2,
+      "Kd_rate_roll": 0.01,
+      "Kd_rate_pitch": 0.01
+    },
+    "lqr": {
+      "Q_x": 1.0,
+      "Q_y": 1.0,
+      "Q_z": 1.0,
+      "Q_vx": 1.0,
+      "Q_vy": 1.0,
+      "Q_vz": 1.0,
+      "Q_qx": 1.0,
+      "Q_qy": 1.0,
+      "Q_qz": 0.1,
+      "Q_p": 1.0,
+      "Q_q": 1.0,
+      "Q_r": 0.01,
+      "R_qx": 10.0,
+      "R_qy": 10.0,
+      "R_T": 1.0,
+      "R_r": 10.0,
+      "use_feedforward": true,
+      "clip_pos_error": 0.5,
+      "clip_vel_error": 0.5
+    },
+    "mpc": {
+      "horizon": 20,
+      "mpc_dt": 0.05,
+      "Q_x": 1.0,
+      "Q_y": 1.0,
+      "Q_z": 1.0,
+      "Q_vx": 1.0,
+      "Q_vy": 1.0,
+      "Q_vz": 1.0,
+      "Q_qx": 1.0,
+      "Q_qy": 1.0,
+      "Q_qz": 0.1,
+      "Q_p": 1.0,
+      "Q_q": 1.0,
+      "Q_r": 0.01,
+      "R_qx": 10.0,
+      "R_qy": 10.0,
+      "R_T": 1.0,
+      "R_r": 10.0,
+      "use_feedforward": true,
+      "clip_pos_error": 0.5,
+      "clip_vel_error": 0.5
+    }
+  },
+  "px4_tune": {
+    "level": "velocity",
+    "duration_s": 2.0,
+    "setpoints": {
+      "rate": {
+        "p_deg_s": 20.0,
+        "q_deg_s": 0.0,
+        "r_deg_s": 0.0
+      },
+      "attitude": {
+        "roll_deg": 5.0,
+        "pitch_deg": 5.0,
+        "yaw_deg": 0.0
+      },
+      "velocity": {
+        "vx": 1.0,
+        "vy": 0.0,
+        "vz": 0.0,
+        "yaw_deg": 0.0
+      },
+      "position": {
+        "x": 0.5,
+        "y": 0.0,
+        "z": 0.0,
+        "yaw_deg": 0.0
+      }
+    }
+  }
+}

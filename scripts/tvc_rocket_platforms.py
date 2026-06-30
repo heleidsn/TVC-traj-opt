@@ -68,7 +68,6 @@ def _proxy_physics() -> Dict[str, float]:
     }
 
 
-# Recommended control / state limits per platform (GUI Constraints tab).
 _PLATFORM_CONSTRAINTS: Dict[str, Dict[str, float]] = {
     PLATFORM_PROXY: {
         "T_min": 0.0,
@@ -85,6 +84,19 @@ _PLATFORM_CONSTRAINTS: Dict[str, Dict[str, float]] = {
         "v_vertical_max": 5.0,
     },
 }
+
+# Typical thrust command quantization for numerical tracking simulation.
+_PLATFORM_THRUST_RESOLUTION_N: Dict[str, float] = {
+    PLATFORM_PROXY: 0.5,
+    PLATFORM_REAL: 10.0,
+}
+
+
+def default_thrust_quantization_resolution(platform_id: str) -> float:
+    """Default thrust step size [N] when simulating discrete thrust commands."""
+    pid = normalize_platform_id(platform_id)
+    return float(_PLATFORM_THRUST_RESOLUTION_N.get(pid, 0.5))
+
 
 _PLATFORM_META: Dict[str, Dict[str, Any]] = {
     PLATFORM_PROXY: {
@@ -186,6 +198,7 @@ _SITL_LAUNCH: Dict[str, Dict[str, str]] = {
         "rocket_platform": PLATFORM_REAL,
         "launch_controller": "false",
         "px4_sim_model": "tvc_real",
+        "px4_sys_autostart": "6004",
         "px4_gz_model_pose": "0,0,0.35",
         "config_file": "tvc_params_real.yaml",
         "robot_urdf": "tvc_real.urdf",
@@ -199,3 +212,28 @@ def sitl_launch_kwargs(platform_id: str) -> Dict[str, str]:
     """Keyword arguments for ``ros2 launch tvc_controller tvc.launch.py``."""
     pid = normalize_platform_id(platform_id)
     return dict(_SITL_LAUNCH[pid])
+
+
+def rocket_visual_geometry(platform_id: str) -> Dict[str, float]:
+    """
+    Body-frame rocket stick dimensions [m] for GIF / 3D plots (COM at origin).
+
+    Matches optimization URDF / Gazebo primitive sizes.
+    """
+    pid = normalize_platform_id(platform_id)
+    if pid == PLATFORM_REAL:
+        return {
+            'body_bottom_z': -0.5 * REAL_BODY_LENGTH_M,
+            'nose_tip_z': 0.5 * REAL_BODY_LENGTH_M + REAL_CONE_HEIGHT_M,
+            'fin_z': -0.15,
+            'shaft_lw': 5.5,
+            'fin_lw': 3.2,
+        }
+    # Proxy — tvc_simple.urdf cylinder L=1.0 m
+    return {
+        'body_bottom_z': -0.5,
+        'nose_tip_z': 0.55,
+        'fin_z': -0.10,
+        'shaft_lw': 4.0,
+        'fin_lw': 2.4,
+    }

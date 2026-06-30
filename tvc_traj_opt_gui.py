@@ -40,6 +40,10 @@ LEFT_STATUS_TEXT_HEIGHT = 72
 DEFAULT_TRAJ_CSV_DIR = os.path.join(ROOT_DIR, 'trajs')
 DEFAULT_TRAJ_CSV_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'latest.csv')
 DEFAULT_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'saved_waypoints.json')
+CONTROLLERS_DIR = os.path.join(ROOT_DIR, 'controllers')
+DEFAULT_TRACKING_PARAMS_PATH = os.path.join(CONTROLLERS_DIR, 'tracking_params.json')
+DEFAULT_TRACKING_GIF_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'tracking_anim.gif')
+APP_ICON_PATH = os.path.join(ROOT_DIR, 'assets', 'icon', 'rocket.jpg')
 TRAJ_PRESETS_DIR = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'presets')
 CUSTOM_WAYPOINTS_PATH = os.path.join(TRAJ_PRESETS_DIR, 'custom_waypoints.json')
 
@@ -66,9 +70,9 @@ try:
                                  QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                  QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
                                  QFileDialog, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
-                                 QAbstractItemView, QHeaderView, QRadioButton, QButtonGroup)
-    from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
-    from PyQt5.QtGui import QFont
+                                 QAbstractItemView, QHeaderView, QRadioButton, QButtonGroup, QStackedWidget)
+    from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QSize
+    from PyQt5.QtGui import QFont, QIcon, QMovie
     QT_AVAILABLE = True
 except ImportError:
     try:
@@ -80,9 +84,9 @@ except ImportError:
                                       QGroupBox, QGridLayout, QTextEdit, QTabWidget,
                                       QDoubleSpinBox, QSpinBox, QMessageBox, QProgressBar, QComboBox, QCheckBox,
                                       QFileDialog, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
-                                      QAbstractItemView, QHeaderView, QRadioButton, QButtonGroup)
-        from PySide2.QtCore import QThread, Signal as pyqtSignal, Qt, QTimer
-        from PySide2.QtGui import QFont
+                                      QAbstractItemView, QHeaderView, QRadioButton, QButtonGroup, QStackedWidget)
+        from PySide2.QtCore import QThread, Signal as pyqtSignal, Qt, QTimer, QSize
+        from PySide2.QtGui import QFont, QIcon, QMovie
         QT_AVAILABLE = True
     except ImportError:
         QT_AVAILABLE = False
@@ -107,11 +111,55 @@ import crocoddyl
 from tvc_traj_opt import TVCRocketActionModel
 from tvc_common import quat_to_euler, yaw_to_quaternion
 from tvc_traj_gui_plots import draw_trajectory_panels, draw_cost_panel
+from tvc_traj_gui_plot_layout import apply_responsive_layout, install_responsive_canvas
+from tvc_traj_gui_tracking import (
+    draw_tracking_state_panels,
+    draw_tracking_3d_panel,
+    draw_tracking_metrics_panels,
+    tracking_state_axes_dict,
+    tracking_metrics_axes_dict,
+    tracking_summary_text,
+)
+from controllers.actuator_dynamics import (
+    BW_MAX_HZ,
+    BW_MIN_HZ,
+    TAU_MAX,
+    TAU_MIN,
+    THRUST_RES_MAX,
+    THRUST_RES_MIN,
+    bandwidth_hz_to_tau,
+    default_actuator_tracking_config,
+    default_thrust_resolution_for_platform,
+    tau_to_bandwidth_hz,
+)
+from controllers.params import (
+    CONTROLLER_IDS,
+    CONTROLLER_LABELS,
+    CONTROLLER_LQR,
+    CONTROLLER_MPC,
+    CONTROLLER_PX4,
+    SIM_NUMERICAL,
+    SIM_SITL,
+    all_default_tracking_config,
+    default_numerical_sim_config,
+    default_params_for,
+    migrate_numerical_sim_config,
+)
+from controllers.param_groups import param_groups_for
+from controllers.px4_params import migrate_px4_params
+from controllers.simulator import run_tracking_simulation
+from controllers.px4_tune import (
+    TUNE_LEVEL_LABELS,
+    TUNE_LEVELS,
+    default_px4_tune_config,
+    run_px4_cascade_tune_sim,
+)
 from tvc_rocket_platforms import (
     PLATFORM_REAL,
     PLATFORM_PROXY,
     default_constraints,
     default_physics,
+    default_thrust_quantization_resolution,
     normalize_platform_id,
     constraint_spin_ranges,
     physics_spin_ranges,
@@ -589,11 +637,29 @@ class TabScrollArea(QScrollArea):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
+    def refresh_content_geometry(self):
+        """Recompute embedded page height from its layout (after expand/collapse)."""
+        vw = max(1, self.viewport().width())
+        self._page.setFixedWidth(vw)
+        lay = self._page.layout()
+        if lay is not None:
+            lay.invalidate()
+            lay.activate()
+        self._page.adjustSize()
+        h = self._page.sizeHint().height()
+        if lay is not None:
+            h = max(h, lay.sizeHint().height(), lay.minimumSize().height())
+        h = max(h, self._page.minimumSizeHint().height(), 1)
+        self._page.setFixedHeight(h)
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value())
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        vw = self.viewport().width()
-        if vw > 0:
-            self._page.setFixedWidth(vw)
+        self.refresh_content_geometry()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_content_geometry()
 
 
 def _normalize_waypoint_row(row, default_t=0.0):
@@ -1089,6 +1155,86 @@ class OptimizationThread(QThread):
         self.running = False
 
 
+class Px4TuneSimulationThread(QThread):
+    """Background PX4 cascade level tuning (step response)."""
+
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, params, phy_gui, tune_config):
+        super().__init__()
+        self.params = dict(params)
+        self.phy_gui = dict(phy_gui)
+        self.tune_config = dict(tune_config)
+
+    def run(self):
+        try:
+            result = run_px4_cascade_tune_sim(
+                self.params, self.phy_gui, self.tune_config,
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            import traceback
+            self.error.emit(f'{e}\n\n{traceback.format_exc()}')
+
+
+class TrackingSimulationThread(QThread):
+    """Background numerical closed-loop tracking simulation."""
+
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, xs, us, time_states, controller_id, params, phy_gui):
+        super().__init__()
+        self.xs = xs
+        self.us = us
+        self.time_states = time_states
+        self.controller_id = controller_id
+        self.params = dict(params)
+        self.phy_gui = dict(phy_gui)
+
+    def run(self):
+        try:
+            result = run_tracking_simulation(
+                self.xs,
+                self.us,
+                self.time_states,
+                self.controller_id,
+                self.params,
+                self.phy_gui,
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            import traceback
+            self.error.emit(f'{e}\n\n{traceback.format_exc()}')
+
+
+class TrackingGifThread(QThread):
+    """Background 3D tracking GIF renderer."""
+
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, result, plan, output_path):
+        super().__init__()
+        self.result = result
+        self.plan = plan
+        self.output_path = output_path
+
+    def run(self):
+        try:
+            from tvc_traj_gui_gif import generate_tracking_gif
+            path = generate_tracking_gif(
+                self.result,
+                self.plan,
+                output_path=self.output_path,
+            )
+            self.finished.emit(path)
+        except Exception as e:
+            import traceback
+            self.error.emit(f'{e}\n\n{traceback.format_exc()}')
+
+
 class MainWindow(QMainWindow):
     """Main window"""
     
@@ -1109,10 +1255,23 @@ class MainWindow(QMainWindow):
         self._platform_phys_cache = {}
         self._cached_platform_id = PLATFORM_PROXY
         self._rocket_platform_guard = False
+        self.tracking_params_file_path = DEFAULT_TRACKING_PARAMS_PATH
+        self._tracking_config = all_default_tracking_config()
+        self._px4_tune_config = default_px4_tune_config()
+        self._px4_tune_sp_widgets = {}
+        self._tracking_param_widgets = {}
+        self._tracking_sim_thread = None
+        self._px4_tune_sim_thread = None
+        self._tracking_gif_thread = None
+        self._tracking_gif_movie = None
+        self._tracking_gif_path = DEFAULT_TRACKING_GIF_PATH
+        self._last_tracking_result = None
         self.init_ui()
         self._update_params_file_label()
         if os.path.isfile(self.params_file_path):
             self._load_params_from_path(self.params_file_path, quiet=True)
+        if os.path.isfile(self.tracking_params_file_path):
+            self._load_tracking_params_from_path(self.tracking_params_file_path, quiet=True)
         self._restore_optimization_for_current_context(quiet=True)
         
     def init_ui(self):
@@ -1211,14 +1370,16 @@ class MainWindow(QMainWindow):
         outer.setSpacing(4)
         outer.setContentsMargins(0, 0, 0, 0)
 
-        traj_tab, params_tab = self.create_parameter_panels()
+        traj_tab, params_tab, tracking_tab = self.create_parameter_panels()
         traj_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         params_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        tracking_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
         self.left_tabs = QTabWidget()
         self.left_tabs.setDocumentMode(True)
         self.left_tabs.addTab(TabScrollArea(traj_tab), 'Trajectory')
         self.left_tabs.addTab(TabScrollArea(params_tab), 'Parameters')
+        self.left_tabs.addTab(TabScrollArea(tracking_tab), 'Tracking')
         self.left_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         outer.addWidget(self.left_tabs, 1)
 
@@ -2003,63 +2164,589 @@ class MainWindow(QMainWindow):
         self.traj_default_path_label.setText(f'Default: {DEFAULT_TRAJ_CSV_PATH}')
         layout.addWidget(self.traj_default_path_label)
 
-        # ROS2 simulation / tracking controls (label + button rows)
-        sim_group = QGroupBox('Simulation & Tracking')
-        sim_layout = QGridLayout()
-        sim_layout.setSpacing(3)
+        tracking_tab = self._create_tracking_panel()
 
-        self.btn_start_px4_sitl = QPushButton('Start')
-        self.btn_start_px4_sitl.setToolTip(
-            'ros2 launch tvc_controller tvc.launch.py rocket_platform:=<proxy|real>\n'
-            'PX4 SITL + Gazebo (PX4 built-in controller). LQR is off unless launch_controller:=true.'
+        return traj_tab, params_tab, tracking_tab
+    
+    def _refresh_tab_scroll_areas(self):
+        """Reflow sidebar tab pages after dynamic widgets change size."""
+        if not hasattr(self, 'left_tabs'):
+            return
+        for i in range(self.left_tabs.count()):
+            scroll = self.left_tabs.widget(i)
+            if isinstance(scroll, TabScrollArea):
+                scroll.refresh_content_geometry()
+
+    def _make_collapsible_group(self, title, parent_layout, expanded=False):
+        """Collapsible section: click the arrow title row (no checkbox)."""
+        section = QGroupBox()
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(8, 6, 8, 6)
+        section_layout.setSpacing(4)
+
+        header_btn = QPushButton()
+        header_btn.setFlat(True)
+        header_btn.setCursor(Qt.PointingHandCursor)
+        header_btn.setStyleSheet(
+            'QPushButton { text-align: left; font-weight: bold; border: none; padding: 2px 4px; }'
+            'QPushButton:hover { color: #1565c0; }'
         )
-        self.btn_start_px4_sitl.clicked.connect(self.start_px4_sitl)
-        self.btn_stop_px4_sitl = QPushButton('Stop')
-        self.btn_stop_px4_sitl.setToolTip('Terminate the TVC launch stack (PX4 SITL + agents)')
-        self.btn_stop_px4_sitl.clicked.connect(self.stop_px4_sitl)
-        self.btn_stop_px4_sitl.setEnabled(False)
-        self.lbl_px4_sitl_status = QLabel('Stopped')
-        self.lbl_px4_sitl_status.setStyleSheet('color: #888;')
-        sim_layout.addWidget(QLabel('PX4 SITL:'), 0, 0)
-        sim_layout.addWidget(self.btn_start_px4_sitl, 0, 1)
-        sim_layout.addWidget(self.btn_stop_px4_sitl, 0, 2)
-        sim_layout.addWidget(self.lbl_px4_sitl_status, 0, 3)
+        inner = QWidget()
+        inner.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(8, 0, 0, 0)
+        inner_layout.setSpacing(4)
 
-        self.btn_start_tracking = QPushButton('Start')
-        self.btn_start_tracking.setToolTip(
-            'ros2 launch tvc_controller tvc_traj_player.launch.py '
-            '(uses last saved CSV when available)'
+        section_layout.addWidget(header_btn)
+        section_layout.addWidget(inner)
+        parent_layout.addWidget(section)
+
+        state = {'open': bool(expanded)}
+
+        def _sync_header():
+            arrow = '▾' if state['open'] else '▸'
+            header_btn.setText(f'{arrow}  {title}')
+
+        def _toggle():
+            state['open'] = not state['open']
+            inner.setVisible(state['open'])
+            inner.setMaximumHeight(16777215 if state['open'] else 0)
+            _sync_header()
+            self._refresh_tab_scroll_areas()
+
+        header_btn.clicked.connect(_toggle)
+        _sync_header()
+        inner.setVisible(expanded)
+        inner.setMaximumHeight(16777215 if expanded else 0)
+
+        return section, inner_layout
+
+    _ACT_DYN_CHANNEL_ROWS = (
+        ('tau_gimbal', 'Gimbal (th_p, th_r)'),
+        ('tau_thrust', 'Thrust'),
+        ('tau_yaw_torque', 'Yaw torque'),
+    )
+
+    def _create_actuator_dynamics_panel(self, parent_layout):
+        """Actuator lag and thrust quantization (numerical simulation only)."""
+        act_group = QGroupBox('Actuator dynamics')
+        act_layout = QVBoxLayout(act_group)
+        act_layout.setSpacing(4)
+
+        self.act_dyn_enable_cb = QCheckBox('Enable first-order actuator lag')
+        self.act_dyn_enable_cb.setToolTip(
+            'When enabled, TVC gimbal, thrust, and yaw torque follow a first-order lag\n'
+            'before entering the nonlinear dynamics model.'
         )
-        self.btn_start_tracking.clicked.connect(self.start_tracking_node)
-        self.btn_stop_tracking = QPushButton('Stop')
-        self.btn_stop_tracking.setToolTip('Terminate tvc_traj_player launch')
-        self.btn_stop_tracking.clicked.connect(self.stop_tracking_node)
-        self.btn_stop_tracking.setEnabled(False)
-        self.lbl_tracking_status = QLabel('Stopped')
-        self.lbl_tracking_status.setStyleSheet('color: #888;')
-        sim_layout.addWidget(QLabel('Tracking:'), 1, 0)
-        sim_layout.addWidget(self.btn_start_tracking, 1, 1)
-        sim_layout.addWidget(self.btn_stop_tracking, 1, 2)
-        sim_layout.addWidget(self.lbl_tracking_status, 1, 3)
+        self.act_dyn_enable_cb.stateChanged.connect(self._on_act_dyn_enable_changed)
+        act_layout.addWidget(self.act_dyn_enable_cb)
 
+        self.act_dyn_lag_detail = QWidget()
+        lag_layout = QVBoxLayout(self.act_dyn_lag_detail)
+        lag_layout.setContentsMargins(12, 0, 0, 0)
+        lag_layout.setSpacing(4)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(QLabel(''), 0, 0)
+        grid.addWidget(QLabel('τ [s]'), 0, 1)
+        grid.addWidget(QLabel('f_c [Hz]'), 0, 2)
+        self._act_dyn_tau_spins = {}
+        self._act_dyn_bw_spins = {}
+        for row, (key, label) in enumerate(self._ACT_DYN_CHANNEL_ROWS, start=1):
+            grid.addWidget(QLabel(label), row, 0)
+            tau_spin = QDoubleSpinBox()
+            tau_spin.setRange(TAU_MIN, TAU_MAX)
+            tau_spin.setDecimals(3)
+            tau_spin.setSingleStep(0.005)
+            tau_spin.valueChanged.connect(
+                lambda _v, k=key: self._on_act_dyn_tau_changed(k)
+            )
+            bw_spin = QDoubleSpinBox()
+            bw_spin.setRange(BW_MIN_HZ, BW_MAX_HZ)
+            bw_spin.setDecimals(2)
+            bw_spin.setSingleStep(0.1)
+            bw_spin.valueChanged.connect(
+                lambda _v, k=key: self._on_act_dyn_bw_changed(k)
+            )
+            grid.addWidget(tau_spin, row, 1)
+            grid.addWidget(bw_spin, row, 2)
+            self._act_dyn_tau_spins[key] = tau_spin
+            self._act_dyn_bw_spins[key] = bw_spin
+        lag_layout.addLayout(grid)
+        lag_hint = QLabel('τ and f_c are linked: τ = 1 / (2π f_c)')
+        lag_hint.setWordWrap(True)
+        lag_hint.setStyleSheet('color: #555;')
+        lag_layout.addWidget(lag_hint)
+        act_layout.addWidget(self.act_dyn_lag_detail)
+
+        self.act_thrust_quant_cb = QCheckBox('Thrust quantization (discrete steps)')
+        self.act_thrust_quant_cb.setToolTip(
+            'Round commanded thrust to the nearest multiple of the resolution.\n'
+            'Proxy ≈ 0.5 N; real platform ≈ 10 N (adjustable).'
+        )
+        self.act_thrust_quant_cb.stateChanged.connect(self._on_act_thrust_quant_changed)
+        act_layout.addWidget(self.act_thrust_quant_cb)
+
+        res_row = QHBoxLayout()
+        res_row.setContentsMargins(12, 0, 0, 0)
+        res_row.addWidget(QLabel('Thrust resolution [N]:'))
+        self.act_thrust_resolution_spin = QDoubleSpinBox()
+        self.act_thrust_resolution_spin.setRange(THRUST_RES_MIN, THRUST_RES_MAX)
+        self.act_thrust_resolution_spin.setDecimals(2)
+        self.act_thrust_resolution_spin.setSingleStep(0.1)
+        self.act_thrust_resolution_spin.setToolTip(
+            'Smallest thrust increment after quantization (0 = continuous).'
+        )
+        self.act_thrust_resolution_spin.valueChanged.connect(self._on_act_thrust_resolution_changed)
+        res_row.addWidget(self.act_thrust_resolution_spin)
+        res_row.addStretch(1)
+        act_layout.addLayout(res_row)
+
+        parent_layout.addWidget(act_group)
+
+        self._act_dyn_updating = False
+        plat = self._current_rocket_platform_id() if hasattr(self, 'rocket_proxy_radio') else None
+        self._apply_actuator_config(
+            self._tracking_config.setdefault(
+                'actuator', default_actuator_tracking_config(plat),
+            )
+        )
+
+    def _on_act_dyn_enable_changed(self, _state=None):
+        enabled = self.act_dyn_enable_cb.isChecked()
+        self.act_dyn_lag_detail.setEnabled(enabled)
+        self.act_dyn_lag_detail.setVisible(enabled)
+        self._store_actuator_config()
+        self._refresh_tab_scroll_areas()
+
+    def _on_act_thrust_quant_changed(self, _state=None):
+        on = self.act_thrust_quant_cb.isChecked()
+        self.act_thrust_resolution_spin.setEnabled(on)
+        self._store_actuator_config()
+        self._refresh_tab_scroll_areas()
+
+    def _on_act_thrust_resolution_changed(self, _value=None):
+        if self._act_dyn_updating:
+            return
+        act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
+        act['thrust_resolution_N'] = float(self.act_thrust_resolution_spin.value())
+
+    def _on_act_dyn_tau_changed(self, key):
+        if self._act_dyn_updating:
+            return
+        tau_spin = self._act_dyn_tau_spins.get(key)
+        bw_spin = self._act_dyn_bw_spins.get(key)
+        if tau_spin is None or bw_spin is None:
+            return
+        tau = float(tau_spin.value())
+        act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
+        act[key] = tau
+        self._act_dyn_updating = True
+        bw_spin.setValue(tau_to_bandwidth_hz(tau))
+        self._act_dyn_updating = False
+
+    def _on_act_dyn_bw_changed(self, key):
+        if self._act_dyn_updating:
+            return
+        tau_spin = self._act_dyn_tau_spins.get(key)
+        bw_spin = self._act_dyn_bw_spins.get(key)
+        if tau_spin is None or bw_spin is None:
+            return
+        tau = bandwidth_hz_to_tau(float(bw_spin.value()))
+        act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
+        act[key] = tau
+        self._act_dyn_updating = True
+        tau_spin.setValue(tau)
+        self._act_dyn_updating = False
+
+    def _refresh_act_dyn_spins(self):
+        if not hasattr(self, '_act_dyn_tau_spins'):
+            return
+        self._act_dyn_updating = True
+        act = self._tracking_config.get('actuator') or default_actuator_tracking_config()
+        for key, tau_spin in self._act_dyn_tau_spins.items():
+            tau = float(act.get(key, 0.05))
+            bw_spin = self._act_dyn_bw_spins[key]
+            tau_spin.setValue(tau)
+            bw_spin.setValue(tau_to_bandwidth_hz(tau))
+        self._act_dyn_updating = False
+
+    def _store_actuator_config(self):
+        if not hasattr(self, 'act_dyn_enable_cb'):
+            return
+        act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
+        act['enabled'] = self.act_dyn_enable_cb.isChecked()
+        act['thrust_quant_enabled'] = self.act_thrust_quant_cb.isChecked()
+        act['thrust_resolution_N'] = float(self.act_thrust_resolution_spin.value())
+        for key, tau_spin in self._act_dyn_tau_spins.items():
+            act[key] = float(tau_spin.value())
+
+    def _apply_actuator_config(self, cfg=None):
+        if not hasattr(self, 'act_dyn_enable_cb'):
+            return
+        plat = self._current_rocket_platform_id() if hasattr(self, 'rocket_proxy_radio') else None
+        defaults = default_actuator_tracking_config(plat)
+        raw = dict(cfg or defaults)
+        act = default_actuator_tracking_config(plat)
+        act['enabled'] = bool(raw.get('enabled', False))
+        act['thrust_quant_enabled'] = bool(raw.get(
+            'thrust_quant_enabled', raw.get('thrust_quant_enable', False),
+        ))
+        if 'thrust_resolution_N' in raw:
+            act['thrust_resolution_N'] = float(raw['thrust_resolution_N'])
+        else:
+            act['thrust_resolution_N'] = default_thrust_quantization_resolution(plat or 'proxy')
+        act['tau_gimbal'] = float(raw.get('tau_gimbal', 0.05))
+        act['tau_thrust'] = float(raw.get('tau_thrust', 0.05))
+        act['tau_yaw_torque'] = float(raw.get('tau_yaw_torque', 0.05))
+        self._tracking_config['actuator'] = act
+        self._act_dyn_updating = True
+        self.act_dyn_enable_cb.setChecked(act['enabled'])
+        self.act_thrust_quant_cb.setChecked(act['thrust_quant_enabled'])
+        self.act_thrust_resolution_spin.setValue(act['thrust_resolution_N'])
+        self._act_dyn_updating = False
+        self._refresh_act_dyn_spins()
+        self.act_dyn_lag_detail.setEnabled(act['enabled'])
+        self.act_dyn_lag_detail.setVisible(act['enabled'])
+        self.act_thrust_resolution_spin.setEnabled(act['thrust_quant_enabled'])
+
+    def _actuator_params_for_sim(self):
+        act = self._tracking_config.get('actuator') or default_actuator_tracking_config()
+        return {
+            'act_dyn_enable': bool(act.get('enabled', False)),
+            'thrust_quant_enable': bool(act.get('thrust_quant_enabled', False)),
+            'thrust_resolution_N': float(act.get('thrust_resolution_N', 0.5)),
+            'tau_gimbal': float(act.get('tau_gimbal', 0.05)),
+            'tau_thrust': float(act.get('tau_thrust', 0.05)),
+            'tau_yaw_torque': float(act.get('tau_yaw_torque', 0.05)),
+        }
+
+    def _migrate_actuator_from_controller_params(self, cfg):
+        """Lift legacy per-controller actuator keys into top-level actuator block."""
+        if cfg.get('actuator'):
+            return cfg.get('actuator')
+        params_map = cfg.get('params') or {}
+        for _cid, raw in params_map.items():
+            if not isinstance(raw, dict):
+                continue
+            if not any(k in raw for k in (
+                'act_dyn_enable', 'act_dyn_gimbal', 'act_dyn_thrust', 'act_dyn_yaw', 'tau_gimbal',
+            )):
+                continue
+            act = default_actuator_tracking_config()
+            act['enabled'] = bool(raw.get(
+                'act_dyn_enable',
+                any(raw.get(k) for k in ('act_dyn_gimbal', 'act_dyn_thrust', 'act_dyn_yaw')),
+            ))
+            act['tau_gimbal'] = float(raw.get('tau_gimbal', 0.05))
+            act['tau_thrust'] = float(raw.get('tau_thrust', 0.05))
+            act['tau_yaw_torque'] = float(raw.get('tau_yaw_torque', 0.05))
+            return act
+        return default_actuator_tracking_config()
+
+    def _create_numerical_sim_timing_panel(self, parent_layout):
+        """Plant step and controller rate for numerical closed-loop simulation."""
+        self.numerical_sim_group = QGroupBox('Numerical simulation timing')
+        grid = QGridLayout(self.numerical_sim_group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+
+        self.num_sim_dt_spin = QDoubleSpinBox()
+        self.num_sim_dt_spin.setRange(0.001, 0.05)
+        self.num_sim_dt_spin.setDecimals(4)
+        self.num_sim_dt_spin.setSingleStep(0.001)
+        self.num_sim_dt_spin.setToolTip(
+            'Plant integration step [s]. Smaller values improve accuracy for fast dynamics.'
+        )
+        self.num_sim_dt_spin.valueChanged.connect(self._on_numerical_sim_timing_changed)
+
+        self.num_control_dt_spin = QDoubleSpinBox()
+        self.num_control_dt_spin.setRange(0.005, 0.2)
+        self.num_control_dt_spin.setDecimals(4)
+        self.num_control_dt_spin.setSingleStep(0.005)
+        self.num_control_dt_spin.setToolTip(
+            'Controller update period [s] (zero-order hold between updates).'
+        )
+        self.num_control_dt_spin.valueChanged.connect(self._on_numerical_sim_timing_changed)
+
+        self.lbl_num_control_hz = QLabel()
+        self.lbl_num_control_hz.setStyleSheet('color: #555;')
+        self.lbl_num_substeps = QLabel()
+        self.lbl_num_substeps.setStyleSheet('color: #555;')
+
+        grid.addWidget(QLabel('Plant step sim_dt [s]:'), 0, 0)
+        grid.addWidget(self.num_sim_dt_spin, 0, 1)
+        grid.addWidget(QLabel('Control period [s]:'), 1, 0)
+        grid.addWidget(self.num_control_dt_spin, 1, 1)
+        grid.addWidget(self.lbl_num_control_hz, 2, 0, 1, 2)
+        grid.addWidget(self.lbl_num_substeps, 3, 0, 1, 2)
+
+        parent_layout.addWidget(self.numerical_sim_group)
+        self._apply_numerical_sim_config(
+            self._tracking_config.get('numerical_sim') or default_numerical_sim_config(),
+        )
+
+    def _on_numerical_sim_timing_changed(self, _value=None):
+        if getattr(self, '_num_sim_timing_guard', False):
+            return
+        sim_dt = float(self.num_sim_dt_spin.value())
+        control_dt = float(self.num_control_dt_spin.value())
+        if control_dt < sim_dt:
+            self._num_sim_timing_guard = True
+            self.num_control_dt_spin.setValue(sim_dt)
+            self._num_sim_timing_guard = False
+            control_dt = sim_dt
+        ratio = max(1, int(round(control_dt / sim_dt)))
+        aligned_control_dt = ratio * sim_dt
+        if abs(aligned_control_dt - control_dt) > 1e-9:
+            self._num_sim_timing_guard = True
+            self.num_control_dt_spin.setValue(aligned_control_dt)
+            self._num_sim_timing_guard = False
+            control_dt = aligned_control_dt
+        hz = 1.0 / control_dt if control_dt > 0 else 0.0
+        self.lbl_num_control_hz.setText(f'Control rate: {hz:.1f} Hz')
+        self.lbl_num_substeps.setText(
+            f'Plant substeps per control update: {ratio}'
+        )
+        self._tracking_config['numerical_sim'] = {
+            'sim_dt': sim_dt,
+            'control_dt': control_dt,
+        }
+
+    def _store_numerical_sim_config(self):
+        if not hasattr(self, 'num_sim_dt_spin'):
+            return
+        self._on_numerical_sim_timing_changed()
+
+    def _apply_numerical_sim_config(self, cfg):
+        if not hasattr(self, 'num_sim_dt_spin'):
+            return
+        cfg = dict(cfg or default_numerical_sim_config())
+        self._num_sim_timing_guard = True
+        self.num_sim_dt_spin.setValue(float(cfg.get('sim_dt', 0.005)))
+        self.num_control_dt_spin.setValue(float(cfg.get('control_dt', 0.02)))
+        self._num_sim_timing_guard = False
+        self._tracking_config['numerical_sim'] = {
+            'sim_dt': float(self.num_sim_dt_spin.value()),
+            'control_dt': float(self.num_control_dt_spin.value()),
+        }
+        self._on_numerical_sim_timing_changed()
+
+    def _numerical_sim_params_for_sim(self):
+        cfg = self._tracking_config.get('numerical_sim') or default_numerical_sim_config()
+        return {
+            'sim_dt': float(cfg.get('sim_dt', 0.005)),
+            'control_dt': float(cfg.get('control_dt', 0.02)),
+        }
+
+    def _migrate_numerical_sim_from_controller_params(self, cfg):
+        return migrate_numerical_sim_config(cfg)
+
+    def _create_px4_cascade_tune_panel(self, parent_layout):
+        """Step-response tuning for isolated PX4 cascade levels."""
+        self.px4_tune_group, tune_outer = self._make_collapsible_group(
+            'PX4 cascade tuning (step response)',
+            parent_layout,
+            expanded=False,
+        )
+        self.px4_tune_group.setToolTip(
+            'Click the section title (▸/▾) to expand or collapse cascade step-response tuning.'
+        )
+
+        level_row = QGridLayout()
+        self.px4_tune_level_combo = QComboBox()
+        for level in TUNE_LEVELS:
+            self.px4_tune_level_combo.addItem(TUNE_LEVEL_LABELS[level], level)
+        self.px4_tune_level_combo.currentIndexChanged.connect(self._on_px4_tune_level_changed)
+        level_row.addWidget(QLabel('Tune level:'), 0, 0)
+        level_row.addWidget(self.px4_tune_level_combo, 0, 1)
+
+        self.px4_tune_duration = QDoubleSpinBox()
+        self.px4_tune_duration.setRange(0.5, 60.0)
+        self.px4_tune_duration.setDecimals(1)
+        self.px4_tune_duration.setSingleStep(0.5)
+        self.px4_tune_duration.setValue(5.0)
+        self.px4_tune_duration.setToolTip('Simulation duration for the step response.')
+        level_row.addWidget(QLabel('Duration [s]:'), 1, 0)
+        level_row.addWidget(self.px4_tune_duration, 1, 1)
+        tune_outer.addLayout(level_row)
+
+        self.px4_tune_sp_stack = QStackedWidget()
+        self._px4_tune_sp_widgets = {}
+        sp_defs = {
+            'rate': [
+                ('p_deg_s', 'Roll rate p [deg/s]', 20.0, -180.0, 180.0),
+                ('q_deg_s', 'Pitch rate q [deg/s]', 0.0, -180.0, 180.0),
+                ('r_deg_s', 'Yaw rate r [deg/s]', 0.0, -180.0, 180.0),
+            ],
+            'attitude': [
+                ('roll_deg', 'Roll [deg]', 5.0, -45.0, 45.0),
+                ('pitch_deg', 'Pitch [deg]', 0.0, -45.0, 45.0),
+                ('yaw_deg', 'Yaw [deg]', 0.0, -180.0, 180.0),
+            ],
+            'velocity': [
+                ('vx', 'Vx [m/s]', 0.0, -5.0, 5.0),
+                ('vy', 'Vy [m/s]', 0.0, -5.0, 5.0),
+                ('vz', 'Vz [m/s]', 0.0, -3.0, 3.0),
+                ('yaw_deg', 'Yaw hold [deg]', 0.0, -180.0, 180.0),
+            ],
+            'position': [
+                ('x', 'X [m]', 0.5, -5.0, 5.0),
+                ('y', 'Y [m]', 0.0, -5.0, 5.0),
+                ('z', 'Z [m]', 0.2, -3.0, 3.0),
+                ('yaw_deg', 'Yaw hold [deg]', 0.0, -180.0, 180.0),
+            ],
+        }
+        defaults = default_px4_tune_config()['setpoints']
+        for level in TUNE_LEVELS:
+            page = QWidget()
+            grid = QGridLayout(page)
+            grid.setContentsMargins(0, 0, 0, 0)
+            self._px4_tune_sp_widgets[level] = {}
+            for row, (key, label, default, min_v, max_v) in enumerate(sp_defs[level]):
+                grid.addWidget(QLabel(label), row, 0)
+                spin = QDoubleSpinBox()
+                spin.setRange(min_v, max_v)
+                spin.setDecimals(2)
+                spin.setSingleStep(0.1)
+                spin.setValue(float(defaults.get(level, {}).get(key, default)))
+                grid.addWidget(spin, row, 1)
+                self._px4_tune_sp_widgets[level][key] = spin
+            self.px4_tune_sp_stack.addWidget(page)
+        tune_outer.addWidget(self.px4_tune_sp_stack)
+
+        self.btn_run_px4_tune = QPushButton('Run cascade tune sim')
+        self.btn_run_px4_tune.setToolTip(
+            'Hover step response at the selected cascade level.\n'
+            'Outer loops are bypassed; only the active level and inner loops run.'
+        )
+        self.btn_run_px4_tune.clicked.connect(self.run_px4_cascade_tune_sim)
+        tune_outer.addWidget(self.btn_run_px4_tune)
+
+        self.lbl_px4_tune_result = QLabel(
+            'Tune: rate → attitude → velocity → position. '
+            'States tab shows dashed cmd = inner-loop setpoints.'
+        )
+        self.lbl_px4_tune_result.setWordWrap(True)
+        self.lbl_px4_tune_result.setStyleSheet('color: #555;')
+        tune_outer.addWidget(self.lbl_px4_tune_result)
+
+    def _update_px4_tune_visibility(self):
+        if not hasattr(self, 'px4_tune_group'):
+            return
+        show = self._current_tracking_controller_id() == CONTROLLER_PX4
+        self.px4_tune_group.setVisible(show)
+        if hasattr(self, 'btn_run_px4_tune'):
+            sitl = hasattr(self, 'tracking_sim_sitl_radio') and self.tracking_sim_sitl_radio.isChecked()
+            self.btn_run_px4_tune.setEnabled(show and not sitl)
+        self._refresh_tab_scroll_areas()
+
+    def _on_px4_tune_level_changed(self, _index=None):
+        if not hasattr(self, 'px4_tune_sp_stack'):
+            return
+        idx = self.px4_tune_level_combo.currentIndex()
+        self.px4_tune_sp_stack.setCurrentIndex(idx)
+        level = self.px4_tune_level_combo.itemData(idx)
+        if level:
+            self._px4_tune_config['level'] = level
+
+    def _collect_px4_tune_config(self):
+        if not hasattr(self, 'px4_tune_level_combo'):
+            return dict(self._px4_tune_config)
+        level = self.px4_tune_level_combo.currentData()
+        setpoints = {}
+        for lvl in TUNE_LEVELS:
+            sp = {}
+            for key, widget in self._px4_tune_sp_widgets.get(lvl, {}).items():
+                sp[key] = float(widget.value())
+            setpoints[lvl] = sp
+        cfg = {
+            'level': level or TUNE_LEVELS[0],
+            'duration_s': float(self.px4_tune_duration.value()),
+            'setpoints': setpoints,
+        }
+        self._px4_tune_config = cfg
+        return cfg
+
+    def _apply_px4_tune_config(self, cfg):
+        if not cfg or not hasattr(self, 'px4_tune_level_combo'):
+            return
+        self._px4_tune_config = dict(cfg)
+        level = cfg.get('level', TUNE_LEVELS[0])
+        for i in range(self.px4_tune_level_combo.count()):
+            if self.px4_tune_level_combo.itemData(i) == level:
+                self.px4_tune_level_combo.setCurrentIndex(i)
+                break
+        self.px4_tune_duration.setValue(float(cfg.get('duration_s', 5.0)))
+        sp_map = cfg.get('setpoints') or {}
+        for lvl in TUNE_LEVELS:
+            sp = sp_map.get(lvl, {})
+            for key, widget in self._px4_tune_sp_widgets.get(lvl, {}).items():
+                if key in sp:
+                    widget.setValue(float(sp[key]))
+        self._on_px4_tune_level_changed()
+
+    def run_px4_cascade_tune_sim(self):
+        if self._current_tracking_controller_id() != CONTROLLER_PX4:
+            return
+        if self._px4_tune_sim_thread is not None and self._px4_tune_sim_thread.isRunning():
+            return
+        params = self._collect_tracking_params()
+        tune_config = self._collect_px4_tune_config()
+        self.btn_run_px4_tune.setEnabled(False)
+        self.lbl_px4_tune_result.setText('Running cascade tune simulation…')
+        self._px4_tune_sim_thread = Px4TuneSimulationThread(
+            params, self._physics_dict_for_tracking(), tune_config,
+        )
+        self._px4_tune_sim_thread.finished.connect(self._on_px4_tune_sim_finished)
+        self._px4_tune_sim_thread.error.connect(self._on_px4_tune_sim_error)
+        self._px4_tune_sim_thread.start()
+
+    def _on_px4_tune_sim_finished(self, result):
+        self._update_px4_tune_visibility()
+        self._last_tracking_result = result
+        summary = tracking_summary_text(result)
+        self.lbl_px4_tune_result.setText(summary)
+        self.lbl_tracking_result.setText(summary)
+        self.status_text.append(summary)
+        if self._display_panels_ready():
+            self._draw_tracking_plot_tabs(result)
+            if hasattr(self, 'plot_tabs'):
+                self.plot_tabs.setCurrentWidget(self._plot_tab_states)
+
+    def _on_px4_tune_sim_error(self, msg):
+        self._update_px4_tune_visibility()
+        self.lbl_px4_tune_result.setText('Cascade tune simulation failed.')
+        QMessageBox.critical(self, 'PX4 cascade tune error', msg)
+        self.status_text.append(f'PX4 tune error: {msg}')
+
+    def _create_tracking_panel(self):
+        """Build the Tracking sidebar tab (controllers, params, simulation)."""
+        tracking_tab = QWidget()
+        layout = QVBoxLayout(tracking_tab)
+        layout.setSpacing(4)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        src_group = QGroupBox('Trajectory source')
+        src_layout = QGridLayout()
         self.tracking_source_combo = QComboBox()
         self.tracking_source_combo.addItem('Current trajectory')
         self.tracking_source_combo.addItem('CSV file')
         self.tracking_source_combo.addItem('GUI waypoints')
         self.tracking_source_combo.setToolTip(
-            'Trajectory source for tvc_traj_player:\n'
-            'Current trajectory — CSV saved for the selected trajectory slot;\n'
+            'Reference for tracking:\n'
+            'Current trajectory — saved CSV for the active slot;\n'
             'CSV file — pick an existing trajectory CSV;\n'
-            'GUI waypoints — GotoSetpoint through current waypoint list.'
+            'GUI waypoints — GotoSetpoint through waypoint list (SITL only).'
         )
         self.tracking_source_combo.currentIndexChanged.connect(self._on_tracking_source_changed)
-        sim_layout.addWidget(QLabel('Track source:'), 2, 0)
-        sim_layout.addWidget(self.tracking_source_combo, 2, 1, 1, 3)
+        src_layout.addWidget(QLabel('Source:'), 0, 0)
+        src_layout.addWidget(self.tracking_source_combo, 0, 1, 1, 2)
 
         self.tracking_csv_widget = QWidget()
         tracking_csv_row = QHBoxLayout(self.tracking_csv_widget)
         tracking_csv_row.setContentsMargins(0, 0, 0, 0)
-        tracking_csv_row.setSpacing(4)
         self.tracking_csv_edit = QLineEdit()
         self.tracking_csv_edit.setPlaceholderText('Path to trajectory CSV')
         self.tracking_csv_edit.setText(DEFAULT_TRAJ_CSV_PATH)
@@ -2068,155 +2755,537 @@ class MainWindow(QMainWindow):
         self.tracking_csv_browse = QPushButton('Browse…')
         self.tracking_csv_browse.clicked.connect(self.browse_tracking_csv)
         tracking_csv_row.addWidget(self.tracking_csv_browse)
-        sim_layout.addWidget(self.tracking_csv_widget, 3, 0, 1, 4)
+        src_layout.addWidget(self.tracking_csv_widget, 1, 0, 1, 3)
         self.tracking_csv_widget.setVisible(False)
 
         self.lbl_tracking_source_info = QLabel()
         self.lbl_tracking_source_info.setWordWrap(True)
         self.lbl_tracking_source_info.setStyleSheet('color: #555;')
-        sim_layout.addWidget(self.lbl_tracking_source_info, 4, 0, 1, 4)
+        src_layout.addWidget(self.lbl_tracking_source_info, 2, 0, 1, 3)
+        src_group.setLayout(src_layout)
+        layout.addWidget(src_group)
 
-        self.btn_clear_rviz_traj = QPushButton('Clear executed path')
-        self.btn_clear_rviz_traj.setToolTip(
-            'Clear RViz executed setpoint trail (/tvc_traj_player/executed_path) and '
-            'current setpoint marker. Planned trajectory is kept; it is (re)loaded when '
-            'you start the tracking node.'
+        ctrl_group = QGroupBox('Controller')
+        ctrl_layout = QVBoxLayout()
+        self.tracking_controller_combo = QComboBox()
+        for cid in CONTROLLER_IDS:
+            self.tracking_controller_combo.addItem(CONTROLLER_LABELS[cid], cid)
+        self.tracking_controller_combo.currentIndexChanged.connect(self._on_tracking_controller_changed)
+        ctrl_layout.addWidget(self.tracking_controller_combo)
+
+        sim_mode_row = QHBoxLayout()
+        self.tracking_sim_numerical_radio = QRadioButton('Numerical simulation')
+        self.tracking_sim_sitl_radio = QRadioButton('PX4 SITL')
+        self.tracking_sim_numerical_radio.setChecked(True)
+        self._tracking_sim_mode_group = QButtonGroup(self)
+        self._tracking_sim_mode_group.addButton(self.tracking_sim_numerical_radio, 0)
+        self._tracking_sim_mode_group.addButton(self.tracking_sim_sitl_radio, 1)
+        self._tracking_sim_mode_group.buttonClicked.connect(self._on_tracking_sim_mode_changed)
+        sim_mode_row.addWidget(self.tracking_sim_numerical_radio)
+        sim_mode_row.addWidget(self.tracking_sim_sitl_radio)
+        ctrl_layout.addLayout(sim_mode_row)
+        ctrl_group.setLayout(ctrl_layout)
+        layout.addWidget(ctrl_group)
+
+        self._create_numerical_sim_timing_panel(layout)
+
+        self._create_actuator_dynamics_panel(layout)
+
+        self.tracking_params_group, param_outer = self._make_collapsible_group(
+            'Controller parameters',
+            layout,
+            expanded=False,
         )
+        self.tracking_params_group.setToolTip(
+            'Click the section title (▸/▾) to expand or collapse controller gain and simulation settings.'
+        )
+        self.tracking_params_scroll = QScrollArea()
+        self.tracking_params_scroll.setWidgetResizable(True)
+        self.tracking_params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.tracking_params_scroll.setMinimumHeight(180)
+        self.tracking_params_scroll.setMaximumHeight(420)
+        self.tracking_params_grid_host = QWidget()
+        self.tracking_params_groups_layout = QVBoxLayout(self.tracking_params_grid_host)
+        self.tracking_params_groups_layout.setSpacing(6)
+        self.tracking_params_groups_layout.setContentsMargins(2, 2, 2, 2)
+        self.tracking_params_scroll.setWidget(self.tracking_params_grid_host)
+        param_outer.addWidget(self.tracking_params_scroll)
+
+        param_io = QHBoxLayout()
+        self.btn_save_tracking_params = QPushButton('Save params')
+        self.btn_save_tracking_params.setToolTip(
+            f'Save controller parameters to {DEFAULT_TRACKING_PARAMS_PATH}'
+        )
+        self.btn_save_tracking_params.clicked.connect(self.save_tracking_params)
+        self.btn_load_tracking_params = QPushButton('Load params…')
+        self.btn_load_tracking_params.clicked.connect(self.load_tracking_params)
+        param_io.addWidget(self.btn_save_tracking_params)
+        param_io.addWidget(self.btn_load_tracking_params)
+        param_outer.addLayout(param_io)
+
+        self.tracking_params_file_label = QLabel()
+        self.tracking_params_file_label.setWordWrap(True)
+        self.tracking_params_file_label.setStyleSheet('color: #555;')
+        param_outer.addWidget(self.tracking_params_file_label)
+
+        self._create_px4_cascade_tune_panel(layout)
+
+        run_group = QGroupBox('Run')
+        run_layout = QGridLayout()
+        self.btn_run_numerical_tracking = QPushButton('Run numerical sim')
+        self.btn_run_numerical_tracking.setToolTip(
+            'Closed-loop simulation on the nonlinear TVC dynamics model (same as '
+            'trajectory optimization) with the selected controller.'
+        )
+        self.btn_run_numerical_tracking.clicked.connect(self.run_numerical_tracking)
+        run_layout.addWidget(self.btn_run_numerical_tracking, 0, 0, 1, 2)
+
+        self.lbl_tracking_result = QLabel('No simulation yet.')
+        self.lbl_tracking_result.setWordWrap(True)
+        self.lbl_tracking_result.setStyleSheet('color: #555;')
+        run_layout.addWidget(self.lbl_tracking_result, 1, 0, 1, 2)
+
+        self.btn_start_px4_sitl = QPushButton('Start SITL')
+        self.btn_start_px4_sitl.setToolTip(
+            'Launch PX4 SITL + Gazebo. LQR controller is enabled when LQR is selected.'
+        )
+        self.btn_start_px4_sitl.clicked.connect(self.start_px4_sitl_for_tracking)
+        self.btn_stop_px4_sitl = QPushButton('Stop SITL')
+        self.btn_stop_px4_sitl.clicked.connect(self.stop_px4_sitl)
+        self.btn_stop_px4_sitl.setEnabled(False)
+        self.lbl_px4_sitl_status = QLabel('Stopped')
+        self.lbl_px4_sitl_status.setStyleSheet('color: #888;')
+        run_layout.addWidget(QLabel('PX4 SITL:'), 2, 0)
+        run_layout.addWidget(self.btn_start_px4_sitl, 2, 1)
+        run_layout.addWidget(self.btn_stop_px4_sitl, 3, 0)
+        run_layout.addWidget(self.lbl_px4_sitl_status, 3, 1)
+
+        self.btn_start_tracking = QPushButton('Start tracking')
+        self.btn_start_tracking.setToolTip('Launch tvc_traj_player with the selected trajectory source.')
+        self.btn_start_tracking.clicked.connect(self.start_tracking_node)
+        self.btn_stop_tracking = QPushButton('Stop tracking')
+        self.btn_stop_tracking.clicked.connect(self.stop_tracking_node)
+        self.btn_stop_tracking.setEnabled(False)
+        self.lbl_tracking_status = QLabel('Stopped')
+        self.lbl_tracking_status.setStyleSheet('color: #888;')
+        run_layout.addWidget(self.btn_start_tracking, 4, 0)
+        run_layout.addWidget(self.btn_stop_tracking, 4, 1)
+        run_layout.addWidget(self.lbl_tracking_status, 5, 0, 1, 2)
+
+        self.btn_clear_rviz_traj = QPushButton('Clear RViz executed path')
         self.btn_clear_rviz_traj.clicked.connect(
             lambda: self.clear_rviz_trajectory_display(quiet=False)
         )
-        sim_layout.addWidget(self.btn_clear_rviz_traj, 5, 0, 1, 4)
+        run_layout.addWidget(self.btn_clear_rviz_traj, 6, 0, 1, 2)
+        run_group.setLayout(run_layout)
+        layout.addWidget(run_group)
+
+        self._update_tracking_params_file_label()
+        self._rebuild_tracking_param_widgets()
+        self._apply_px4_tune_config(self._px4_tune_config)
+        self._update_px4_tune_visibility()
+        self._on_tracking_sim_mode_changed()
         self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
+        QTimer.singleShot(0, self._refresh_tab_scroll_areas)
+        return tracking_tab
 
-        sim_group.setLayout(sim_layout)
-        layout.addWidget(sim_group)
-
-        return traj_tab, params_tab
-    
     def create_display_panel(self):
-        """Create display panel - all states, controls and cost on one page"""
+        """Create tabbed plot area: Overview / States / 3D / Metrics."""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Create single canvas with all subplots. figsize is only used to
-        # set the figure's natural aspect ratio; the canvas is allowed to
-        # shrink below it so the whole window can stay within the screen.
+        fig_actions = QHBoxLayout()
+        self.btn_save_figure = QPushButton('Save figure…')
+        self.btn_save_figure.setToolTip('Export the active plot tab (PNG, PDF, or SVG)')
+        self.btn_save_figure.clicked.connect(self.save_figure)
+        self.btn_save_figure.setMaximumHeight(30)
+        fig_actions.addWidget(self.btn_save_figure)
+        fig_actions.addStretch(1)
+        layout.addLayout(fig_actions)
+
+        self.plot_tabs = QTabWidget()
+        self.plot_tabs.setDocumentMode(True)
+
+        # ── Tab 1: Overview (planning results, unchanged layout) ──
         self.fig = Figure(figsize=(12, 7))
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.canvas.setMinimumSize(400, 300)
+        self.canvas.setMinimumSize(280, 220)
         gs = GridSpec(
-            4, 4, figure=self.fig, height_ratios=[0.28, 1.0, 1.0, 1.0],
-            hspace=0.38, wspace=0.3,
+            4, 4, figure=self.fig, height_ratios=[0.22, 1.0, 1.0, 1.0],
+            hspace=0.32, wspace=0.26,
         )
-        self.fig.suptitle('TVC Rocket Trajectory Optimization', 
-                         fontsize=16, fontweight='bold', y=0.995)
-
+        self.fig._tvc_gridspec_pads = {
+            'left': 0.06, 'right': 0.98, 'top': 0.91, 'bottom': 0.06,
+            'hspace': 0.32, 'wspace': 0.26,
+        }
+        self.fig.suptitle(
+            'TVC Rocket Trajectory Optimization',
+            fontsize=13, fontweight='bold', y=0.97,
+        )
         self.ax_opt_info = self.fig.add_subplot(gs[0, :])
         self.ax_opt_info.axis('off')
-        
-        # Second row: 3D trajectory and convergence curve
-        # 1. 3D position trajectory (occupies 2 positions)
         self.ax_3d = self.fig.add_subplot(gs[1, 0:2], projection='3d')
         self.ax_3d.set_xlabel('X (m)', fontsize=10)
         self.ax_3d.set_ylabel('Y (m)', fontsize=10)
         self.ax_3d.set_zlabel('Z (m)', fontsize=10)
         self.ax_3d.set_title('3D Position Trajectory', fontsize=11, fontweight='bold')
         self.ax_3d.grid(True, alpha=0.3)
-        
-        # 2. Cost convergence curve (occupies 2 positions)
         self.ax_cost = self.fig.add_subplot(gs[1, 2:4])
         self.ax_cost.set_xlabel('Iteration', fontsize=10)
         self.ax_cost.set_ylabel('Cost (log scale)', fontsize=10)
         self.ax_cost.set_title('Optimization Cost Convergence', fontsize=11, fontweight='bold')
         self.ax_cost.grid(True, alpha=0.3)
-        
-        # Third row: position states
-        # 3. Position
         self.ax_pos = self.fig.add_subplot(gs[2, 0])
         self.ax_pos.set_xlabel('Time (s)', fontsize=9)
         self.ax_pos.set_ylabel('Position (m)', fontsize=9)
         self.ax_pos.set_title('Position', fontsize=10, fontweight='bold')
         self.ax_pos.grid(True, alpha=0.3)
-        
-        # 4. Velocity
         self.ax_vel = self.fig.add_subplot(gs[2, 1])
         self.ax_vel.set_xlabel('Time (s)', fontsize=9)
         self.ax_vel.set_ylabel('Velocity (m/s)', fontsize=9)
         self.ax_vel.set_title('Linear Velocity', fontsize=10, fontweight='bold')
         self.ax_vel.grid(True, alpha=0.3)
-        
-        # 5. Euler angles (left of angular velocity)
         self.ax_euler = self.fig.add_subplot(gs[2, 2])
         self.ax_euler.set_xlabel('Time (s)', fontsize=9)
         self.ax_euler.set_ylabel('Euler Angles (deg)', fontsize=9)
         self.ax_euler.set_title('Attitude (Euler)', fontsize=10, fontweight='bold')
         self.ax_euler.grid(True, alpha=0.3)
-        
-        # 6. Angular velocity
         self.ax_angvel = self.fig.add_subplot(gs[2, 3])
         self.ax_angvel.set_xlabel('Time (s)', fontsize=9)
         self.ax_angvel.set_ylabel('Angular Vel (°/s)', fontsize=9)
         self.ax_angvel.set_title('Angular Velocity', fontsize=10, fontweight='bold')
         self.ax_angvel.grid(True, alpha=0.3)
-        
-        # Fourth row: control inputs
-        # 7. TVC Pitch angle
         self.ax_pitch = self.fig.add_subplot(gs[3, 0])
         self.ax_pitch.set_xlabel('Time (s)', fontsize=9)
         self.ax_pitch.set_ylabel('Angle (deg)', fontsize=9)
         self.ax_pitch.set_title('TVC Pitch Angle', fontsize=10, fontweight='bold')
         self.ax_pitch.grid(True, alpha=0.3)
-        
-        # 8. TVC Roll angle
         self.ax_roll = self.fig.add_subplot(gs[3, 1])
         self.ax_roll.set_xlabel('Time (s)', fontsize=9)
         self.ax_roll.set_ylabel('Angle (deg)', fontsize=9)
         self.ax_roll.set_title('TVC Roll Angle', fontsize=10, fontweight='bold')
         self.ax_roll.grid(True, alpha=0.3)
-        
-        # 9. Thrust
         self.ax_thrust = self.fig.add_subplot(gs[3, 2])
         self.ax_thrust.set_xlabel('Time (s)', fontsize=9)
         self.ax_thrust.set_ylabel('Thrust (N)', fontsize=9)
         self.ax_thrust.set_title('Thrust', fontsize=10, fontweight='bold')
         self.ax_thrust.grid(True, alpha=0.3)
-        
-        # 10. Yaw torque
         self.ax_yaw = self.fig.add_subplot(gs[3, 3])
         self.ax_yaw.set_xlabel('Time (s)', fontsize=9)
         self.ax_yaw.set_ylabel('Torque (N·m)', fontsize=9)
         self.ax_yaw.set_title('Yaw Torque', fontsize=10, fontweight='bold')
         self.ax_yaw.grid(True, alpha=0.3)
 
-        fig_actions = QHBoxLayout()
-        self.btn_save_figure = QPushButton('Save figure…')
-        self.btn_save_figure.setToolTip('Export the full plot grid (PNG, PDF, or SVG)')
-        self.btn_save_figure.clicked.connect(self.save_figure)
-        self.btn_save_figure.setMaximumHeight(30)
-        fig_actions.addWidget(self.btn_save_figure)
-        fig_actions.addStretch(1)
-        layout.addLayout(fig_actions)
-        layout.addWidget(self.canvas)
-        
-        # Data storage
+        overview_widget = QWidget()
+        overview_layout = QVBoxLayout(overview_widget)
+        overview_layout.setContentsMargins(0, 0, 0, 0)
+        overview_layout.addWidget(self.canvas)
+        install_responsive_canvas(
+            self.canvas, self.fig, base_width_px=1100, base_height_px=700,
+            layout_mode='gridspec',
+        )
+        self.plot_tabs.addTab(overview_widget, 'Overview')
+
+        # ── Tab 2: States (4×2, tracking ref vs sim) ──
+        self.fig_states = Figure(figsize=(12, 8))
+        self.canvas_states = FigureCanvas(self.fig_states)
+        self.canvas_states.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_states.setMinimumSize(280, 220)
+        gs_s = GridSpec(4, 2, figure=self.fig_states, hspace=0.30, wspace=0.22)
+        self.fig_states._tvc_gridspec_pads = {
+            'left': 0.07, 'right': 0.98, 'top': 0.93, 'bottom': 0.06,
+            'hspace': 0.30, 'wspace': 0.22,
+        }
+        self.fig_states.suptitle('Tracking — States & Controls', fontsize=11, fontweight='bold', y=0.98)
+        self.ax_trk_pos = self.fig_states.add_subplot(gs_s[0, 0])
+        self.ax_trk_att = self.fig_states.add_subplot(gs_s[0, 1])
+        self.ax_trk_vel = self.fig_states.add_subplot(gs_s[1, 0])
+        self.ax_trk_angvel = self.fig_states.add_subplot(gs_s[1, 1])
+        self.ax_trk_acc = self.fig_states.add_subplot(gs_s[2, 0])
+        self.ax_trk_angacc = self.fig_states.add_subplot(gs_s[2, 1])
+        self.ax_trk_gimbal = self.fig_states.add_subplot(gs_s[3, 0])
+        self.ax_trk_thrust = self.fig_states.add_subplot(gs_s[3, 1])
+        states_widget = QWidget()
+        states_layout = QVBoxLayout(states_widget)
+        states_layout.setContentsMargins(0, 0, 0, 0)
+        states_layout.addWidget(self.canvas_states)
+        install_responsive_canvas(
+            self.canvas_states, self.fig_states, base_width_px=1100, base_height_px=900,
+            layout_mode='gridspec',
+        )
+        self._plot_tab_states = states_widget
+        self.plot_tabs.addTab(states_widget, 'States')
+
+        # ── Tab 3: 3D trajectory ──
+        self.fig_3d_tab = Figure(figsize=(10, 8))
+        self.canvas_3d_tab = FigureCanvas(self.fig_3d_tab)
+        self.canvas_3d_tab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_3d_tab.setMinimumSize(280, 220)
+        self.ax_3d_trk = self.fig_3d_tab.add_subplot(111, projection='3d')
+        tab3_widget = QWidget()
+        tab3_layout = QVBoxLayout(tab3_widget)
+        tab3_layout.setContentsMargins(0, 0, 0, 0)
+        tab3_layout.addWidget(self.canvas_3d_tab)
+        install_responsive_canvas(self.canvas_3d_tab, self.fig_3d_tab, base_width_px=900, base_height_px=700)
+        self.plot_tabs.addTab(tab3_widget, '3D Trajectory')
+
+        # ── Tab 4: 3D tracking GIF (attitude arrow animation) ──
+        gif_widget = QWidget()
+        gif_layout = QVBoxLayout(gif_widget)
+        gif_layout.setContentsMargins(4, 4, 4, 4)
+        self.tracking_gif_status = QLabel(
+            'Run numerical tracking simulation to generate the 3D animation.'
+        )
+        self.tracking_gif_status.setWordWrap(True)
+        self.tracking_gif_status.setStyleSheet('color: #555;')
+        gif_layout.addWidget(self.tracking_gif_status)
+        self.tracking_gif_label = QLabel()
+        self.tracking_gif_label.setAlignment(Qt.AlignCenter)
+        self.tracking_gif_label.setMinimumHeight(320)
+        self.tracking_gif_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tracking_gif_label.setScaledContents(False)
+        gif_layout.addWidget(self.tracking_gif_label, 1)
+        gif_btn_row = QHBoxLayout()
+        self.btn_save_tracking_gif = QPushButton('Save GIF…')
+        self.btn_save_tracking_gif.setEnabled(False)
+        self.btn_save_tracking_gif.clicked.connect(self.save_tracking_gif)
+        self.btn_regenerate_tracking_gif = QPushButton('Regenerate GIF')
+        self.btn_regenerate_tracking_gif.setToolTip(
+            'Rebuild animation from the latest numerical tracking result.'
+        )
+        self.btn_regenerate_tracking_gif.clicked.connect(self.regenerate_tracking_gif)
+        gif_btn_row.addWidget(self.btn_regenerate_tracking_gif)
+        gif_btn_row.addWidget(self.btn_save_tracking_gif)
+        gif_btn_row.addStretch(1)
+        gif_layout.addLayout(gif_btn_row)
+        self._plot_tab_gif = gif_widget
+        self.plot_tabs.addTab(gif_widget, '3D traj GIF')
+
+        # ── Tab 5: Optimization & tracking metrics ──
+        self.fig_metrics = Figure(figsize=(12, 7))
+        self.canvas_metrics = FigureCanvas(self.fig_metrics)
+        self.canvas_metrics.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_metrics.setMinimumSize(280, 220)
+        gs_m = GridSpec(2, 2, figure=self.fig_metrics, hspace=0.30, wspace=0.22)
+        self.fig_metrics._tvc_gridspec_pads = {
+            'left': 0.07, 'right': 0.98, 'top': 0.93, 'bottom': 0.08,
+            'hspace': 0.30, 'wspace': 0.22,
+        }
+        self.fig_metrics.suptitle('Optimization & Tracking Metrics', fontsize=11, fontweight='bold', y=0.98)
+        self.ax_metrics_cost = self.fig_metrics.add_subplot(gs_m[0, 0])
+        self.ax_metrics_pos_err = self.fig_metrics.add_subplot(gs_m[0, 1])
+        self.ax_metrics_vel_err = self.fig_metrics.add_subplot(gs_m[1, 0])
+        self.ax_metrics_info = self.fig_metrics.add_subplot(gs_m[1, 1])
+        self.ax_metrics_info.axis('off')
+        metrics_widget = QWidget()
+        metrics_layout = QVBoxLayout(metrics_widget)
+        metrics_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_layout.addWidget(self.canvas_metrics)
+        install_responsive_canvas(
+            self.canvas_metrics, self.fig_metrics, base_width_px=1100, base_height_px=700,
+            layout_mode='gridspec',
+        )
+        self.plot_tabs.addTab(metrics_widget, 'Metrics')
+
+        layout.addWidget(self.plot_tabs, 1)
+        self.plot_tabs.currentChanged.connect(lambda _i: self._refresh_all_plot_layouts())
+
         self.iterations = []
         self.costs = []
         self.stops = []
         self.current_xs = None
         self.current_us = None
-        # Multi-segment cost tracking
-        self.segment_costs = {}  # {segment_idx: [costs]}
-        self.segment_iterations = {}  # {segment_idx: [iterations]}
+        self.segment_costs = {}
+        self.segment_iterations = {}
+        self._last_tracking_result = None
         self.current_segment_idx = 0
         self._last_figure_save_path = ''
+        self._refresh_metrics_tab(opt_only=True)
         self._refresh_opt_info_display()
-
         return panel
 
+    def _active_plot_figure_and_canvas(self):
+        """Return (figure, canvas) for the currently selected plot tab."""
+        idx = self.plot_tabs.currentIndex() if hasattr(self, 'plot_tabs') else 0
+        mapping = (
+            (self.fig, self.canvas),
+            (self.fig_states, self.canvas_states),
+            (self.fig_3d_tab, self.canvas_3d_tab),
+            (None, None),  # GIF tab — no matplotlib figure
+            (self.fig_metrics, self.canvas_metrics),
+        )
+        if 0 <= idx < len(mapping):
+            fig, canvas = mapping[idx]
+            if fig is not None:
+                return fig, canvas
+        return self.fig, self.canvas
+
+    def _refresh_all_plot_layouts(self):
+        """Reflow matplotlib panels after window resize."""
+        pairs = (
+            (self.fig, self.canvas),
+            (self.fig_states, self.canvas_states),
+            (self.fig_3d_tab, self.canvas_3d_tab),
+            (self.fig_metrics, self.canvas_metrics),
+        )
+        for fig, canvas in pairs:
+            if fig is not None and canvas is not None:
+                apply_responsive_layout(fig, canvas)
+
+    def _cost_loggers_from_summary(self):
+        histories = (self.opt_summary or {}).get('segment_cost_histories') or []
+        if not histories:
+            return None
+        return [_SavedCostLogger(h) for h in histories]
+
+    def _refresh_metrics_tab(self, opt_only=False):
+        """Redraw Metrics tab (optimization cost + optional tracking errors)."""
+        if not hasattr(self, 'ax_metrics_cost'):
+            return
+        result = None if opt_only else getattr(self, '_last_tracking_result', None)
+        draw_tracking_metrics_panels(
+            tracking_metrics_axes_dict(self),
+            result,
+            self.opt_summary,
+            self._cost_loggers_from_summary(),
+        )
+        if hasattr(self, 'canvas_metrics'):
+            self.canvas_metrics.draw_idle()
+        self._refresh_all_plot_layouts()
+
+    def _draw_tracking_plot_tabs(self, result):
+        """Update States, 3D, and Metrics tabs after numerical tracking."""
+        plan = getattr(self, 'last_trajectory', None)
+        draw_tracking_state_panels(
+            tracking_state_axes_dict(self),
+            result,
+            plan,
+            quat_to_euler_fn=quat_to_euler,
+        )
+        draw_tracking_3d_panel(self.ax_3d_trk, result, plan)
+        draw_tracking_metrics_panels(
+            tracking_metrics_axes_dict(self),
+            result,
+            self.opt_summary,
+            self._cost_loggers_from_summary(),
+        )
+        self.canvas_states.draw_idle()
+        self.canvas_3d_tab.draw_idle()
+        self.canvas_metrics.draw_idle()
+        self._refresh_all_plot_layouts()
+        self._start_tracking_gif_generation(result)
+
+    def _start_tracking_gif_generation(self, result=None):
+        """Render 3D attitude GIF in a background thread."""
+        result = result or getattr(self, '_last_tracking_result', None)
+        if result is None:
+            return
+        if self._tracking_gif_thread is not None and self._tracking_gif_thread.isRunning():
+            return
+        plan = getattr(self, 'last_trajectory', None)
+        self.tracking_gif_status.setText('Generating 3D tracking GIF…')
+        self.btn_regenerate_tracking_gif.setEnabled(False)
+        self.btn_save_tracking_gif.setEnabled(False)
+        if self._tracking_gif_movie is not None:
+            self._tracking_gif_movie.stop()
+            self._tracking_gif_movie = None
+        self._tracking_gif_thread = TrackingGifThread(
+            result, plan, DEFAULT_TRACKING_GIF_PATH,
+        )
+        self._tracking_gif_thread.finished.connect(self._on_tracking_gif_finished)
+        self._tracking_gif_thread.error.connect(self._on_tracking_gif_error)
+        self._tracking_gif_thread.start()
+
+    def _update_tracking_gif_scaled_size(self):
+        movie = getattr(self, '_tracking_gif_movie', None)
+        label = getattr(self, 'tracking_gif_label', None)
+        if movie is None or label is None:
+            return
+        fw = movie.frameRect().width()
+        fh = movie.frameRect().height()
+        if fw <= 0 or fh <= 0:
+            return
+        lw, lh = label.width(), label.height()
+        if lw <= 0 or lh <= 0:
+            return
+        scale = min(lw / fw, lh / fh)
+        movie.setScaledSize(QSize(max(1, int(fw * scale)), max(1, int(fh * scale))))
+
+    def _display_tracking_gif(self, path):
+        if not path or not os.path.isfile(path):
+            self.tracking_gif_status.setText(f'GIF not found: {path}')
+            return
+        self._tracking_gif_path = os.path.abspath(path)
+        movie = QMovie(self._tracking_gif_path)
+        if movie.isValid():
+            if self._tracking_gif_movie is not None:
+                self._tracking_gif_movie.stop()
+            self._tracking_gif_movie = movie
+            self.tracking_gif_label.setMovie(self._tracking_gif_movie)
+            self._update_tracking_gif_scaled_size()
+            self._tracking_gif_movie.start()
+            self.tracking_gif_status.setText(
+                '3D tracking GIF — red: body +Z (nose), orange: thrust direction (length ∝ T)\n'
+                f'{self._tracking_gif_path}'
+            )
+            self.btn_save_tracking_gif.setEnabled(True)
+        else:
+            self.tracking_gif_status.setText(f'Could not load GIF: {path}')
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_tracking_gif_scaled_size()
+        self._refresh_all_plot_layouts()
+
+    def _on_tracking_gif_finished(self, path):
+        self.btn_regenerate_tracking_gif.setEnabled(True)
+        self._display_tracking_gif(path)
+        if hasattr(self, 'status_text'):
+            self.status_text.append(f'Tracking GIF saved: {path}')
+
+    def _on_tracking_gif_error(self, msg):
+        self.btn_regenerate_tracking_gif.setEnabled(True)
+        self.tracking_gif_status.setText('GIF generation failed.')
+        if hasattr(self, 'status_text'):
+            self.status_text.append(f'Tracking GIF error: {msg.splitlines()[0]}')
+
+    def regenerate_tracking_gif(self):
+        if getattr(self, '_last_tracking_result', None) is None:
+            QMessageBox.information(
+                self, 'No tracking result',
+                'Run numerical tracking simulation first.',
+            )
+            return
+        self._start_tracking_gif_generation(self._last_tracking_result)
+
+    def save_tracking_gif(self):
+        src = getattr(self, '_tracking_gif_path', None)
+        if not src or not os.path.isfile(src):
+            QMessageBox.warning(self, 'No GIF', 'Generate the tracking GIF first.')
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save tracking GIF', src, 'GIF (*.gif);;All files (*)',
+        )
+        if not path:
+            return
+        if not path.lower().endswith('.gif'):
+            path += '.gif'
+        try:
+            import shutil
+            shutil.copy2(src, path)
+            self.status_text.append(f'Saved tracking GIF to {path}')
+        except OSError as e:
+            QMessageBox.critical(self, 'Save failed', str(e))
+
     def save_figure(self):
-        """Save ``self.fig`` to disk via file dialog (PNG / PDF / SVG)."""
+        """Save the active plot tab figure to disk (or copy GIF on GIF tab)."""
+        if hasattr(self, 'plot_tabs') and self.plot_tabs.currentWidget() is getattr(
+            self, '_plot_tab_gif', None
+        ):
+            self.save_tracking_gif()
+            return
         start = self._last_figure_save_path or os.path.join(
             os.path.expanduser('~'), 'tvc_traj_opt_figure.png'
         )
@@ -2228,9 +3297,10 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        fig, canvas = self._active_plot_figure_and_canvas()
         try:
-            self.canvas.draw()
-            self.fig.savefig(path, dpi=150, bbox_inches='tight')
+            canvas.draw()
+            fig.savefig(path, dpi=150, bbox_inches='tight')
         except Exception as e:
             QMessageBox.critical(self, 'Save figure failed', str(e))
             return
@@ -2882,6 +3952,7 @@ class MainWindow(QMainWindow):
             )
         if hasattr(self, 'canvas'):
             self.canvas.draw_idle()
+            self._refresh_all_plot_layouts()
 
     def _clear_optimization_plots(self):
         """Clear trajectory / cost axes (keep titles)."""
@@ -3104,6 +4175,10 @@ class MainWindow(QMainWindow):
             segment_boundaries_override=traj.get('segment_boundary_indices'),
             time_states=traj.get('time_states'),
         )
+        draw_tracking_3d_panel(self.ax_3d_trk, self._last_tracking_result, traj)
+        if hasattr(self, 'canvas_3d_tab'):
+            self.canvas_3d_tab.draw_idle()
+        self._refresh_metrics_tab(opt_only=(self._last_tracking_result is None))
 
     def _try_restore_saved_optimization(
         self,
@@ -3532,6 +4607,7 @@ class MainWindow(QMainWindow):
             'r_thrust_z': self.r_thrust_z.value(),
             'min_time_T_min': self.min_time_T_min_spin.value(),
             'min_time_T_max_scale': self.min_time_T_max_scale_spin.value(),
+            'tracking': self._tracking_config_to_dict() if hasattr(self, 'tracking_controller_combo') else None,
         }
         if preset_id == TRAJECTORY_PRESET_CUSTOM:
             cfg['waypoints'] = waypoints_to_json_list(self.waypoints)
@@ -3622,6 +4698,9 @@ class MainWindow(QMainWindow):
                 _set_spin(sp, k)
             _set_spin(self.min_time_T_min_spin, 'min_time_T_min')
             _set_spin(self.min_time_T_max_scale_spin, 'min_time_T_max_scale')
+
+            if 'tracking' in cfg and cfg['tracking']:
+                self._apply_tracking_config(cfg['tracking'])
 
             if 'rocket_platform' in cfg:
                 pid = normalize_platform_id(cfg['rocket_platform'])
@@ -4046,6 +5125,7 @@ class MainWindow(QMainWindow):
            segment_boundaries_override=segment_boundaries_override,
            time_states=time_states)
         self.canvas.draw()
+        self._refresh_all_plot_layouts()
     
     def _bounds_display_from_widgets(self):
         """Same numeric limits as GUI constraint spin boxes (for shared plot style)."""
@@ -4100,6 +5180,7 @@ class MainWindow(QMainWindow):
         
         draw_cost_panel(self.ax_cost, all_loggers)
         self.canvas.draw()
+        self._refresh_metrics_tab(opt_only=True)
         
         # Update final state (us_actual: actuator model x[12:16] per shooting node, from Acados)
         u_act = timing_info.get("us_actual") if timing_info else None
@@ -4613,7 +5694,13 @@ class MainWindow(QMainWindow):
             self._traj_player_proc is not None and self._traj_player_proc.poll() is None
         )
         if hasattr(self, 'btn_start_px4_sitl'):
-            self.btn_start_px4_sitl.setEnabled(not tvc_running)
+            sitl = (
+                hasattr(self, 'tracking_sim_sitl_radio')
+                and self.tracking_sim_sitl_radio.isChecked()
+            )
+            cid = self._current_tracking_controller_id()
+            can_sitl = sitl and cid != CONTROLLER_MPC
+            self.btn_start_px4_sitl.setEnabled(can_sitl and not tvc_running)
             self.btn_stop_px4_sitl.setEnabled(tvc_running)
         if hasattr(self, 'lbl_px4_sitl_status'):
             if tvc_running:
@@ -4623,7 +5710,11 @@ class MainWindow(QMainWindow):
                 self.lbl_px4_sitl_status.setText('Stopped')
                 self.lbl_px4_sitl_status.setStyleSheet('color: #888;')
         if hasattr(self, 'btn_start_tracking'):
-            self.btn_start_tracking.setEnabled(not track_running)
+            sitl = (
+                hasattr(self, 'tracking_sim_sitl_radio')
+                and self.tracking_sim_sitl_radio.isChecked()
+            )
+            self.btn_start_tracking.setEnabled(sitl and not track_running)
             self.btn_stop_tracking.setEnabled(track_running)
         if hasattr(self, 'lbl_tracking_status'):
             if track_running:
@@ -4633,12 +5724,376 @@ class MainWindow(QMainWindow):
                 self.lbl_tracking_status.setText('Stopped')
                 self.lbl_tracking_status.setStyleSheet('color: #888;')
 
+    def _current_tracking_controller_id(self):
+        if not hasattr(self, 'tracking_controller_combo'):
+            return CONTROLLER_PX4
+        idx = self.tracking_controller_combo.currentIndex()
+        cid = self.tracking_controller_combo.itemData(idx)
+        return cid if cid else CONTROLLER_PX4
+
+    def _on_tracking_controller_changed(self, _index=None):
+        self._store_tracking_params_for_controller(self._tracking_config.get('controller'))
+        cid = self._current_tracking_controller_id()
+        self._tracking_config['controller'] = cid
+        self._rebuild_tracking_param_widgets()
+        self._update_px4_tune_visibility()
+        self._on_tracking_sim_mode_changed()
+
+    def _on_tracking_sim_mode_changed(self, _btn=None):
+        cid = self._current_tracking_controller_id()
+        sitl = hasattr(self, 'tracking_sim_sitl_radio') and self.tracking_sim_sitl_radio.isChecked()
+        self._tracking_config['sim_mode'] = SIM_SITL if sitl else SIM_NUMERICAL
+        if hasattr(self, 'btn_run_numerical_tracking'):
+            self.btn_run_numerical_tracking.setEnabled(not sitl)
+        if hasattr(self, 'numerical_sim_group'):
+            self.numerical_sim_group.setEnabled(not sitl)
+        self._update_px4_tune_visibility()
+        cid = self._current_tracking_controller_id()
+        if cid == CONTROLLER_MPC and sitl:
+            self.btn_start_px4_sitl.setToolTip(
+                'MPC tracking is available in numerical simulation only.'
+            )
+        elif cid == CONTROLLER_LQR:
+            self.btn_start_px4_sitl.setToolTip(
+                'Launch PX4 SITL with external LQR node (launch_controller:=true).'
+            )
+        else:
+            self.btn_start_px4_sitl.setToolTip(
+                'Launch PX4 SITL + Gazebo; trajectory player sends setpoints to PX4 cascade.'
+            )
+        self._refresh_sim_button_states()
+
+    def _store_tracking_params_for_controller(self, controller_id):
+        if not controller_id or controller_id not in CONTROLLER_IDS:
+            return
+        if controller_id not in self._tracking_config.setdefault('params', {}):
+            self._tracking_config['params'][controller_id] = default_params_for(controller_id)
+        stored = self._tracking_config['params'][controller_id]
+        for key, widget in self._tracking_param_widgets.items():
+            if isinstance(widget, QCheckBox):
+                stored[key] = widget.isChecked()
+            elif isinstance(widget, QSpinBox):
+                stored[key] = int(widget.value())
+            else:
+                stored[key] = float(widget.value())
+
+    def _collect_tracking_params(self):
+        cid = self._current_tracking_controller_id()
+        self._store_tracking_params_for_controller(cid)
+        self._store_actuator_config()
+        self._store_numerical_sim_config()
+        params = dict(self._tracking_config['params'].get(cid, default_params_for(cid)))
+        params.update(self._actuator_params_for_sim())
+        params.update(self._numerical_sim_params_for_sim())
+        return params
+
+    def _make_tracking_param_widget(self, spec, params, controller_id):
+        key = spec['key']
+        if spec.get('checkbox'):
+            w = QCheckBox()
+            w.setChecked(bool(params.get(key, spec['default'])))
+            if controller_id == CONTROLLER_PX4 and key == 'share_rp_gains':
+                w.stateChanged.connect(self._on_px4_share_rp_changed)
+        elif spec.get('integer'):
+            w = QSpinBox()
+            w.setRange(int(spec['min']), int(spec['max']))
+            w.setValue(int(params.get(key, spec['default'])))
+        else:
+            w = QDoubleSpinBox()
+            w.setRange(float(spec['min']), float(spec['max']))
+            w.setDecimals(int(spec.get('decimals', 3)))
+            w.setSingleStep(10 ** (-int(spec.get('decimals', 3))))
+            w.setValue(float(params.get(key, spec['default'])))
+        return w
+
+    def _populate_tracking_param_group(self, grid, specs, params, controller_id):
+        row = 0
+        col_slot = 0
+        for spec in specs:
+            key = spec['key']
+            if spec.get('full_width'):
+                if col_slot == 1:
+                    row += 1
+                    col_slot = 0
+                w = self._make_tracking_param_widget(spec, params, controller_id)
+                if spec.get('checkbox'):
+                    w.setText(spec['label'])
+                    grid.addWidget(w, row, 0, 1, 4)
+                else:
+                    grid.addWidget(QLabel(spec['label']), row, 0)
+                    grid.addWidget(w, row, 1, 1, 3)
+                self._tracking_param_widgets[key] = w
+                row += 1
+                continue
+
+            base_col = col_slot * 2
+            grid.addWidget(QLabel(spec['label']), row, base_col)
+            w = self._make_tracking_param_widget(spec, params, controller_id)
+            grid.addWidget(w, row, base_col + 1)
+            self._tracking_param_widgets[key] = w
+            if col_slot == 1:
+                row += 1
+                col_slot = 0
+            else:
+                col_slot = 1
+        if col_slot == 1:
+            row += 1
+        return row
+
+    def _rebuild_tracking_param_widgets(self):
+        if not hasattr(self, 'tracking_params_groups_layout'):
+            return
+        while self.tracking_params_groups_layout.count():
+            item = self.tracking_params_groups_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._tracking_param_widgets = {}
+
+        cid = self._current_tracking_controller_id()
+        params = self._tracking_config.setdefault('params', {}).setdefault(
+            cid, default_params_for(cid)
+        )
+        if cid == CONTROLLER_PX4:
+            params.update(migrate_px4_params(params))
+            self._tracking_config['params'][cid] = params
+        px4_extra = params if cid == CONTROLLER_PX4 else None
+        groups = param_groups_for(cid, px4_params=px4_extra)
+        for group in groups:
+            box = QGroupBox(group.get('title', 'Parameters'))
+            grid = QGridLayout(box)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(4)
+            self._populate_tracking_param_group(
+                grid, group.get('specs') or [], params, cid
+            )
+            self.tracking_params_groups_layout.addWidget(box)
+        self.tracking_params_groups_layout.addStretch(1)
+        QTimer.singleShot(0, self._refresh_tab_scroll_areas)
+
+    def _on_px4_share_rp_changed(self, _state=None):
+        if self._current_tracking_controller_id() != CONTROLLER_PX4:
+            return
+        self._store_tracking_params_for_controller(CONTROLLER_PX4)
+        self._rebuild_tracking_param_widgets()
+
+    def _tracking_config_to_dict(self):
+        self._store_tracking_params_for_controller(self._current_tracking_controller_id())
+        self._store_actuator_config()
+        self._store_numerical_sim_config()
+        out = {
+            'controller': self._current_tracking_controller_id(),
+            'sim_mode': (
+                SIM_SITL
+                if hasattr(self, 'tracking_sim_sitl_radio') and self.tracking_sim_sitl_radio.isChecked()
+                else SIM_NUMERICAL
+            ),
+            'numerical_sim': dict(
+                self._tracking_config.get('numerical_sim') or default_numerical_sim_config()
+            ),
+            'actuator': dict(self._tracking_config.get('actuator') or default_actuator_tracking_config()),
+            'params': dict(self._tracking_config.get('params', {})),
+        }
+        if hasattr(self, 'px4_tune_level_combo'):
+            out['px4_tune'] = self._collect_px4_tune_config()
+        return out
+
+    def _apply_tracking_config(self, cfg):
+        if not cfg:
+            return
+        params_map = cfg.get('params') or {}
+        for cid in CONTROLLER_IDS:
+            if cid in params_map:
+                raw = dict(params_map[cid])
+                if cid == CONTROLLER_PX4:
+                    raw = migrate_px4_params(raw)
+                self._tracking_config.setdefault('params', {})[cid] = raw
+        actuator_cfg = cfg.get('actuator') or self._migrate_actuator_from_controller_params(cfg)
+        self._tracking_config['actuator'] = dict(actuator_cfg)
+        numerical_cfg = cfg.get('numerical_sim') or self._migrate_numerical_sim_from_controller_params(cfg)
+        self._tracking_config['numerical_sim'] = dict(numerical_cfg)
+        controller = cfg.get('controller', CONTROLLER_PX4)
+        if hasattr(self, 'tracking_controller_combo'):
+            for i in range(self.tracking_controller_combo.count()):
+                if self.tracking_controller_combo.itemData(i) == controller:
+                    self.tracking_controller_combo.setCurrentIndex(i)
+                    break
+        sim_mode = cfg.get('sim_mode', SIM_NUMERICAL)
+        if hasattr(self, 'tracking_sim_numerical_radio'):
+            if sim_mode == SIM_SITL:
+                self.tracking_sim_sitl_radio.setChecked(True)
+            else:
+                self.tracking_sim_numerical_radio.setChecked(True)
+        self._tracking_config['controller'] = controller
+        self._rebuild_tracking_param_widgets()
+        self._apply_actuator_config(self._tracking_config.get('actuator'))
+        self._apply_numerical_sim_config(self._tracking_config.get('numerical_sim'))
+        if cfg.get('px4_tune'):
+            self._apply_px4_tune_config(cfg['px4_tune'])
+        self._update_px4_tune_visibility()
+        self._on_tracking_sim_mode_changed()
+
+    def _update_tracking_params_file_label(self):
+        if hasattr(self, 'tracking_params_file_label'):
+            self.tracking_params_file_label.setText(
+                f'Controller params file: {self.tracking_params_file_path}'
+            )
+
+    def save_tracking_params(self):
+        try:
+            with open(self.tracking_params_file_path, 'w', encoding='utf-8') as f:
+                json.dump(self._tracking_config_to_dict(), f, indent=2, ensure_ascii=False)
+            self.status_text.append(f'Saved tracking params to {self.tracking_params_file_path}')
+        except OSError as e:
+            QMessageBox.critical(self, 'Save failed', str(e))
+
+    def load_tracking_params(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load tracking parameters', self.tracking_params_file_path,
+            'JSON (*.json);;All files (*)',
+        )
+        if path:
+            self._load_tracking_params_from_path(path, quiet=False)
+
+    def _load_tracking_params_from_path(self, path, quiet=False):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+        except OSError as e:
+            if not quiet:
+                QMessageBox.critical(self, 'Load failed', str(e))
+            return
+        self._apply_tracking_config(cfg)
+        self.tracking_params_file_path = os.path.abspath(path)
+        self._update_tracking_params_file_label()
+        if not quiet:
+            self.status_text.append(f'Loaded tracking params from {path}')
+
+    def _physics_dict_for_tracking(self):
+        return {
+            'mass': self.mass.value(),
+            'Ixx': self.Ixx.value(),
+            'Iyy': self.Iyy.value(),
+            'Izz': self.Izz.value(),
+            'r_thrust_x': self.r_thrust_x.value(),
+            'r_thrust_y': self.r_thrust_y.value(),
+            'r_thrust_z': self.r_thrust_z.value(),
+            'g': 9.81,
+            'platform_id': self._current_rocket_platform_id(),
+        }
+
+    def _trajectory_arrays_for_tracking(self):
+        """Return (xs, us, time_states) from memory or CSV for numerical sim."""
+        source = self.tracking_source_combo.currentIndex() if hasattr(self, 'tracking_source_combo') else 0
+        if source == 1:
+            path = self.tracking_csv_edit.text().strip()
+            if not path or not os.path.isfile(path):
+                return None, None, None
+            return self._load_trajectory_arrays_from_csv(path)
+        traj = getattr(self, 'last_trajectory', None)
+        if traj and traj.get('xs') is not None:
+            return (
+                np.asarray(traj['xs'], dtype=float),
+                np.asarray(traj['us'], dtype=float) if traj.get('us') is not None else None,
+                np.asarray(traj['time_states'], dtype=float) if traj.get('time_states') is not None else None,
+            )
+        path = self._current_trajectory_csv_path()
+        if os.path.isfile(path):
+            return self._load_trajectory_arrays_from_csv(path)
+        return None, None, None
+
+    def _load_trajectory_arrays_from_csv(self, path):
+        """Minimal CSV loader for tracking (planner ENU format)."""
+        import csv
+        t_list, rows = [], []
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('#') or not line.strip():
+                    continue
+                if line.lower().startswith('t,'):
+                    header = [c.strip() for c in line.strip().split(',')]
+                    break
+            else:
+                return None, None, None
+            reader = csv.DictReader(f, fieldnames=header)
+            for row in reader:
+                try:
+                    t_list.append(float(row['t']))
+                    rows.append([
+                        float(row['x']), float(row['y']), float(row['z']),
+                        float(row['vx']), float(row['vy']), float(row['vz']),
+                        float(row['qw']), float(row['qx']), float(row['qy']), float(row['qz']),
+                        float(row['wx']), float(row['wy']), float(row['wz']),
+                    ])
+                except (KeyError, ValueError):
+                    continue
+        if not rows:
+            return None, None, None
+        xs = np.asarray(rows, dtype=float)
+        return xs, None, np.asarray(t_list, dtype=float)
+
+    def run_numerical_tracking(self):
+        xs, us, time_states = self._trajectory_arrays_for_tracking()
+        if xs is None:
+            QMessageBox.warning(
+                self, 'No trajectory',
+                'Optimize and save a trajectory first, or pick a valid CSV file.',
+            )
+            return
+        if self._tracking_sim_thread is not None and self._tracking_sim_thread.isRunning():
+            return
+        cid = self._current_tracking_controller_id()
+        params = self._collect_tracking_params()
+        self.btn_run_numerical_tracking.setEnabled(False)
+        self.lbl_tracking_result.setText('Running numerical simulation…')
+        self._tracking_sim_thread = TrackingSimulationThread(
+            xs, us, time_states, cid, params, self._physics_dict_for_tracking(),
+        )
+        self._tracking_sim_thread.finished.connect(self._on_tracking_sim_finished)
+        self._tracking_sim_thread.error.connect(self._on_tracking_sim_error)
+        self._tracking_sim_thread.start()
+
+    def _on_tracking_sim_finished(self, result):
+        self.btn_run_numerical_tracking.setEnabled(True)
+        self._last_tracking_result = result
+        summary = tracking_summary_text(result)
+        self.lbl_tracking_result.setText(summary)
+        self.status_text.append(summary)
+        if self._display_panels_ready():
+            self._draw_tracking_plot_tabs(result)
+            if hasattr(self, 'plot_tabs'):
+                self.plot_tabs.setCurrentWidget(self._plot_tab_states)
+
+    def _on_tracking_sim_error(self, msg):
+        self.btn_run_numerical_tracking.setEnabled(True)
+        self.lbl_tracking_result.setText('Simulation failed.')
+        QMessageBox.critical(self, 'Tracking simulation error', msg)
+        self.status_text.append(f'Tracking sim error: {msg}')
+
+    def start_px4_sitl_for_tracking(self):
+        """Start PX4 SITL with controller choice from Tracking tab."""
+        cid = self._current_tracking_controller_id()
+        if cid == CONTROLLER_MPC:
+            QMessageBox.information(
+                self, 'MPC SITL',
+                'Linear MPC is supported in numerical simulation only.\n'
+                'Switch to Numerical simulation or choose PX4 / LQR for SITL.',
+            )
+            return
+        self.start_px4_sitl()
+
     def _sitl_launch_extra_args(self):
-        """ROS launch overrides for the active rocket platform."""
+        """ROS launch overrides for the active rocket platform and tracking controller."""
         kw = sitl_launch_kwargs(self._current_rocket_platform_id())
         args = [self._launch_arg('rocket_platform', kw['rocket_platform'])]
-        if kw.get('launch_controller') is not None:
-            args.append(self._launch_arg('launch_controller', kw['launch_controller']))
+        launch_ctrl = kw.get('launch_controller')
+        cid = self._current_tracking_controller_id() if hasattr(self, 'tracking_controller_combo') else None
+        if cid == CONTROLLER_LQR:
+            launch_ctrl = 'true'
+        elif cid == CONTROLLER_PX4:
+            launch_ctrl = 'false'
+        if launch_ctrl is not None:
+            args.append(self._launch_arg('launch_controller', launch_ctrl))
         return args
 
     def start_px4_sitl(self):
@@ -4769,12 +6224,33 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
 
 
+def _load_app_icon():
+    """Load application window icon from assets/icon/rocket.jpg."""
+    if not os.path.isfile(APP_ICON_PATH):
+        return None
+    icon = QIcon(APP_ICON_PATH)
+    return icon if not icon.isNull() else None
+
+
+def _apply_app_icon(app=None, window=None):
+    """Set the rocket icon on the QApplication and/or main window."""
+    icon = _load_app_icon()
+    if icon is None:
+        return
+    if app is not None:
+        app.setWindowIcon(icon)
+    if window is not None:
+        window.setWindowIcon(icon)
+
+
 def run_gui(argv=None) -> int:
     """Create Qt application, show main window, run event loop."""
     if argv is not None:
         sys.argv = list(argv)
     app = QApplication(sys.argv)
+    _apply_app_icon(app=app)
     window = MainWindow()
+    _apply_app_icon(window=window)
     window.show()
     return int(app.exec_())
 
