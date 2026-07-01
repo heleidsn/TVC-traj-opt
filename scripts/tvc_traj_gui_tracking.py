@@ -78,6 +78,33 @@ def _align_control_hist(arr, n):
     return np.vstack([u, pad])
 
 
+def _align_cascade_series(arr, n, result=None):
+    """Match cascade setpoint history length to simulation time vector."""
+    if arr is None:
+        return None
+    a = np.asarray(arr, dtype=float)
+    if a.ndim == 1:
+        a = a.reshape(-1, 1)
+    if len(a) == n:
+        return a
+    if len(a) == 0:
+        return None
+    ratio = None
+    if result is not None:
+        sim_dt = float(result.get('sim_dt', 0.0) or 0.0)
+        control_dt = float(result.get('control_dt', 0.0) or 0.0)
+        if sim_dt > 0 and control_dt >= sim_dt:
+            ratio = max(1, int(round(control_dt / sim_dt)))
+    if ratio and ratio > 1 and len(a) * ratio >= n - ratio:
+        expanded = np.repeat(a, ratio, axis=0)
+        if len(expanded) >= n:
+            return expanded[:n]
+    if len(a) < n:
+        pad = np.repeat(a[-1:], n - len(a), axis=0)
+        return np.vstack([a, pad])
+    return a[:n]
+
+
 def _style_axis(ax, title, xlabel='Time (s)', ylabel=''):
     ax.set_title(title, fontsize=9, fontweight='bold', pad=2)
     ax.set_xlabel(xlabel, fontsize=8)
@@ -90,9 +117,12 @@ def _style_axis(ax, title, xlabel='Time (s)', ylabel=''):
 _SP_STYLE = dict(linestyle='-.', linewidth=1.5, alpha=0.9)
 
 
-def _plot_xyz(ax, t, ref_arr, sim_arr, ylabel, title, deg=False, cmd_arr=None, canvas_width_px=800):
+def _plot_xyz(ax, t, ref_arr, sim_arr, ylabel, title, deg=False, cmd_arr=None, canvas_width_px=800, result=None):
     """Plot plan (dotted), cascade setpoint (dash-dot), and simulation (solid)."""
     _style_axis(ax, title, ylabel=ylabel)
+    n = len(t)
+    if cmd_arr is not None:
+        cmd_arr = _align_cascade_series(cmd_arr, n, result)
     for i, c in enumerate(_COLORS):
         lbl = _LABELS3[i]
         r = ref_arr[:, i]
@@ -101,7 +131,7 @@ def _plot_xyz(ax, t, ref_arr, sim_arr, ylabel, title, deg=False, cmd_arr=None, c
             r = np.degrees(r) if ref_arr.shape[1] == 3 and np.max(np.abs(r)) < 10 else r
             s = np.degrees(s) if sim_arr.shape[1] == 3 and np.max(np.abs(s)) < 10 else s
         ax.plot(t, r, color=c, label=f'{lbl} plan', **_REF_STYLE)
-        if cmd_arr is not None and cmd_arr.shape[0] == len(t):
+        if cmd_arr is not None and cmd_arr.shape[0] == n:
             cmd_i = cmd_arr[:, i]
             if np.any(np.isfinite(cmd_i)):
                 if deg and cmd_arr.shape[1] == 3 and np.max(np.abs(cmd_i)) < 10:
@@ -200,9 +230,9 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
     cascade = result.get('cascade_sp')
     sp_vel = sp_att = sp_rate = None
     if cascade:
-        sp_vel = np.asarray(cascade.get('vel'), dtype=float)
-        sp_att = np.asarray(cascade.get('att_rad'), dtype=float)
-        sp_rate = np.asarray(cascade.get('rate_rad_s'), dtype=float)
+        sp_vel = _align_cascade_series(cascade.get('vel'), len(t), result)
+        sp_att = _align_cascade_series(cascade.get('att_rad'), len(t), result)
+        sp_rate = _align_cascade_series(cascade.get('rate_rad_s'), len(t), result)
 
     mapping = [
         ('ax_pos', x_ref[:, 0:3], x_sim[:, 0:3], 'Position (m)', 'Position', False, None),
@@ -210,8 +240,7 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
          np.degrees(sp_att) if sp_att is not None else None),
         ('ax_vel', x_ref[:, 3:6], x_sim[:, 3:6], 'Velocity (m/s)', 'Velocity', False, sp_vel),
         ('ax_angvel', np.degrees(x_ref[:, 9:12]), np.degrees(x_sim[:, 9:12]),
-         'Angular vel (°/s)', 'Angular velocity', False,
-         np.degrees(sp_rate) if sp_rate is not None else None),
+         'Angular vel (°/s)', 'Angular velocity', False, sp_rate),
         ('ax_acc', acc_ref, acc_sim, 'Acceleration (m/s²)', 'Acceleration', False, None),
         ('ax_angacc', angacc_ref, angacc_sim, 'Angular acc (rad/s²)', 'Angular acceleration', False, None),
     ]
@@ -222,7 +251,7 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
         ax.clear()
         _plot_xyz(
             ax, t, plan, sim, ylab, title, deg=deg, cmd_arr=cmd_arr,
-            canvas_width_px=width_px,
+            canvas_width_px=width_px, result=result,
         )
 
     ax_g = axes.get('ax_gimbal')
@@ -378,10 +407,8 @@ def draw_tracking_metrics_panels(axes, result, opt_summary=None, cost_loggers=No
 def _write_metrics_info(ax, result, opt_summary):
     lines = ['── Tracking ──']
     if result:
-        ff = 'yes' if result.get('use_feedforward') else 'no'
         lines.extend([
             f"Controller : {result.get('controller_id', '?')}",
-            f"Feedforward: {ff}",
             f"Duration   : {float(result['t'][-1] - result['t'][0]):.3f} s",
             f"Samples    : {len(result['t'])}",
             f"Max |Δp|   : {result['max_pos_err_m'] * 1000:.2f} mm",
@@ -424,9 +451,12 @@ def tracking_summary_text(result):
             f"PX4 cascade tune ({level}): duration {result.get('tune_duration_s', 0):.1f} s — "
             f"setpoints: {sp_txt}"
         )
-    ff = 'with FF' if result.get('use_feedforward') else 'no FF'
-    return (
-        f"Tracking ({result.get('controller_id', '?')}, {ff}): "
+    txt = (
+        f"Tracking ({result.get('controller_id', '?')}): "
         f"max |Δp| = {result['max_pos_err_m'] * 1000:.1f} mm, "
         f"RMSE = {result['rmse_pos_m'] * 1000:.1f} mm"
     )
+    r_scale = float(result.get('r_gimbal_scale', 1.0))
+    if r_scale > 1.5:
+        txt += f" (gimbal R ×{r_scale:.0f} for {result.get('platform_id', 'platform')} mass)"
+    return txt

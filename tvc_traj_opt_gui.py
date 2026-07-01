@@ -135,6 +135,7 @@ from controllers.actuator_dynamics import (
 from controllers.params import (
     CONTROLLER_IDS,
     CONTROLLER_LABELS,
+    CONTROLLER_ACADOS_NMPC,
     CONTROLLER_LQR,
     CONTROLLER_MPC,
     CONTROLLER_PX4,
@@ -144,10 +145,12 @@ from controllers.params import (
     default_numerical_sim_config,
     default_params_for,
     migrate_numerical_sim_config,
+    strip_legacy_tracking_options,
 )
 from controllers.param_groups import param_groups_for
 from controllers.px4_params import migrate_px4_params
 from controllers.simulator import run_tracking_simulation
+from controllers.acados_nmpc_tracker import acados_nmpc_available
 from controllers.px4_tune import (
     TUNE_LEVEL_LABELS,
     TUNE_LEVELS,
@@ -2229,7 +2232,8 @@ class MainWindow(QMainWindow):
 
     def _create_actuator_dynamics_panel(self, parent_layout):
         """Actuator lag and thrust quantization (numerical simulation only)."""
-        act_group = QGroupBox('Actuator dynamics')
+        self.actuator_dynamics_group = QGroupBox('Actuator dynamics')
+        act_group = self.actuator_dynamics_group
         act_layout = QVBoxLayout(act_group)
         act_layout.setSpacing(4)
 
@@ -2632,15 +2636,39 @@ class MainWindow(QMainWindow):
         self.lbl_px4_tune_result.setStyleSheet('color: #555;')
         tune_outer.addWidget(self.lbl_px4_tune_result)
 
-    def _update_px4_tune_visibility(self):
-        if not hasattr(self, 'px4_tune_group'):
+    def _update_tracking_panel_visibility(self):
+        """Show sidebar blocks only for the active controller / simulation mode."""
+        if not hasattr(self, 'tracking_controller_combo'):
             return
-        show = self._current_tracking_controller_id() == CONTROLLER_PX4
-        self.px4_tune_group.setVisible(show)
-        if hasattr(self, 'btn_run_px4_tune'):
-            sitl = hasattr(self, 'tracking_sim_sitl_radio') and self.tracking_sim_sitl_radio.isChecked()
-            self.btn_run_px4_tune.setEnabled(show and not sitl)
+        cid = self._current_tracking_controller_id()
+        sitl = (
+            hasattr(self, 'tracking_sim_sitl_radio')
+            and self.tracking_sim_sitl_radio.isChecked()
+        )
+        numerical = not sitl
+
+        if hasattr(self, 'numerical_sim_group'):
+            self.numerical_sim_group.setVisible(numerical)
+        if hasattr(self, 'actuator_dynamics_group'):
+            self.actuator_dynamics_group.setVisible(numerical)
+        if hasattr(self, 'tracking_params_group'):
+            self.tracking_params_group.setVisible(True)
+        if hasattr(self, 'px4_tune_group'):
+            show_px4_tune = cid == CONTROLLER_PX4
+            self.px4_tune_group.setVisible(show_px4_tune)
+            if hasattr(self, 'btn_run_px4_tune'):
+                self.btn_run_px4_tune.setEnabled(show_px4_tune and numerical)
+
+        if hasattr(self, 'btn_run_numerical_tracking'):
+            self.btn_run_numerical_tracking.setVisible(numerical)
+        if hasattr(self, 'sitl_run_widget'):
+            numerical_only = cid in (CONTROLLER_MPC, CONTROLLER_ACADOS_NMPC)
+            self.sitl_run_widget.setVisible(sitl and not numerical_only)
+
         self._refresh_tab_scroll_areas()
+
+    def _update_px4_tune_visibility(self):
+        self._update_tracking_panel_visibility()
 
     def _on_px4_tune_level_changed(self, _index=None):
         if not hasattr(self, 'px4_tune_sp_stack'):
@@ -2769,7 +2797,10 @@ class MainWindow(QMainWindow):
         ctrl_layout = QVBoxLayout()
         self.tracking_controller_combo = QComboBox()
         for cid in CONTROLLER_IDS:
-            self.tracking_controller_combo.addItem(CONTROLLER_LABELS[cid], cid)
+            label = CONTROLLER_LABELS[cid]
+            if cid == CONTROLLER_ACADOS_NMPC and not acados_nmpc_available():
+                label = f'{label} (requires acados)'
+            self.tracking_controller_combo.addItem(label, cid)
         self.tracking_controller_combo.currentIndexChanged.connect(self._on_tracking_controller_changed)
         ctrl_layout.addWidget(self.tracking_controller_combo)
 
@@ -2797,7 +2828,7 @@ class MainWindow(QMainWindow):
             expanded=False,
         )
         self.tracking_params_group.setToolTip(
-            'Click the section title (▸/▾) to expand or collapse controller gain and simulation settings.'
+            'Click the section title (▸/▾) to expand or collapse controller gains.'
         )
         self.tracking_params_scroll = QScrollArea()
         self.tracking_params_scroll.setWidgetResizable(True)
@@ -2845,6 +2876,11 @@ class MainWindow(QMainWindow):
         self.lbl_tracking_result.setStyleSheet('color: #555;')
         run_layout.addWidget(self.lbl_tracking_result, 1, 0, 1, 2)
 
+        self.sitl_run_widget = QWidget()
+        sitl_run_layout = QGridLayout(self.sitl_run_widget)
+        sitl_run_layout.setContentsMargins(0, 0, 0, 0)
+        sitl_run_layout.setHorizontalSpacing(6)
+        sitl_run_layout.setVerticalSpacing(4)
         self.btn_start_px4_sitl = QPushButton('Start SITL')
         self.btn_start_px4_sitl.setToolTip(
             'Launch PX4 SITL + Gazebo. LQR controller is enabled when LQR is selected.'
@@ -2855,10 +2891,10 @@ class MainWindow(QMainWindow):
         self.btn_stop_px4_sitl.setEnabled(False)
         self.lbl_px4_sitl_status = QLabel('Stopped')
         self.lbl_px4_sitl_status.setStyleSheet('color: #888;')
-        run_layout.addWidget(QLabel('PX4 SITL:'), 2, 0)
-        run_layout.addWidget(self.btn_start_px4_sitl, 2, 1)
-        run_layout.addWidget(self.btn_stop_px4_sitl, 3, 0)
-        run_layout.addWidget(self.lbl_px4_sitl_status, 3, 1)
+        sitl_run_layout.addWidget(QLabel('PX4 SITL:'), 0, 0)
+        sitl_run_layout.addWidget(self.btn_start_px4_sitl, 0, 1)
+        sitl_run_layout.addWidget(self.btn_stop_px4_sitl, 1, 0)
+        sitl_run_layout.addWidget(self.lbl_px4_sitl_status, 1, 1)
 
         self.btn_start_tracking = QPushButton('Start tracking')
         self.btn_start_tracking.setToolTip('Launch tvc_traj_player with the selected trajectory source.')
@@ -2868,22 +2904,23 @@ class MainWindow(QMainWindow):
         self.btn_stop_tracking.setEnabled(False)
         self.lbl_tracking_status = QLabel('Stopped')
         self.lbl_tracking_status.setStyleSheet('color: #888;')
-        run_layout.addWidget(self.btn_start_tracking, 4, 0)
-        run_layout.addWidget(self.btn_stop_tracking, 4, 1)
-        run_layout.addWidget(self.lbl_tracking_status, 5, 0, 1, 2)
+        sitl_run_layout.addWidget(self.btn_start_tracking, 2, 0)
+        sitl_run_layout.addWidget(self.btn_stop_tracking, 2, 1)
+        sitl_run_layout.addWidget(self.lbl_tracking_status, 3, 0, 1, 2)
+        run_layout.addWidget(self.sitl_run_widget, 2, 0, 1, 2)
 
         self.btn_clear_rviz_traj = QPushButton('Clear RViz executed path')
         self.btn_clear_rviz_traj.clicked.connect(
             lambda: self.clear_rviz_trajectory_display(quiet=False)
         )
-        run_layout.addWidget(self.btn_clear_rviz_traj, 6, 0, 1, 2)
+        run_layout.addWidget(self.btn_clear_rviz_traj, 3, 0, 1, 2)
         run_group.setLayout(run_layout)
         layout.addWidget(run_group)
 
         self._update_tracking_params_file_label()
         self._rebuild_tracking_param_widgets()
         self._apply_px4_tune_config(self._px4_tune_config)
-        self._update_px4_tune_visibility()
+        self._update_tracking_panel_visibility()
         self._on_tracking_sim_mode_changed()
         self._on_tracking_source_changed(self.tracking_source_combo.currentIndex())
         QTimer.singleShot(0, self._refresh_tab_scroll_areas)
@@ -5699,7 +5736,7 @@ class MainWindow(QMainWindow):
                 and self.tracking_sim_sitl_radio.isChecked()
             )
             cid = self._current_tracking_controller_id()
-            can_sitl = sitl and cid != CONTROLLER_MPC
+            can_sitl = sitl and cid not in (CONTROLLER_MPC, CONTROLLER_ACADOS_NMPC)
             self.btn_start_px4_sitl.setEnabled(can_sitl and not tvc_running)
             self.btn_stop_px4_sitl.setEnabled(tvc_running)
         if hasattr(self, 'lbl_px4_sitl_status'):
@@ -5736,7 +5773,6 @@ class MainWindow(QMainWindow):
         cid = self._current_tracking_controller_id()
         self._tracking_config['controller'] = cid
         self._rebuild_tracking_param_widgets()
-        self._update_px4_tune_visibility()
         self._on_tracking_sim_mode_changed()
 
     def _on_tracking_sim_mode_changed(self, _btn=None):
@@ -5745,13 +5781,15 @@ class MainWindow(QMainWindow):
         self._tracking_config['sim_mode'] = SIM_SITL if sitl else SIM_NUMERICAL
         if hasattr(self, 'btn_run_numerical_tracking'):
             self.btn_run_numerical_tracking.setEnabled(not sitl)
-        if hasattr(self, 'numerical_sim_group'):
-            self.numerical_sim_group.setEnabled(not sitl)
-        self._update_px4_tune_visibility()
+        self._update_tracking_panel_visibility()
         cid = self._current_tracking_controller_id()
         if cid == CONTROLLER_MPC and sitl:
             self.btn_start_px4_sitl.setToolTip(
-                'MPC tracking is available in numerical simulation only.'
+                'Linear MPC tracking is available in numerical simulation only.'
+            )
+        elif cid == CONTROLLER_ACADOS_NMPC and sitl:
+            self.btn_start_px4_sitl.setToolTip(
+                'Acados NMPC tracking is available in numerical simulation only.'
             )
         elif cid == CONTROLLER_LQR:
             self.btn_start_px4_sitl.setToolTip(
@@ -5785,7 +5823,14 @@ class MainWindow(QMainWindow):
         params = dict(self._tracking_config['params'].get(cid, default_params_for(cid)))
         params.update(self._actuator_params_for_sim())
         params.update(self._numerical_sim_params_for_sim())
+        params.update(self._constraints_for_tracking())
         return params
+
+    def _constraints_for_tracking(self):
+        """Limits from Parameters → Constraints (shared with trajectory optimization)."""
+        if not hasattr(self, 'th_p_max'):
+            return {}
+        return self._bounds_display_from_widgets()
 
     def _make_tracking_param_widget(self, spec, params, controller_id):
         key = spec['key']
@@ -5907,6 +5952,7 @@ class MainWindow(QMainWindow):
                 raw = dict(params_map[cid])
                 if cid == CONTROLLER_PX4:
                     raw = migrate_px4_params(raw)
+                raw = strip_legacy_tracking_options(raw)
                 self._tracking_config.setdefault('params', {})[cid] = raw
         actuator_cfg = cfg.get('actuator') or self._migrate_actuator_from_controller_params(cfg)
         self._tracking_config['actuator'] = dict(actuator_cfg)
@@ -6005,7 +6051,7 @@ class MainWindow(QMainWindow):
     def _load_trajectory_arrays_from_csv(self, path):
         """Minimal CSV loader for tracking (planner ENU format)."""
         import csv
-        t_list, rows = [], []
+        t_list, rows, u_rows = [], [], []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 if line.startswith('#') or not line.strip():
@@ -6025,12 +6071,22 @@ class MainWindow(QMainWindow):
                         float(row['qw']), float(row['qx']), float(row['qy']), float(row['qz']),
                         float(row['wx']), float(row['wy']), float(row['wz']),
                     ])
+                    if 'th_p_cmd' in row and 'T_cmd' in row:
+                        u_rows.append([
+                            float(row['th_p_cmd']), float(row['th_r_cmd']),
+                            float(row['T_cmd']), float(row['tau_yaw_cmd']),
+                        ])
                 except (KeyError, ValueError):
                     continue
         if not rows:
             return None, None, None
         xs = np.asarray(rows, dtype=float)
-        return xs, None, np.asarray(t_list, dtype=float)
+        us = np.asarray(u_rows, dtype=float) if u_rows else None
+        if us is not None and us.shape[0] == xs.shape[0]:
+            us = us[:-1]
+        elif us is not None and us.shape[0] != max(xs.shape[0] - 1, 0):
+            us = None
+        return xs, us, np.asarray(t_list, dtype=float)
 
     def run_numerical_tracking(self):
         xs, us, time_states = self._trajectory_arrays_for_tracking()
@@ -6043,6 +6099,13 @@ class MainWindow(QMainWindow):
         if self._tracking_sim_thread is not None and self._tracking_sim_thread.isRunning():
             return
         cid = self._current_tracking_controller_id()
+        if cid == CONTROLLER_ACADOS_NMPC and not acados_nmpc_available():
+            QMessageBox.warning(
+                self, 'Acados unavailable',
+                'Nonlinear NMPC requires CasADi and a built acados installation.\n'
+                'See TVC-traj-opt/README.md (Acados Installation).',
+            )
+            return
         params = self._collect_tracking_params()
         self.btn_run_numerical_tracking.setEnabled(False)
         self.lbl_tracking_result.setText('Running numerical simulation…')
@@ -6073,10 +6136,11 @@ class MainWindow(QMainWindow):
     def start_px4_sitl_for_tracking(self):
         """Start PX4 SITL with controller choice from Tracking tab."""
         cid = self._current_tracking_controller_id()
-        if cid == CONTROLLER_MPC:
+        if cid in (CONTROLLER_MPC, CONTROLLER_ACADOS_NMPC):
+            kind = 'Linear MPC' if cid == CONTROLLER_MPC else 'Acados NMPC'
             QMessageBox.information(
-                self, 'MPC SITL',
-                'Linear MPC is supported in numerical simulation only.\n'
+                self, f'{kind} SITL',
+                f'{kind} tracking is supported in numerical simulation only.\n'
                 'Switch to Numerical simulation or choose PX4 / LQR for SITL.',
             )
             return

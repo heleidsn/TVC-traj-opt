@@ -36,6 +36,23 @@ def _lqr_param_groups() -> List[Dict[str, Any]]:
     ]
 
 
+def _nmpc_param_groups() -> List[Dict[str, Any]]:
+    from .params import _NMPC_SPECS
+    by_key = {s['key']: s for s in _NMPC_SPECS}
+    groups = [
+        {
+            'title': 'NMPC settings',
+            'specs': [
+                by_key['horizon'], by_key['nmpc_dt'],
+                by_key['nmpc_du_weight'], by_key['nmpc_terminal_scale'],
+                by_key['nmpc_nlp_max_iter'],
+            ],
+        },
+    ]
+    groups.extend(_lqr_param_groups())
+    return groups
+
+
 def _mpc_param_groups() -> List[Dict[str, Any]]:
     from .params import _MPC_SPECS
     by_key = {s['key']: s for s in _MPC_SPECS}
@@ -55,12 +72,14 @@ def param_groups_for(
 ) -> List[Dict[str, Any]]:
     """Return categorized parameter groups for the Tracking GUI."""
     from .params import (
+        CONTROLLER_ACADOS_NMPC,
         CONTROLLER_LQR,
         CONTROLLER_MPC,
         CONTROLLER_PX4,
-        _COMMON_SIM_SPECS,
     )
-    cid = controller_id if controller_id in (CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC) else CONTROLLER_PX4
+    cid = controller_id if controller_id in (
+        CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC, CONTROLLER_ACADOS_NMPC,
+    ) else CONTROLLER_PX4
     groups: List[Dict[str, Any]] = []
     if cid == CONTROLLER_PX4:
         share = True
@@ -71,11 +90,9 @@ def param_groups_for(
         groups = _lqr_param_groups()
     elif cid == CONTROLLER_MPC:
         groups = _mpc_param_groups()
-    tracking_group = {
-        'title': 'Tracking options',
-        'specs': deepcopy(_COMMON_SIM_SPECS),
-    }
-    return deepcopy(groups + [tracking_group])
+    elif cid == CONTROLLER_ACADOS_NMPC:
+        groups = _nmpc_param_groups()
+    return deepcopy(groups)
 
 
 def flatten_param_groups(groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

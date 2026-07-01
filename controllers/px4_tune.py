@@ -127,6 +127,7 @@ def run_px4_cascade_tune_sim(
     sp_rate_hist = []
 
     u_cmd_hold = None
+    cascade_hold = None
     substep = 0
 
     t = 0.0
@@ -136,10 +137,7 @@ def run_px4_cascade_tune_sim(
         if substep == 0:
             u_lqr, sig = tracker.compute_tune(x12, control_dt, level, setpoints, use_ff=False)
             u_cmd_hold = lqr_to_control_opt(u_lqr, mass, g)
-            sp_pos_hist.append(sig['pos'].copy())
-            sp_vel_hist.append(sig['vel'].copy())
-            sp_att_hist.append(sig['att_rad'].copy())
-            sp_rate_hist.append(sig['rate_rad_s'].copy())
+            cascade_hold = sig
 
         u_plant = actuator.step(u_cmd_hold, sim_dt) if actuator.any_enabled() else u_cmd_hold
 
@@ -147,6 +145,11 @@ def run_px4_cascade_tune_sim(
         x12_hist.append(x12.copy())
         u_opt_hist.append(u_plant.copy())
         u_cmd_hist.append(u_cmd_hold.copy())
+        if cascade_hold is not None:
+            sp_pos_hist.append(cascade_hold['pos'].copy())
+            sp_vel_hist.append(cascade_hold['vel'].copy())
+            sp_att_hist.append(cascade_hold['att_rad'].copy())
+            sp_rate_hist.append(cascade_hold['rate_rad_s'].copy())
 
         if t >= t_end - 1e-12:
             break

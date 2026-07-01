@@ -10,6 +10,21 @@ from .linear_model import build_AB, discretize_euler
 
 
 class MPCTracker:
+    """
+    Receding-horizon tracker on the 12-state linear TVC model.
+
+    Control law: u = u_ref + du, where u_ref is the planned trajectory control
+    and du is the first step of a finite-horizon LQ problem that drives the
+    *error state* e = x - x_ref toward zero:
+
+        e_{k+1} = Ad e_k + Bd du_k
+        min  sum_k e_k' Q e_k + du_k' R du_k  (+ terminal Qf)
+
+    This matches LQR feedforward + feedback structure and remains stable when the
+    reference states come from nonlinear trajectory optimization (they are not
+    exactly reachable by the linear prediction model).
+    """
+
     def __init__(self, phy_params, params):
         self.phy = phy_params
         self.A, self.B = build_AB(phy_params)
@@ -65,34 +80,60 @@ class MPCTracker:
                 self.Gamma[row, col] = Ak @ Bd
             Apow = Apow @ Ad
 
-        Qbar = scipy.linalg.block_diag(*([self.Q] * N))
-        Rbar = scipy.linalg.block_diag(*([self.R] * N))
-        self.H = self.Gamma.T @ Qbar @ self.Gamma + Rbar
+        Q_blocks = [self.Q] * (N - 1) + [self.Qf]
+        self.Qbar = scipy.linalg.block_diag(*Q_blocks)
+        self.Rbar = scipy.linalg.block_diag(*([self.R] * N))
+        self.H = self.Gamma.T @ self.Qbar @ self.Gamma + self.Rbar
         self.H = 0.5 * (self.H + self.H.T) + 1e-8 * np.eye(self.H.shape[0])
 
-    def compute(self, x12, ref_horizon, u_ff=None, use_ff=True, clip_pos=0.5, clip_vel=0.5):
+    def compute(
+        self,
+        x12,
+        ref_horizon,
+        u_ref_horizon=None,
+        u_ff=None,
+        use_ff=True,
+        clip_pos=0.5,
+        clip_vel=0.5,
+        ignore_attitude_error=False,
+        ignore_rate_error=False,
+    ):
         """
-        ref_horizon : (N+1, 12) reference over MPC horizon.
+        ref_horizon : (N+1, 12) planned states (only ref_horizon[0] used for error).
+        u_ref_horizon : (N, 4) planned controls in LQR coords; u_ref_horizon[0] is feedforward.
+
+        Returns u_ref[0] + du[0] in LQR coordinates [qx, qy, T_delta, r].
         """
+        del u_ff, use_ff
+
         x0 = np.asarray(x12, dtype=float)
         N = self.horizon
+        m = self.B.shape[1]
         xref = np.asarray(ref_horizon, dtype=float)
-        if xref.shape[0] < N + 1:
-            pad = np.repeat(xref[-1:], N + 1 - xref.shape[0], axis=0)
-            xref = np.vstack([xref, pad])
-        xref = xref[: N + 1]
+        if xref.shape[0] < 1:
+            raise ValueError('ref_horizon must contain at least one state sample')
+        x_ref0 = xref[0]
 
-        x_ref_stack = xref[1: N + 1].reshape(-1)
-        x_pred_ref = self.Phi @ x0
-        err_free = x_pred_ref - x_ref_stack
-        f = self.Gamma.T @ scipy.linalg.block_diag(*([self.Q] * N)) @ err_free
+        if u_ref_horizon is None or len(u_ref_horizon) == 0:
+            u_ref0 = np.zeros(m, dtype=float)
+        else:
+            u_ref0 = np.asarray(u_ref_horizon[0], dtype=float).reshape(m)
+
+        e0 = x0 - x_ref0
+        e0[0:3] = np.clip(e0[0:3], -clip_pos, clip_pos)
+        e0[3:6] = np.clip(e0[3:6], -clip_vel, clip_vel)
+        if ignore_attitude_error:
+            e0[6:9] = 0.0
+        if ignore_rate_error:
+            e0[9:12] = 0.0
+
+        err_free = self.Phi @ e0
+        rhs = -self.Gamma.T @ self.Qbar @ err_free
 
         try:
-            U = np.linalg.solve(self.H, -f)
+            dU = np.linalg.solve(self.H, rhs)
         except np.linalg.LinAlgError:
-            U, _, _, _ = np.linalg.lstsq(self.H, -f, rcond=None)
+            dU, _, _, _ = np.linalg.lstsq(self.H, rhs, rcond=None)
 
-        u = U[: self.B.shape[1]]
-        if use_ff and u_ff is not None:
-            u = u + np.asarray(u_ff, dtype=float)
-        return u
+        du0 = dU[:m]
+        return u_ref0 + du0

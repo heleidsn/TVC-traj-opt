@@ -53,6 +53,10 @@ class TrajectoryReference:
     def duration(self):
         return float(self.t[-1] - self.t[0])
 
+    def plan_end_time(self):
+        """Absolute time of the last planned state sample."""
+        return float(self.t[-1])
+
     def _interp_rows(self, arr, t_query):
         t_query = float(np.clip(t_query, self.t[0], self.t[-1]))
         out = np.zeros(arr.shape[1], dtype=float)
@@ -86,7 +90,55 @@ class TrajectoryReference:
             u[j] = np.interp(t_query, t_u, self.us[:, j])
         return u
 
+    def in_terminal_hold(self, t_query):
+        """True once simulation time has reached the end of the planned trajectory."""
+        return float(t_query) >= self.plan_end_time() - 1e-9
+
+    def plan_in_hover_segment(self, t_query):
+        """Last 0.5 s of the plan while the reference is near the goal and slow."""
+        t_q = float(t_query)
+        if t_q >= self.plan_end_time() - 1e-9:
+            return False
+        if t_q + 1e-9 < self.plan_end_time() - 0.5:
+            return False
+        x_ref = self.state12_at(t_q)
+        x_final = self.state12_at(self.t[-1])
+        if float(np.linalg.norm(x_ref[0:3] - x_final[0:3])) > 0.08:
+            return False
+        return float(np.linalg.norm(x_ref[3:6])) < 0.12
+
+    def use_terminal_gains(self, t_query):
+        """Stronger hover gains: terminal mode, or last planned hover segment."""
+        return self.in_terminal_hold(t_query) or self.plan_in_hover_segment(t_query)
+
+    def terminal_hold_state12(self):
+        """Final planned position, level attitude, zero velocity and body rates."""
+        x = np.zeros(12, dtype=float)
+        x[0:3] = self.state12_at(self.t[-1])[0:3]
+        return x
+
+    def terminal_hold_control_lqr(self):
+        """Hover trim in LQR coords: level gimbal, thrust = weight, no yaw torque."""
+        return np.zeros(4, dtype=float)
+
+    def tracking_state12_at(self, t_query):
+        """Closed-loop tracking target (terminal setpoint after plan time)."""
+        if self.in_terminal_hold(t_query):
+            return self.terminal_hold_state12()
+        return self.state12_at(t_query)
+
     def horizon_window(self, t0, n_steps, dt):
         """Return (n_steps+1, 12) reference states starting at t0."""
+        if self.in_terminal_hold(t0):
+            x_hold = self.terminal_hold_state12()
+            return np.tile(x_hold, (n_steps + 1, 1))
         times = t0 + np.arange(n_steps + 1) * dt
-        return np.array([self.state12_at(t) for t in times])
+        return np.array([self.state12_at(min(t, self.plan_end_time())) for t in times])
+
+    def control_lqr_horizon(self, t0, n_steps, dt):
+        """Return (n_steps, 4) planned controls in LQR coords [qx, qy, T_delta, r]."""
+        if self.in_terminal_hold(t0):
+            u_hold = self.terminal_hold_control_lqr()
+            return np.tile(u_hold, (n_steps, 1))
+        times = t0 + np.arange(n_steps) * dt
+        return np.array([self.control_lqr_at(min(t, self.plan_end_time())) for t in times])

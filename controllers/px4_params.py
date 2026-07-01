@@ -96,13 +96,6 @@ def px4_param_groups(share_rp: bool = True) -> List[Dict[str, Any]]:
                 _spin('Kd_rate_yaw', 'Rate — Kd', 0.0, 0.0, 20.0, 2),
             ],
         },
-        {
-            'title': 'Limits',
-            'specs': [
-                _spin('tilt_max_deg', 'Max tilt [deg]', 28.6, 1.0, 80.0, 1),
-                _spin('gimbal_max_deg', 'Max gimbal [deg]', 14.3, 1.0, 45.0, 1),
-            ],
-        },
     ])
     return groups
 
@@ -141,6 +134,81 @@ def migrate_px4_params(raw: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in defaults.items():
         p.setdefault(k, v)
     return p
+
+
+def _tilt_max_rad_from_params(p: Dict[str, Any]) -> float:
+    """Max tilt [rad] from Parameters → Constraints (pitch/roll), or legacy saved keys."""
+    if 'pitch_max' in p or 'roll_max' in p:
+        pitch_deg = float(p.get('pitch_max', 10.0))
+        roll_deg = float(p.get('roll_max', pitch_deg))
+        return min(pitch_deg, roll_deg) * _DEG
+    if 'tilt_max_deg' in p:
+        return float(p['tilt_max_deg']) * _DEG
+    if 'tilt_max' in p and float(p['tilt_max']) < 3.0:
+        return float(p['tilt_max'])
+    return 10.0 * _DEG
+
+
+def gimbal_pitch_roll_max_rad(p: Dict[str, Any]) -> tuple[float, float]:
+    """TVC pitch / roll limits [rad] from Parameters → Constraints or legacy keys."""
+    if 'th_p_max' in p or 'th_r_max' in p:
+        th_p_deg = float(p.get('th_p_max', 10.0))
+        th_r_deg = float(p.get('th_r_max', th_p_deg))
+        return th_p_deg * _DEG, th_r_deg * _DEG
+    if 'gimbal_max_deg' in p:
+        g = float(p['gimbal_max_deg']) * _DEG
+        return g, g
+    if 'gimbal_max' in p and float(p['gimbal_max']) < 3.0:
+        g = float(p['gimbal_max'])
+        return g, g
+    g = 10.0 * _DEG
+    return g, g
+
+
+def _gimbal_max_rad_from_params(p: Dict[str, Any]) -> float:
+    """Legacy scalar gimbal limit [rad] (min of pitch and roll)."""
+    th_p, th_r = gimbal_pitch_roll_max_rad(p)
+    return min(th_p, th_r)
+
+
+def clip_lqr_gimbal_cmd(
+    u4,
+    th_p_max_rad: float,
+    th_r_max_rad: float,
+):
+    """
+  Clip LQR inputs [qx, qy, T_delta, r] to TVC gimbal limits.
+
+  Small-angle map: qx ≈ th_r/2, qy ≈ th_p/2.
+  """
+    import numpy as np
+
+    u = np.asarray(u4, dtype=float).reshape(4).copy()
+    u[0] = np.clip(u[0], -th_r_max_rad / 2.0, th_r_max_rad / 2.0)
+    u[1] = np.clip(u[1], -th_p_max_rad / 2.0, th_p_max_rad / 2.0)
+    return u
+
+
+def clip_control_opt(
+    u4,
+    th_p_max_rad: float,
+    th_r_max_rad: float,
+    T_min: float | None = None,
+    T_max: float | None = None,
+    tau_yaw_max: float | None = None,
+):
+    """Clip planner controls [th_p, th_r, T, tau_yaw] to constraint limits."""
+    import numpy as np
+
+    u = np.asarray(u4, dtype=float).reshape(4).copy()
+    u[0] = np.clip(u[0], -th_p_max_rad, th_p_max_rad)
+    u[1] = np.clip(u[1], -th_r_max_rad, th_r_max_rad)
+    if T_min is not None and T_max is not None:
+        u[2] = np.clip(u[2], float(T_min), float(T_max))
+    if tau_yaw_max is not None:
+        tau = float(tau_yaw_max)
+        u[3] = np.clip(u[3], -tau, tau)
+    return u
 
 
 def normalize_px4_params(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,9 +255,12 @@ def normalize_px4_params(raw: Dict[str, Any]) -> Dict[str, Any]:
         'Kp_rate_yaw': float(p['Kp_rate_yaw']),
         'Ki_rate_yaw': float(p['Ki_rate_yaw']),
         'Kd_rate_yaw': float(p['Kd_rate_yaw']),
-        'tilt_max': float(p['tilt_max_deg']) * _DEG,
-        'gimbal_max': float(p['gimbal_max_deg']) * _DEG,
+        'tilt_max': _tilt_max_rad_from_params(p),
+        'gimbal_max': _gimbal_max_rad_from_params(p),
     }
+    th_p_lim, th_r_lim = gimbal_pitch_roll_max_rad(p)
+    out['gimbal_max_pitch'] = th_p_lim
+    out['gimbal_max_roll'] = th_r_lim
     kpr, kpp = _pair('Kp_att', deg_suffix=True)
     out.update({
         'Kp_att_roll_deg': kpr, 'Kp_att_pitch_deg': kpp,

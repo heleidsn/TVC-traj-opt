@@ -11,24 +11,61 @@ from .px4_params import default_px4_gui_params, migrate_px4_params, px4_param_sp
 CONTROLLER_PX4 = 'px4_cascade'
 CONTROLLER_LQR = 'lqr'
 CONTROLLER_MPC = 'mpc'
+CONTROLLER_ACADOS_NMPC = 'acados_nmpc'
 
-CONTROLLER_IDS = (CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC)
+CONTROLLER_IDS = (CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC, CONTROLLER_ACADOS_NMPC)
 CONTROLLER_LABELS = {
     CONTROLLER_PX4: 'PX4 cascade (pos→vel→att→rate)',
     CONTROLLER_LQR: 'LQR (full-state + feedforward)',
-    CONTROLLER_MPC: 'MPC (linear receding horizon)',
+    CONTROLLER_MPC: 'MPC (linear horizon, u_ref + Δu)',
+    CONTROLLER_ACADOS_NMPC: 'NMPC (acados nonlinear, direct u)',
 }
 
 SIM_NUMERICAL = 'numerical'
 SIM_SITL = 'px4_sitl'
 
-# Tracking options (per controller; timing is in numerical_sim block)
-_COMMON_SIM_SPECS = [
-    {'key': 'use_feedforward', 'label': 'Use planned control FF', 'default': 1.0, 'min': 0.0, 'max': 1.0,
-     'decimals': 1, 'checkbox': True},
-    {'key': 'clip_pos_error', 'label': 'Max pos error [m]', 'default': 0.5, 'min': 0.05, 'max': 5.0, 'decimals': 2},
-    {'key': 'clip_vel_error', 'label': 'Max vel error [m/s]', 'default': 0.5, 'min': 0.05, 'max': 5.0, 'decimals': 2},
-]
+# Fixed closed-loop tracking behaviour (no longer exposed in the Tracking GUI).
+TRACKING_USE_FEEDFORWARD = True
+TRACKING_CLIP_POS_ERROR_M = 0.5
+TRACKING_CLIP_VEL_ERROR_M_S = 0.5
+TRACKING_REF_MASS_KG = 0.6
+TRACKING_GIMBAL_RATE_LIMIT_DEG_S = 45.0
+# After planned trajectory time, hold the final waypoint for this duration [s].
+TRACKING_TERMINAL_HOLD_DURATION_S = 3.0
+TRACKING_MANEUVER_GIMBAL_R_EXPONENT = 1.5
+# Terminal hover: stronger gimbal authority + larger error window (MPC still used).
+TRACKING_TERMINAL_HOLD_GIMBAL_R_EXPONENT = 1.0
+TRACKING_TERMINAL_CLIP_POS_ERROR_M = 1.0
+TRACKING_TERMINAL_CLIP_VEL_ERROR_M_S = 1.0
+
+
+def scale_tracking_gimbal_r(
+    params: Dict[str, Any],
+    mass_kg: float,
+    ref_mass: float = TRACKING_REF_MASS_KG,
+    exponent: float = TRACKING_MANEUVER_GIMBAL_R_EXPONENT,
+) -> Dict[str, Any]:
+    """
+    Increase R_qx/R_qy for heavier platforms so gimbal feedback does not saturate.
+
+    GUI defaults are tuned for the ~0.6 kg proxy; the 20 kg real vehicle needs
+    much softer attitude corrections to avoid ±gimbal limit chatter during
+    aggressive tracking.
+    """
+    scaled = dict(params)
+    if mass_kg <= ref_mass * 1.05:
+        return scaled
+    gain = (float(mass_kg) / ref_mass) ** float(exponent)
+    for key in ('R_qx', 'R_qy'):
+        if key in scaled:
+            scaled[key] = float(scaled[key]) * gain
+    return scaled
+
+_LEGACY_TRACKING_OPTION_KEYS = (
+    'use_feedforward',
+    'clip_pos_error',
+    'clip_vel_error',
+)
 
 # Actuator dynamics for numerical tracking sim (configured in Tracking tab, not per-controller).
 _ACTUATOR_TRACKING_KEYS = (
@@ -56,9 +93,18 @@ _MPC_SPECS = [
     {'key': 'mpc_dt', 'label': 'MPC dt [s]', 'default': 0.05, 'min': 0.01, 'max': 0.2, 'decimals': 3},
 ] + _LQR_SPECS  # reuse Q/R weights
 
+_NMPC_SPECS = [
+    {'key': 'horizon', 'label': 'Horizon steps', 'default': 15, 'min': 5, 'max': 60, 'decimals': 0, 'integer': True},
+    {'key': 'nmpc_dt', 'label': 'NMPC dt [s]', 'default': 0.05, 'min': 0.01, 'max': 0.2, 'decimals': 3},
+    {'key': 'nmpc_du_weight', 'label': 'Control-rate weight du', 'default': 0.05, 'min': 0.0, 'max': 10.0, 'decimals': 4},
+    {'key': 'nmpc_terminal_scale', 'label': 'Terminal cost scale', 'default': 10.0, 'min': 1.0, 'max': 500.0, 'decimals': 1},
+    {'key': 'nmpc_nlp_max_iter', 'label': 'SQP max iter', 'default': 10, 'min': 1, 'max': 50, 'decimals': 0, 'integer': True},
+] + _LQR_SPECS
+
 _PARAM_REGISTRY: Dict[str, List[Dict[str, Any]]] = {
-    CONTROLLER_LQR: _LQR_SPECS + _COMMON_SIM_SPECS,
-    CONTROLLER_MPC: _MPC_SPECS + _COMMON_SIM_SPECS,
+    CONTROLLER_LQR: _LQR_SPECS,
+    CONTROLLER_MPC: _MPC_SPECS,
+    CONTROLLER_ACADOS_NMPC: _NMPC_SPECS,
 }
 
 
@@ -90,6 +136,14 @@ def default_numerical_sim_config() -> Dict[str, float]:
         'sim_dt': 0.005,
         'control_dt': 0.02,
     }
+
+
+def strip_legacy_tracking_options(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove retired Tracking-options keys from a saved controller param dict."""
+    cleaned = dict(params or {})
+    for key in _LEGACY_TRACKING_OPTION_KEYS:
+        cleaned.pop(key, None)
+    return cleaned
 
 
 def migrate_numerical_sim_config(cfg: Dict[str, Any] | None) -> Dict[str, float]:

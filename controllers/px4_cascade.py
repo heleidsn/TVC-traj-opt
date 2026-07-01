@@ -148,8 +148,11 @@ class PX4CascadeTracker:
         wz2_x = self.l * self.m * self.g / self.Ixx
         wz2_y = self.l * self.m * self.g / self.Iyy
 
-        qx_cmd = float(np.clip(-angacc_x / wz2_x, -g['gimbal_max'], g['gimbal_max']))
-        qy_cmd = float(np.clip(-angacc_y / wz2_y, -g['gimbal_max'], g['gimbal_max']))
+        # u uses LQR coords [qx, qy, …] with qx ≈ th_r/2, qy ≈ th_p/2 — clip at half gimbal [rad].
+        qx_lim = g.get('gimbal_max_roll', g['gimbal_max']) / 2.0
+        qy_lim = g.get('gimbal_max_pitch', g['gimbal_max']) / 2.0
+        qx_cmd = float(np.clip(-angacc_x / wz2_x, -qx_lim, qx_lim))
+        qy_cmd = float(np.clip(-angacc_y / wz2_y, -qy_lim, qy_lim))
 
         hover = self.m * self.g
         T_delta = float(np.clip(az * self.m, -0.5 * hover, 0.5 * hover))
@@ -350,9 +353,11 @@ class PX4CascadeTracker:
         return u, signals
 
     def _clip_u(self, u):
-        gmax = self.gains['gimbal_max']
-        u[0] = np.clip(u[0], -gmax, gmax)
-        u[1] = np.clip(u[1], -gmax, gmax)
+        g = self.gains
+        qx_lim = g.get('gimbal_max_roll', g['gimbal_max']) / 2.0
+        qy_lim = g.get('gimbal_max_pitch', g['gimbal_max']) / 2.0
+        u[0] = np.clip(u[0], -qx_lim, qx_lim)
+        u[1] = np.clip(u[1], -qy_lim, qy_lim)
         hover = self.m * self.g
         u[2] = np.clip(u[2], -0.5 * hover, 0.5 * hover)
         return u

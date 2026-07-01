@@ -12,8 +12,28 @@ from .linear_model import lqr_to_control_opt, state12_to_state13, state13_to_sta
 from .lqr_tracker import LQRTracker
 from .mpc_tracker import MPCTracker
 from .nonlinear_plant import plant_from_phy_gui, tracker_phy_from_gui
-from .params import CONTROLLER_LQR, CONTROLLER_MPC, CONTROLLER_PX4
+from .params import (
+    CONTROLLER_ACADOS_NMPC,
+    CONTROLLER_LQR,
+    CONTROLLER_MPC,
+    CONTROLLER_PX4,
+    TRACKING_CLIP_POS_ERROR_M,
+    TRACKING_CLIP_VEL_ERROR_M_S,
+    TRACKING_GIMBAL_RATE_LIMIT_DEG_S,
+    TRACKING_MANEUVER_GIMBAL_R_EXPONENT,
+    TRACKING_TERMINAL_CLIP_POS_ERROR_M,
+    TRACKING_TERMINAL_CLIP_VEL_ERROR_M_S,
+    TRACKING_TERMINAL_HOLD_DURATION_S,
+    TRACKING_TERMINAL_HOLD_GIMBAL_R_EXPONENT,
+    TRACKING_USE_FEEDFORWARD,
+    scale_tracking_gimbal_r,
+)
 from .px4_cascade import PX4CascadeTracker
+from .px4_params import (
+    clip_control_opt,
+    clip_lqr_gimbal_cmd,
+    gimbal_pitch_roll_max_rad,
+)
 from .trajectory_ref import TrajectoryReference
 
 
@@ -30,14 +50,36 @@ def numerical_sim_timing(params: Dict[str, Any]) -> tuple[float, float, int]:
     return sim_dt, control_dt, ratio
 
 
-def _make_tracker(controller_id, phy, params):
+def _make_tracker(controller_id, phy, params, phy_gui=None):
     if controller_id == CONTROLLER_PX4:
         return PX4CascadeTracker(phy, params)
     if controller_id == CONTROLLER_LQR:
         return LQRTracker(phy, params)
     if controller_id == CONTROLLER_MPC:
         return MPCTracker(phy, params)
+    if controller_id == CONTROLLER_ACADOS_NMPC:
+        from .acados_nmpc_tracker import AcadosNmpcTracker, acados_nmpc_available
+        if not acados_nmpc_available():
+            raise ImportError(
+                "Acados NMPC requires CasADi and a built acados installation."
+            )
+        if phy_gui is None:
+            raise ValueError("phy_gui is required for Acados NMPC tracker")
+        return AcadosNmpcTracker(phy_gui, params)
     raise ValueError(f'Unknown controller: {controller_id}')
+
+
+def _control_limits_from_params(params):
+    th_p_max, th_r_max = gimbal_pitch_roll_max_rad(params)
+    T_min = float(params['T_min']) if 'T_min' in params else None
+    T_max = float(params['T_max']) if 'T_max' in params else None
+    tau_max = float(params['tau_yaw_max']) if 'tau_yaw_max' in params else None
+    return th_p_max, th_r_max, T_min, T_max, tau_max
+
+
+def _clip_plant_control(u_opt, params):
+    th_p_max, th_r_max, T_min, T_max, tau_max = _control_limits_from_params(params)
+    return clip_control_opt(u_opt, th_p_max, th_r_max, T_min, T_max, tau_max)
 
 
 def _init_actuator(actuator, mass, g, u_ff=None):
@@ -76,12 +118,41 @@ def run_tracking_simulation(
         xs, us, time_states=time_states,
         mass=mass, g=g,
     )
-    tracker = _make_tracker(controller_id, phy, params)
 
     sim_dt, control_dt, steps_per_control = numerical_sim_timing(params)
-    use_ff = bool(params.get('use_feedforward', True))
-    clip_pos = float(params.get('clip_pos_error', 0.5))
-    clip_vel = float(params.get('clip_vel_error', 0.5))
+    mass = float(phy_gui.get('mass', phy['MASS']))
+    ctrl_params = params
+    r_gimbal_scale = 1.0
+    if controller_id in (CONTROLLER_LQR, CONTROLLER_MPC):
+        ctrl_params = scale_tracking_gimbal_r(
+            params, mass, exponent=TRACKING_MANEUVER_GIMBAL_R_EXPONENT,
+        )
+        r_gimbal_scale = float(ctrl_params.get('R_qx', 10.0)) / max(
+            float(params.get('R_qx', 10.0)), 1e-9,
+        )
+
+    tracker = _make_tracker(controller_id, phy, ctrl_params, phy_gui=phy_gui)
+    terminal_ctrl_params = None
+    if controller_id in (CONTROLLER_LQR, CONTROLLER_MPC):
+        terminal_ctrl_params = scale_tracking_gimbal_r(
+            params, mass, exponent=TRACKING_TERMINAL_HOLD_GIMBAL_R_EXPONENT,
+        )
+    if controller_id == CONTROLLER_MPC:
+        mpc_dt = float(ctrl_params.get('mpc_dt', control_dt))
+        if abs(mpc_dt - control_dt) > 1e-9 and hasattr(tracker, 'update_params'):
+            mpc_params = dict(ctrl_params)
+            mpc_params['mpc_dt'] = control_dt
+            tracker.update_params(mpc_params)
+    if controller_id == CONTROLLER_ACADOS_NMPC:
+        nmpc_params = dict(params)
+        nmpc_params['control_dt'] = control_dt
+        nmpc_params['nmpc_dt'] = control_dt
+        if hasattr(tracker, 'update_params'):
+            tracker.update_params(nmpc_params)
+
+    use_ff = TRACKING_USE_FEEDFORWARD
+    clip_pos = TRACKING_CLIP_POS_ERROR_M
+    clip_vel = TRACKING_CLIP_VEL_ERROR_M_S
 
     actuator = ActuatorDynamics(actuator_config_from_params(params))
 
@@ -90,9 +161,10 @@ def run_tracking_simulation(
     else:
         x13 = state12_to_state13(np.asarray(x0, dtype=float).reshape(12))
 
-    t_end = ref.duration()
+    t_end = ref.plan_end_time() + TRACKING_TERMINAL_HOLD_DURATION_S - ref.t[0]
     if t_end <= 0:
         t_end = 0.1
+    plan_end_t = ref.plan_end_time()
 
     if hasattr(tracker, 'reset'):
         tracker.reset()
@@ -112,41 +184,105 @@ def run_tracking_simulation(
     record_cascade = controller_id == CONTROLLER_PX4
 
     u_cmd_hold = None
+    prev_u_cmd_hold = None
+    cascade_hold = None
     substep = 0
+    th_p_lim, th_r_lim = gimbal_pitch_roll_max_rad(params)
+    max_gimbal_slew = np.radians(TRACKING_GIMBAL_RATE_LIMIT_DEG_S) * control_dt
+    terminal_gains_active = None
+    was_in_terminal = False
 
     t = 0.0
     while True:
         x12 = state13_to_state12(x13)
-        t_clamped = min(t, ref.t[-1])
+        t_clamped = min(t, plan_end_t)
+        in_terminal = ref.in_terminal_hold(t)
+        terminal_gains = ref.use_terminal_gains(t)
 
         if substep == 0:
-            x_ref = ref.state12_at(t_clamped)
-            acc_ref = ref.accel_at(t_clamped)
-            u_ff = ref.control_lqr_at(t_clamped) if use_ff else None
+            entering_hover_gains = (
+                terminal_gains and terminal_gains_active is not True
+            )
+            entering_terminal_mode = in_terminal and not was_in_terminal
+
+            if (
+                controller_id in (CONTROLLER_LQR, CONTROLLER_MPC)
+                and terminal_ctrl_params is not None
+                and terminal_gains != terminal_gains_active
+            ):
+                tuned = terminal_ctrl_params if terminal_gains else ctrl_params
+                if hasattr(tracker, 'update_gains'):
+                    tracker.update_gains(tuned)
+                elif hasattr(tracker, 'update_params'):
+                    mpc_params = dict(tuned)
+                    mpc_params['mpc_dt'] = control_dt
+                    tracker.update_params(mpc_params)
+                terminal_gains_active = terminal_gains
+
+            if entering_hover_gains or entering_terminal_mode:
+                prev_u_cmd_hold = None
+            was_in_terminal = in_terminal
+
+            clip_p = (
+                TRACKING_TERMINAL_CLIP_POS_ERROR_M
+                if terminal_gains else clip_pos
+            )
+            clip_v = (
+                TRACKING_TERMINAL_CLIP_VEL_ERROR_M_S
+                if terminal_gains else clip_vel
+            )
+
+            x_ref = ref.tracking_state12_at(t)
+            acc_ref = np.zeros(3, dtype=float) if in_terminal else ref.accel_at(t_clamped)
+            if use_ff:
+                if in_terminal:
+                    u_ff = ref.terminal_hold_control_lqr()
+                else:
+                    u_ff = ref.control_lqr_at(t_clamped)
+            else:
+                u_ff = None
 
             if controller_id == CONTROLLER_PX4:
                 u_lqr, sig = tracker.compute(
                     x12, x_ref, acc_ref, control_dt, u_ff=u_ff, use_ff=use_ff,
                 )
-                sp_pos_hist.append(sig['pos'].copy())
-                sp_vel_hist.append(sig['vel'].copy())
-                sp_att_hist.append(sig['att_rad'].copy())
-                sp_rate_hist.append(sig['rate_rad_s'].copy())
+                cascade_hold = sig
+                u_ref_lqr = u_ff if (use_ff and u_ff is not None) else np.zeros(4)
             elif controller_id == CONTROLLER_MPC:
                 horizon = int(params.get('horizon', 20))
-                mpc_dt = float(params.get('mpc_dt', 0.05))
-                ref_h = ref.horizon_window(t_clamped, horizon, mpc_dt)
+                mpc_dt = float(getattr(tracker, 'mpc_dt', params.get('mpc_dt', control_dt)))
+                ref_h = ref.horizon_window(t, horizon, mpc_dt)
+                u_ref_h = ref.control_lqr_horizon(t, horizon, mpc_dt)
                 u_lqr = tracker.compute(
-                    x12, ref_h, u_ff=u_ff, use_ff=use_ff,
-                    clip_pos=clip_pos, clip_vel=clip_vel,
+                    x12, ref_h, u_ref_horizon=u_ref_h,
+                    clip_pos=clip_p, clip_vel=clip_v,
+                )
+                u_ref_lqr = u_ref_h[0]
+            elif controller_id == CONTROLLER_ACADOS_NMPC:
+                horizon = int(params.get('horizon', 15))
+                u_cmd_hold = _clip_plant_control(
+                    tracker.compute(x13, ref, t, horizon=horizon, dt=control_dt),
+                    params,
                 )
             else:
                 u_lqr = tracker.compute(
                     x12, x_ref, u_ff=u_ff, use_ff=use_ff,
-                    clip_pos=clip_pos, clip_vel=clip_vel,
+                    clip_pos=clip_p, clip_vel=clip_v,
                 )
+                u_ref_lqr = u_ff if (use_ff and u_ff is not None) else np.zeros(4)
 
-            u_cmd_hold = lqr_to_control_opt(u_lqr, mass, g)
+            if controller_id != CONTROLLER_ACADOS_NMPC:
+                u_lqr = clip_lqr_gimbal_cmd(u_lqr, th_p_lim, th_r_lim)
+                u_cmd_hold = _clip_plant_control(
+                    lqr_to_control_opt(u_lqr, mass, g), params,
+                )
+            if prev_u_cmd_hold is not None:
+                for axis in (0, 1):
+                    du = u_cmd_hold[axis] - prev_u_cmd_hold[axis]
+                    u_cmd_hold[axis] = prev_u_cmd_hold[axis] + np.clip(
+                        du, -max_gimbal_slew, max_gimbal_slew,
+                    )
+            prev_u_cmd_hold = u_cmd_hold.copy()
 
         if actuator.any_enabled():
             u_plant = actuator.step(u_cmd_hold, sim_dt)
@@ -156,6 +292,11 @@ def run_tracking_simulation(
         t_hist.append(t)
         x12_hist.append(x12.copy())
         u_opt_hist.append(u_plant.copy())
+        if record_cascade and cascade_hold is not None:
+            sp_pos_hist.append(cascade_hold['pos'].copy())
+            sp_vel_hist.append(cascade_hold['vel'].copy())
+            sp_att_hist.append(cascade_hold['att_rad'].copy())
+            sp_rate_hist.append(cascade_hold['rate_rad_s'].copy())
         if record_cascade or actuator.any_enabled():
             u_cmd_hist.append(u_cmd_hold.copy())
 
@@ -167,7 +308,7 @@ def run_tracking_simulation(
 
     t_arr = np.asarray(t_hist, dtype=float)
     x_sim = np.asarray(x12_hist, dtype=float)
-    x_ref_arr = np.array([ref.state12_at(min(ti, ref.t[-1])) for ti in t_arr])
+    x_ref_arr = np.array([ref.tracking_state12_at(ti) for ti in t_arr])
     pos_err = x_sim[:, 0:3] - x_ref_arr[:, 0:3]
     err_norm = np.linalg.norm(pos_err, axis=1)
 
@@ -185,6 +326,9 @@ def run_tracking_simulation(
         'actuator_dynamics_enabled': actuator.any_enabled(),
         'sim_dt': sim_dt,
         'control_dt': control_dt,
+        'plan_duration_s': ref.duration(),
+        'terminal_hold_duration_s': TRACKING_TERMINAL_HOLD_DURATION_S,
+        'r_gimbal_scale': r_gimbal_scale if controller_id in (CONTROLLER_LQR, CONTROLLER_MPC) else 1.0,
         'platform_id': str(phy_gui.get('platform_id', 'proxy')),
         'r_thrust_body': np.array([
             float(phy_gui.get('r_thrust_x', 0.0)),
