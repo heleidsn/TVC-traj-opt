@@ -3,7 +3,9 @@
   "sim_mode": "numerical",
   "numerical_sim": {
     "sim_dt": 0.005,
-    "control_dt": 0.05
+    "control_dt": 0.05,
+    "terminal_hold_duration_s": 3.0,
+    "total_duration_s": 0.0
   },
   "actuator": {
     "enabled": false,
@@ -78,6 +80,48 @@
       "R_qy": 10.0,
       "R_T": 1.0,
       "R_r": 10.0
+    },
+    "acados_nmpc": {
+      "horizon": 15,
+      "nmpc_dt": 0.05,
+      "nmpc_du_weight": 0.05,
+      "nmpc_terminal_scale": 10.0,
+      "nmpc_nlp_max_iter": 10,
+      "Q_x": 1.0,
+      "Q_y": 1.0,
+      "Q_z": 1.0,
+      "Q_vx": 1.0,
+      "Q_vy": 1.0,
+      "Q_vz": 1.0,
+      "Q_qx": 1.0,
+      "Q_qy": 1.0,
+      "Q_qz": 0.1,
+      "Q_p": 1.0,
+      "Q_q": 1.0,
+      "Q_r": 0.01,
+      "R_qx": 10.0,
+      "R_qy": 10.0,
+      "R_T": 1.0,
+      "R_r": 10.0
+    },
+    "flatness_ff": {
+      "share_rp_gains": true,
+      "Kp_pos_xy": 1.0,
+      "Kp_vel_xy": 3.0,
+      "Ki_vel_xy": 0.0,
+      "Kd_vel_xy": 0.0,
+      "Kp_pos_z": 1.0,
+      "Kp_vel_z": 15.0,
+      "Ki_vel_z": 0.0,
+      "Kd_vel_z": 0.0,
+      "Kp_att_rp_deg": 6.5,
+      "Kp_rate_rp": 15.0,
+      "Ki_rate_rp": 0.0,
+      "Kd_rate_rp": 0.0,
+      "Kp_att_yaw_deg": 4.0,
+      "Kp_rate_yaw": 5.0,
+      "Ki_rate_yaw": 0.0,
+      "Kd_rate_yaw": 0.0
     }
   },
   "px4_tune": {

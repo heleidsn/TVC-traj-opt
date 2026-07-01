@@ -14,6 +14,7 @@ from .mpc_tracker import MPCTracker
 from .nonlinear_plant import plant_from_phy_gui, tracker_phy_from_gui
 from .params import (
     CONTROLLER_ACADOS_NMPC,
+    CONTROLLER_FLATNESS,
     CONTROLLER_LQR,
     CONTROLLER_MPC,
     CONTROLLER_PX4,
@@ -37,6 +38,18 @@ from .px4_params import (
 from .trajectory_ref import TrajectoryReference
 
 
+def numerical_sim_end_time(ref, params: Dict[str, Any]) -> float:
+    """Simulation horizon [s] from trajectory start (t=0 in the loop)."""
+    plan_span = max(float(ref.plan_end_time() - ref.t[0]), 0.0)
+    hold = float(
+        params.get('terminal_hold_duration_s', TRACKING_TERMINAL_HOLD_DURATION_S),
+    )
+    total_override = float(params.get('total_duration_s', 0.0))
+    if total_override > 0.0:
+        return max(total_override, 0.1)
+    return max(plan_span + max(hold, 0.0), 0.1)
+
+
 def numerical_sim_timing(params: Dict[str, Any]) -> tuple[float, float, int]:
     """
     Parse plant step (sim_dt) and controller period (control_dt).
@@ -50,11 +63,21 @@ def numerical_sim_timing(params: Dict[str, Any]) -> tuple[float, float, int]:
     return sim_dt, control_dt, ratio
 
 
-def _make_tracker(controller_id, phy, params, phy_gui=None):
+def _make_tracker(
+    controller_id, phy, params, phy_gui=None, flat_outputs=None, flatness_physics=None,
+):
     if controller_id == CONTROLLER_PX4:
         return PX4CascadeTracker(phy, params)
     if controller_id == CONTROLLER_LQR:
         return LQRTracker(phy, params)
+    if controller_id == CONTROLLER_FLATNESS:
+        from .flatness_tracker import FlatnessCascadeTracker
+        mass = float(phy_gui.get('mass', phy['MASS'])) if phy_gui else float(phy['MASS'])
+        g = float(phy_gui.get('g', phy['G'])) if phy_gui else float(phy['G'])
+        return FlatnessCascadeTracker(
+            phy, params, flat_outputs=flat_outputs, flatness_physics=flatness_physics,
+            mass=mass, g=g,
+        )
     if controller_id == CONTROLLER_MPC:
         return MPCTracker(phy, params)
     if controller_id == CONTROLLER_ACADOS_NMPC:
@@ -99,6 +122,8 @@ def run_tracking_simulation(
     params,
     phy_gui,
     x0=None,
+    flat_outputs=None,
+    flatness_physics=None,
 ) -> Dict[str, Any]:
     """
     Simulate closed-loop tracking of a planned trajectory.
@@ -131,7 +156,10 @@ def run_tracking_simulation(
             float(params.get('R_qx', 10.0)), 1e-9,
         )
 
-    tracker = _make_tracker(controller_id, phy, ctrl_params, phy_gui=phy_gui)
+    tracker = _make_tracker(
+        controller_id, phy, ctrl_params, phy_gui=phy_gui,
+        flat_outputs=flat_outputs, flatness_physics=flatness_physics,
+    )
     terminal_ctrl_params = None
     if controller_id in (CONTROLLER_LQR, CONTROLLER_MPC):
         terminal_ctrl_params = scale_tracking_gimbal_r(
@@ -161,9 +189,10 @@ def run_tracking_simulation(
     else:
         x13 = state12_to_state13(np.asarray(x0, dtype=float).reshape(12))
 
-    t_end = ref.plan_end_time() + TRACKING_TERMINAL_HOLD_DURATION_S - ref.t[0]
-    if t_end <= 0:
-        t_end = 0.1
+    t_end = numerical_sim_end_time(ref, params)
+    terminal_hold_s = float(
+        params.get('terminal_hold_duration_s', TRACKING_TERMINAL_HOLD_DURATION_S),
+    )
     plan_end_t = ref.plan_end_time()
 
     if hasattr(tracker, 'reset'):
@@ -181,7 +210,7 @@ def run_tracking_simulation(
     sp_vel_hist = []
     sp_att_hist = []
     sp_rate_hist = []
-    record_cascade = controller_id == CONTROLLER_PX4
+    record_cascade = controller_id in (CONTROLLER_PX4, CONTROLLER_FLATNESS)
 
     u_cmd_hold = None
     prev_u_cmd_hold = None
@@ -264,6 +293,13 @@ def run_tracking_simulation(
                     tracker.compute(x13, ref, t, horizon=horizon, dt=control_dt),
                     params,
                 )
+            elif controller_id == CONTROLLER_FLATNESS:
+                u_lqr, sig = tracker.compute(
+                    x12, ref, acc_ref, control_dt,
+                    u_ff=u_ff, use_ff=use_ff, t_query=t_clamped,
+                )
+                cascade_hold = sig
+                u_ref_lqr = u_ff if (use_ff and u_ff is not None) else np.zeros(4)
             else:
                 u_lqr = tracker.compute(
                     x12, x_ref, u_ff=u_ff, use_ff=use_ff,
@@ -327,8 +363,14 @@ def run_tracking_simulation(
         'sim_dt': sim_dt,
         'control_dt': control_dt,
         'plan_duration_s': ref.duration(),
-        'terminal_hold_duration_s': TRACKING_TERMINAL_HOLD_DURATION_S,
-        'r_gimbal_scale': r_gimbal_scale if controller_id in (CONTROLLER_LQR, CONTROLLER_MPC) else 1.0,
+        'terminal_hold_duration_s': terminal_hold_s,
+        'sim_total_duration_s': float(t_arr[-1]) if len(t_arr) else t_end,
+        'total_duration_s': float(params.get('total_duration_s', 0.0)),
+        'r_gimbal_scale': (
+            r_gimbal_scale
+            if controller_id in (CONTROLLER_LQR, CONTROLLER_MPC)
+            else 1.0
+        ),
         'platform_id': str(phy_gui.get('platform_id', 'proxy')),
         'r_thrust_body': np.array([
             float(phy_gui.get('r_thrust_x', 0.0)),

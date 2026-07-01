@@ -73,12 +73,14 @@ def param_groups_for(
     """Return categorized parameter groups for the Tracking GUI."""
     from .params import (
         CONTROLLER_ACADOS_NMPC,
+        CONTROLLER_FLATNESS,
         CONTROLLER_LQR,
         CONTROLLER_MPC,
         CONTROLLER_PX4,
     )
     cid = controller_id if controller_id in (
-        CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC, CONTROLLER_ACADOS_NMPC,
+        CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC,
+        CONTROLLER_ACADOS_NMPC, CONTROLLER_FLATNESS,
     ) else CONTROLLER_PX4
     groups: List[Dict[str, Any]] = []
     if cid == CONTROLLER_PX4:
@@ -92,6 +94,11 @@ def param_groups_for(
         groups = _mpc_param_groups()
     elif cid == CONTROLLER_ACADOS_NMPC:
         groups = _nmpc_param_groups()
+    elif cid == CONTROLLER_FLATNESS:
+        share = True
+        if px4_params is not None:
+            share = bool(px4_params.get('share_rp_gains', True))
+        groups = px4_param_groups(share_rp=share)
     return deepcopy(groups)
 
 

@@ -12,13 +12,18 @@ CONTROLLER_PX4 = 'px4_cascade'
 CONTROLLER_LQR = 'lqr'
 CONTROLLER_MPC = 'mpc'
 CONTROLLER_ACADOS_NMPC = 'acados_nmpc'
+CONTROLLER_FLATNESS = 'flatness_ff'
 
-CONTROLLER_IDS = (CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC, CONTROLLER_ACADOS_NMPC)
+CONTROLLER_IDS = (
+    CONTROLLER_PX4, CONTROLLER_LQR, CONTROLLER_MPC,
+    CONTROLLER_ACADOS_NMPC, CONTROLLER_FLATNESS,
+)
 CONTROLLER_LABELS = {
     CONTROLLER_PX4: 'PX4 cascade (pos→vel→att→rate)',
     CONTROLLER_LQR: 'LQR (full-state + feedforward)',
     CONTROLLER_MPC: 'MPC (linear horizon, u_ref + Δu)',
     CONTROLLER_ACADOS_NMPC: 'NMPC (acados nonlinear, direct u)',
+    CONTROLLER_FLATNESS: 'Flatness cascade (ξ loop + planned FF)',
 }
 
 SIM_NUMERICAL = 'numerical'
@@ -116,7 +121,7 @@ def param_specs_for(controller_id: str, px4_params: Dict[str, Any] | None = None
 
 def default_params_for(controller_id: str) -> Dict[str, float]:
     """Default parameter dict for one controller."""
-    if controller_id == CONTROLLER_PX4:
+    if controller_id in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
         return default_px4_gui_params(share_rp=True)
     out = {}
     for spec in param_specs_for(controller_id):
@@ -131,10 +136,12 @@ def default_params_for(controller_id: str) -> Dict[str, float]:
 
 
 def default_numerical_sim_config() -> Dict[str, float]:
-    """Plant integration step and controller update period for numerical tracking."""
+    """Plant step, controller period, and simulation horizon for numerical tracking."""
     return {
         'sim_dt': 0.005,
         'control_dt': 0.02,
+        'terminal_hold_duration_s': TRACKING_TERMINAL_HOLD_DURATION_S,
+        'total_duration_s': 0.0,
     }
 
 
@@ -148,19 +155,27 @@ def strip_legacy_tracking_options(params: Dict[str, Any]) -> Dict[str, Any]:
 
 def migrate_numerical_sim_config(cfg: Dict[str, Any] | None) -> Dict[str, float]:
     """Load numerical_sim block; lift legacy sim_dt from per-controller params."""
+    defaults = default_numerical_sim_config()
     if cfg and cfg.get('numerical_sim'):
         ns = dict(cfg['numerical_sim'])
         return {
-            'sim_dt': float(ns.get('sim_dt', 0.005)),
-            'control_dt': float(ns.get('control_dt', 0.02)),
+            'sim_dt': float(ns.get('sim_dt', defaults['sim_dt'])),
+            'control_dt': float(ns.get('control_dt', defaults['control_dt'])),
+            'terminal_hold_duration_s': float(
+                ns.get('terminal_hold_duration_s', defaults['terminal_hold_duration_s']),
+            ),
+            'total_duration_s': float(ns.get('total_duration_s', defaults['total_duration_s'])),
         }
     params_map = (cfg or {}).get('params') or {}
     for raw in params_map.values():
         if isinstance(raw, dict) and 'sim_dt' in raw:
             old_dt = float(raw['sim_dt'])
             plant_dt = min(old_dt, 0.01)
-            return {'sim_dt': plant_dt, 'control_dt': old_dt}
-    return default_numerical_sim_config()
+            out = dict(defaults)
+            out['sim_dt'] = plant_dt
+            out['control_dt'] = old_dt
+            return out
+    return defaults
 
 
 def all_default_tracking_config() -> Dict[str, Any]:

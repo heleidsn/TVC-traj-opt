@@ -456,6 +456,9 @@ def tracking_summary_text(result):
         f"max |Δp| = {result['max_pos_err_m'] * 1000:.1f} mm, "
         f"RMSE = {result['rmse_pos_m'] * 1000:.1f} mm"
     )
+    sim_dur = result.get('sim_total_duration_s')
+    if sim_dur is not None:
+        txt += f", sim {float(sim_dur):.2f} s"
     r_scale = float(result.get('r_gimbal_scale', 1.0))
     if r_scale > 1.5:
         txt += f" (gimbal R ×{r_scale:.0f} for {result.get('platform_id', 'platform')} mass)"
