@@ -44,6 +44,8 @@ def px4_param_groups(share_rp: bool = True) -> List[Dict[str, Any]]:
             'specs': [
                 _spin('share_rp_gains', 'Roll/pitch share same gains', 1.0, 0, 1, 1,
                       checkbox=True, full_width=True),
+                _spin('use_acc_feedforward', 'Velocity loop: planned acc FF', 0.0, 0, 1, 1,
+                      checkbox=True, full_width=True),
             ],
         },
         {
@@ -245,6 +247,7 @@ def normalize_px4_params(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     out = {
         'share_rp_gains': share,
+        'use_acc_feedforward': bool(p.get('use_acc_feedforward', False)),
         'Kp_pos_xy': float(p['Kp_pos_xy']),
         'Kp_pos_z': float(p['Kp_pos_z']),
         'Kp_vel_xy': float(p['Kp_vel_xy']), 'Ki_vel_xy': float(p['Ki_vel_xy']),

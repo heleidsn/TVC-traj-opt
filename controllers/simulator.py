@@ -178,7 +178,9 @@ def run_tracking_simulation(
         if hasattr(tracker, 'update_params'):
             tracker.update_params(nmpc_params)
 
-    use_ff = TRACKING_USE_FEEDFORWARD
+    px4_tracking = controller_id == CONTROLLER_PX4
+    # PX4 cascade is tuned as pure feedback; other controllers may use planned u_ff.
+    use_ff = TRACKING_USE_FEEDFORWARD and not px4_tracking
     clip_pos = TRACKING_CLIP_POS_ERROR_M
     clip_vel = TRACKING_CLIP_VEL_ERROR_M_S
 
@@ -189,7 +191,10 @@ def run_tracking_simulation(
     else:
         x13 = state12_to_state13(np.asarray(x0, dtype=float).reshape(12))
 
-    t_end = numerical_sim_end_time(ref, params)
+    if px4_tracking:
+        t_end = max(ref.duration(), 0.1)
+    else:
+        t_end = numerical_sim_end_time(ref, params)
     terminal_hold_s = float(
         params.get('terminal_hold_duration_s', TRACKING_TERMINAL_HOLD_DURATION_S),
     )
@@ -261,22 +266,27 @@ def run_tracking_simulation(
                 if terminal_gains else clip_vel
             )
 
-            x_ref = ref.tracking_state12_at(t)
-            acc_ref = np.zeros(3, dtype=float) if in_terminal else ref.accel_at(t_clamped)
-            if use_ff:
-                if in_terminal:
-                    u_ff = ref.terminal_hold_control_lqr()
-                else:
-                    u_ff = ref.control_lqr_at(t_clamped)
-            else:
+            if px4_tracking:
+                x_ref = ref.state12_at(t_clamped)
+                acc_ref = ref.accel_at(t_clamped)
                 u_ff = None
+            else:
+                x_ref = ref.tracking_state12_at(t)
+                acc_ref = np.zeros(3, dtype=float) if in_terminal else ref.accel_at(t_clamped)
+                if use_ff:
+                    if in_terminal:
+                        u_ff = ref.terminal_hold_control_lqr()
+                    else:
+                        u_ff = ref.control_lqr_at(t_clamped)
+                else:
+                    u_ff = None
 
             if controller_id == CONTROLLER_PX4:
                 u_lqr, sig = tracker.compute(
-                    x12, x_ref, acc_ref, control_dt, u_ff=u_ff, use_ff=use_ff,
+                    x12, x_ref, acc_ref, control_dt, u_ff=None, use_ff=False,
                 )
                 cascade_hold = sig
-                u_ref_lqr = u_ff if (use_ff and u_ff is not None) else np.zeros(4)
+                u_ref_lqr = np.zeros(4)
             elif controller_id == CONTROLLER_MPC:
                 horizon = int(params.get('horizon', 20))
                 mpc_dt = float(getattr(tracker, 'mpc_dt', params.get('mpc_dt', control_dt)))
@@ -307,12 +317,16 @@ def run_tracking_simulation(
                 )
                 u_ref_lqr = u_ff if (use_ff and u_ff is not None) else np.zeros(4)
 
-            if controller_id != CONTROLLER_ACADOS_NMPC:
+            if controller_id == CONTROLLER_ACADOS_NMPC:
+                pass
+            elif px4_tracking:
+                u_cmd_hold = lqr_to_control_opt(u_lqr, mass, g)
+            else:
                 u_lqr = clip_lqr_gimbal_cmd(u_lqr, th_p_lim, th_r_lim)
                 u_cmd_hold = _clip_plant_control(
                     lqr_to_control_opt(u_lqr, mass, g), params,
                 )
-            if prev_u_cmd_hold is not None:
+            if prev_u_cmd_hold is not None and not px4_tracking:
                 for axis in (0, 1):
                     du = u_cmd_hold[axis] - prev_u_cmd_hold[axis]
                     u_cmd_hold[axis] = prev_u_cmd_hold[axis] + np.clip(
@@ -344,7 +358,10 @@ def run_tracking_simulation(
 
     t_arr = np.asarray(t_hist, dtype=float)
     x_sim = np.asarray(x12_hist, dtype=float)
-    x_ref_arr = np.array([ref.tracking_state12_at(ti) for ti in t_arr])
+    if px4_tracking:
+        x_ref_arr = np.array([ref.state12_at(min(ti, ref.t[-1])) for ti in t_arr])
+    else:
+        x_ref_arr = np.array([ref.tracking_state12_at(ti) for ti in t_arr])
     pos_err = x_sim[:, 0:3] - x_ref_arr[:, 0:3]
     err_norm = np.linalg.norm(pos_err, axis=1)
 
@@ -358,6 +375,10 @@ def run_tracking_simulation(
         'controller_id': controller_id,
         'u_hist': np.asarray(u_opt_hist, dtype=float),
         'use_feedforward': use_ff,
+        'use_acc_feedforward': (
+            bool(getattr(tracker, 'gains', {}).get('use_acc_feedforward', False))
+            if controller_id == CONTROLLER_PX4 else None
+        ),
         'dynamics_model': 'nonlinear',
         'actuator_dynamics_enabled': actuator.any_enabled(),
         'sim_dt': sim_dt,

@@ -240,7 +240,8 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
          np.degrees(sp_att) if sp_att is not None else None),
         ('ax_vel', x_ref[:, 3:6], x_sim[:, 3:6], 'Velocity (m/s)', 'Velocity', False, sp_vel),
         ('ax_angvel', np.degrees(x_ref[:, 9:12]), np.degrees(x_sim[:, 9:12]),
-         'Angular vel (°/s)', 'Angular velocity', False, sp_rate),
+         'Angular vel (°/s)', 'Angular velocity', False,
+         np.degrees(sp_rate) if sp_rate is not None else None),
         ('ax_acc', acc_ref, acc_sim, 'Acceleration (m/s²)', 'Acceleration', False, None),
         ('ax_angacc', angacc_ref, angacc_sim, 'Angular acc (rad/s²)', 'Angular acceleration', False, None),
     ]

@@ -175,6 +175,10 @@ class PX4CascadeTracker:
         vel_ref = ref[3:6]
         pos_err = pos_ref - pos
 
+        acc_ref = np.asarray(acc_ref, dtype=float).reshape(3)
+        if not g.get('use_acc_feedforward', False):
+            acc_ref = np.zeros(3, dtype=float)
+
         vel_sp = np.array([
             g['Kp_pos_xy'] * pos_err[0] + vel_ref[0],
             g['Kp_pos_xy'] * pos_err[1] + vel_ref[1],
