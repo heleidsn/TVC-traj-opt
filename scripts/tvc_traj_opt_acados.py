@@ -872,7 +872,8 @@ def solve_with_acados_waypoints_free_tf(
 
 def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, max_iter=100,
                                 use_box_solver=False, callback=None, running_flag=None,
-                                terminal_weights=None, iteration_callback=None, verbose_solve=False):
+                                terminal_weights=None, iteration_callback=None, verbose_solve=False,
+                                initial_state=None):
     """
     Solve trajectory optimization with waypoints using Acados.
     
@@ -942,8 +943,13 @@ def solve_with_acados_waypoints(dt, waypoints, m, I, r_thrust, weights, bounds, 
     all_u_actual = []  # per segment: (N+1,4) or None if no actuator dynamics
     all_loggers = []
     
-    # Initial state
-    x0 = waypoint_to_acados_state(waypoints[0])
+    # Initial state (optional override for online replanning from measured state)
+    if initial_state is not None:
+        x0 = np.asarray(initial_state, dtype=float).flatten()
+        if x0.size > 12:
+            x0 = x0[:12]
+    else:
+        x0 = waypoint_to_acados_state(waypoints[0])
     
     # Base dir for code export (avoid segment overwrite / module cache reuse)
     base_export = os.path.join(os.path.dirname(os.path.abspath(__file__)), "c_generated_code")

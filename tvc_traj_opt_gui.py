@@ -1383,6 +1383,17 @@ class MainWindow(QMainWindow):
         self.saved_waypoints_path = DEFAULT_SAVED_WAYPOINTS_PATH
         self._tvc_launch_proc = None
         self._traj_player_proc = None
+        self._online_planner_proc = None
+        self._bg_proc_log_handles = {}
+        self._online_planner_diag_timer = QTimer(self)
+        self._online_planner_diag_timer.setInterval(500)
+        self._online_planner_diag_timer.timeout.connect(
+            self._poll_online_planner_diagnostics
+        )
+        self._sitl_nodes_timer = QTimer(self)
+        self._sitl_nodes_timer.setInterval(2000)
+        self._sitl_nodes_timer.timeout.connect(self._poll_sitl_nodes_status)
+        self._online_planner_advance_retries_left = 0
         self._method_sync_guard = False
         self._platform_phys_cache = {}
         self._cached_platform_id = PLATFORM_PROXY
@@ -3098,7 +3109,8 @@ class MainWindow(QMainWindow):
         sitl_run_layout.setVerticalSpacing(4)
         self.btn_start_px4_sitl = QPushButton('Start SITL')
         self.btn_start_px4_sitl.setToolTip(
-            'Launch PX4 SITL + Gazebo. LQR controller is enabled when LQR is selected.'
+            'Launch PX4 SITL + Gazebo (+ RViz). Uncheck "Show Gazebo GUI" to run '
+            'Gazebo headless and visualize only in RViz.'
         )
         self.btn_start_px4_sitl.clicked.connect(self.start_px4_sitl_for_tracking)
         self.btn_stop_px4_sitl = QPushButton('Stop SITL')
@@ -3111,6 +3123,98 @@ class MainWindow(QMainWindow):
         sitl_run_layout.addWidget(self.btn_stop_px4_sitl, 1, 0)
         sitl_run_layout.addWidget(self.lbl_px4_sitl_status, 1, 1)
 
+        self.lbl_sitl_nodes_status = QLabel('Nodes: —')
+        self.lbl_sitl_nodes_status.setWordWrap(True)
+        self.lbl_sitl_nodes_status.setTextFormat(Qt.RichText)
+        self.lbl_sitl_nodes_status.setStyleSheet(
+            'color: #888; font-family: monospace; font-size: 11px;'
+        )
+        self.lbl_sitl_nodes_status.setToolTip(
+            'Live ROS2 / process status (● up, ○ down). Refreshes every 2 s while SITL runs.'
+        )
+        sitl_run_layout.addWidget(QLabel('Stack:'), 2, 0, Qt.AlignTop)
+        sitl_run_layout.addWidget(self.lbl_sitl_nodes_status, 2, 1)
+
+        self.chk_show_gazebo_gui = QCheckBox('Show Gazebo GUI')
+        self.chk_show_gazebo_gui.setToolTip(
+            'When unchecked, Gazebo runs headless (no 3D window). Physics and '
+            'ros_gz_bridge still run — RViz is enough for most SITL tracking.'
+        )
+        self.chk_show_gazebo_gui.setChecked(False)
+        self.chk_show_gazebo_gui.stateChanged.connect(
+            self._on_show_gazebo_gui_changed
+        )
+        sitl_run_layout.addWidget(self.chk_show_gazebo_gui, 3, 0, 1, 2)
+
+        self.chk_enable_online_planner = QCheckBox('Online safety planner (RViz)')
+        self.chk_enable_online_planner.setToolTip(
+            'When checked, Start SITL also launches the online_planner node '
+            '(Acados replanning from current state to the next waypoint(s), '
+            'visualized in RViz as /online_planner/planned_path). '
+            'During tracking, targets follow Trajectory-tab arrival times.'
+        )
+        self.chk_enable_online_planner.setChecked(True)
+        self.chk_enable_online_planner.stateChanged.connect(
+            self._on_online_planner_checkbox_changed
+        )
+        sitl_run_layout.addWidget(self.chk_enable_online_planner, 4, 0)
+
+        self.spin_online_planner_rate = QDoubleSpinBox()
+        self.spin_online_planner_rate.setRange(0.2, 50.0)
+        self.spin_online_planner_rate.setSingleStep(0.5)
+        self.spin_online_planner_rate.setDecimals(1)
+        self.spin_online_planner_rate.setSuffix(' Hz')
+        self.spin_online_planner_rate.setToolTip(
+            'Online planner replanning rate (0.2–50 Hz). Applied at launch; '
+            'if the planner is already running, the rate is updated live via ros2 param set.'
+        )
+        self.spin_online_planner_rate.setValue(
+            float(self._tracking_config.get('online_planner_rate_hz', 10.0))
+        )
+        self.spin_online_planner_rate.valueChanged.connect(
+            self._on_online_planner_rate_changed
+        )
+        self.lbl_online_planner_actual_hz = QLabel('Actual: —')
+        self.lbl_online_planner_actual_hz.setStyleSheet(
+            'color: #888; font-family: monospace; font-size: 11px;'
+        )
+        self.lbl_online_planner_actual_hz.setToolTip(
+            'Measured replan completion rate over the last 5 s '
+            '(actual/target). Drops below target when Acados solve is slower '
+            'than the timer period (shown as busy %).'
+        )
+        rate_col = QWidget()
+        rate_col_layout = QVBoxLayout(rate_col)
+        rate_col_layout.setContentsMargins(0, 0, 0, 0)
+        rate_col_layout.setSpacing(2)
+        rate_col_layout.addWidget(self.spin_online_planner_rate)
+        rate_col_layout.addWidget(self.lbl_online_planner_actual_hz)
+        sitl_run_layout.addWidget(rate_col, 4, 1)
+
+        self.lbl_online_planner_diag = QLabel('Planner: —')
+        self.lbl_online_planner_diag.setStyleSheet('color: #888;')
+        self.lbl_online_planner_diag.setWordWrap(True)
+        self.lbl_online_planner_diag.setToolTip(
+            'Live metrics from /online_planner/diagnostics: replan rate, '
+            'solve time, start/end ENU, active waypoint.'
+        )
+        sitl_run_layout.addWidget(self.lbl_online_planner_diag, 5, 0, 1, 2)
+
+        self.btn_online_planner_next_wp = QPushButton('Planner: next WP')
+        self.btn_online_planner_next_wp.setToolTip(
+            'Advance the online planner to the next mission waypoint '
+            '(cycles back to WP0 after the last). '
+            'Calls service /online_planner/advance_waypoint.'
+        )
+        self.btn_online_planner_next_wp.clicked.connect(
+            self._online_planner_advance_waypoint
+        )
+        self.lbl_online_planner_wp_info = QLabel('')
+        self.lbl_online_planner_wp_info.setStyleSheet('color: #888;')
+        self.lbl_online_planner_wp_info.setWordWrap(True)
+        sitl_run_layout.addWidget(self.btn_online_planner_next_wp, 6, 0)
+        sitl_run_layout.addWidget(self.lbl_online_planner_wp_info, 6, 1)
+
         self.btn_start_tracking = QPushButton('Start tracking')
         self.btn_start_tracking.setToolTip('Launch tvc_traj_player with the selected trajectory source.')
         self.btn_start_tracking.clicked.connect(self.start_tracking_node)
@@ -3119,9 +3223,9 @@ class MainWindow(QMainWindow):
         self.btn_stop_tracking.setEnabled(False)
         self.lbl_tracking_status = QLabel('Stopped')
         self.lbl_tracking_status.setStyleSheet('color: #888;')
-        sitl_run_layout.addWidget(self.btn_start_tracking, 2, 0)
-        sitl_run_layout.addWidget(self.btn_stop_tracking, 2, 1)
-        sitl_run_layout.addWidget(self.lbl_tracking_status, 3, 0, 1, 2)
+        sitl_run_layout.addWidget(self.btn_start_tracking, 7, 0)
+        sitl_run_layout.addWidget(self.btn_stop_tracking, 7, 1)
+        sitl_run_layout.addWidget(self.lbl_tracking_status, 8, 0, 1, 2)
         run_layout.addWidget(self.sitl_run_widget, 2, 0, 1, 2)
 
         self.btn_clear_rviz_traj = QPushButton('Clear RViz executed path')
@@ -6126,6 +6230,73 @@ class MainWindow(QMainWindow):
         """CSV path for the current trajectory slot (legacy alias)."""
         return self._current_trajectory_csv_path()
 
+    def _mission_waypoints_for_online_planner(self):
+        """Mission targets from Trajectory tab (skip index-0 departure pose)."""
+        self._sync_waypoints_from_table()
+        if not self.waypoints:
+            return []
+        rows = [_normalize_waypoint_row(w) for w in self.waypoints]
+        if len(rows) >= 2:
+            return rows[1:]
+        return rows
+
+    def _encode_waypoints_for_online_planner(self):
+        """Encode Trajectory-tab mission targets for online_planner (ENU x,y,z,yaw,time)."""
+        mission = self._mission_waypoints_for_online_planner()
+        if not mission:
+            return ''
+        parts = []
+        for row in mission:
+            x, y, z, yaw, t_arr = row
+            parts.append(f'{x},{y},{z},{yaw},{t_arr}')
+        return ';'.join(parts)
+
+    def _update_online_planner_wp_info_label(self):
+        if not hasattr(self, 'lbl_online_planner_wp_info'):
+            return
+        mission = self._mission_waypoints_for_online_planner()
+        total = len(self.waypoints) if hasattr(self, 'waypoints') else 0
+        if not mission:
+            self.lbl_online_planner_wp_info.setText('WPs: (none from Trajectory)')
+            return
+        preview = ' | '.join(
+            f'({r[0]:.1f},{r[1]:.1f},{r[2]:.1f})' for r in mission[:3]
+        )
+        if len(mission) > 3:
+            preview += f' … +{len(mission) - 3}'
+        self.lbl_online_planner_wp_info.setText(
+            f'WPs: {len(mission)} targets (skip start; {total} in table) {preview}'
+        )
+
+    def _collect_online_planner_cost_config(self):
+        """Acados cost / bounds / discretization from the Trajectory tab (Method 4 style)."""
+        if not hasattr(self, 'w_p'):
+            return None
+        params = self.get_parameters()
+        weights = dict(params.get('weights') or {})
+        weights['acados_objective'] = 'tracking'
+        return {
+            'weights': weights,
+            'terminal_weights': dict(params.get('terminal_weights') or {}),
+            'bounds': dict(params.get('bounds') or {}),
+            'dt': float(params.get('dt', 0.1)),
+            'horizon_N': int(params.get('N', 20)),
+            'max_iter': int(params.get('max_iter', 100)),
+        }
+
+    def _encode_online_planner_cost_json(self):
+        """Serialize Trajectory-tab cost params for online_planner ROS parameters."""
+        cfg = self._collect_online_planner_cost_config()
+        if not cfg:
+            return '', '', ''
+        compact = json.dumps
+        safe = _json_safe_for_fingerprint
+        return (
+            compact(safe(cfg['weights']), separators=(',', ':')),
+            compact(safe(cfg['terminal_weights']), separators=(',', ':')),
+            compact(safe(cfg['bounds']), separators=(',', ':')),
+        )
+
     def _encode_waypoints_for_tracking(self):
         """Encode GUI waypoint list as tvc_traj_player waypoints_enu string."""
         self._sync_waypoints_from_table()
@@ -6282,27 +6453,56 @@ class MainWindow(QMainWindow):
                 )
         return True
 
+    def _background_process_log_path(self, attr_name: str) -> str:
+        log_dir = os.path.join(self._ros2_workspace_root(), 'logs', 'gui_background')
+        os.makedirs(log_dir, exist_ok=True)
+        slug = str(attr_name).lstrip('_')
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        return os.path.join(log_dir, f'{slug}_{stamp}.log')
+
+    def _close_background_process_log(self, attr_name: str) -> None:
+        fh = self._bg_proc_log_handles.pop(attr_name, None)
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
     def _start_background_process(self, attr_name, cmd, label):
         """Start a detached process group; store handle on self.<attr_name>."""
         proc = getattr(self, attr_name, None)
-        if proc is not None and proc.poll() is None:
-            QMessageBox.information(self, label, f'{label} is already running.')
-            return
+        if proc is not None:
+            if proc.poll() is None:
+                QMessageBox.information(self, label, f'{label} is already running.')
+                return
+            setattr(self, attr_name, None)
+            self._close_background_process_log(attr_name)
+        log_path = self._background_process_log_path(attr_name)
+        log_fh = None
         try:
+            log_fh = open(log_path, 'w', encoding='utf-8', buffering=1)
             new_proc = subprocess.Popen(
                 cmd,
                 cwd=self._ros2_workspace_root(),
-                stdout=subprocess.PIPE,
+                stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid,
                 text=True,
             )
         except OSError as e:
+            if log_fh is not None:
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
             QMessageBox.critical(self, f'{label} failed', str(e))
             self.status_text.append(f'{label} failed: {e}')
             return
+        self._bg_proc_log_handles[attr_name] = log_fh
         setattr(self, attr_name, new_proc)
-        self.status_text.append(f'{label} started (pid {new_proc.pid})')
+        self.status_text.append(
+            f'{label} started (pid {new_proc.pid})\n  log: {log_path}'
+        )
         self._refresh_sim_button_states()
 
     def _stop_background_process(self, attr_name, label):
@@ -6329,6 +6529,7 @@ class MainWindow(QMainWindow):
                 pass
             proc.wait(timeout=3.0)
         setattr(self, attr_name, None)
+        self._close_background_process_log(attr_name)
         self.status_text.append(f'{label} stopped')
         self._refresh_sim_button_states()
 
@@ -6370,6 +6571,88 @@ class MainWindow(QMainWindow):
             else:
                 self.lbl_tracking_status.setText('Stopped')
                 self.lbl_tracking_status.setStyleSheet('color: #888;')
+        planner_running = self._online_planner_running() if hasattr(self, '_online_planner_running') else False
+        sitl_running = self._sitl_proc_running() if hasattr(self, '_sitl_proc_running') else False
+        planner_enabled = self._online_planner_enabled() if hasattr(self, '_online_planner_enabled') else False
+        if hasattr(self, 'btn_online_planner_next_wp'):
+            self.btn_online_planner_next_wp.setEnabled(sitl_running and planner_enabled)
+        self._update_online_planner_diag_timer()
+        self._update_sitl_nodes_timer()
+
+    def _traj_player_proc_running(self) -> bool:
+        proc = getattr(self, '_traj_player_proc', None)
+        if proc is None:
+            return False
+        if proc.poll() is not None:
+            setattr(self, '_traj_player_proc', None)
+            return False
+        return True
+
+    def _px4_sitl_process_active(self) -> bool:
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', 'px4_sitl_default/bin/px4'],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0 and bool(result.stdout.strip())
+
+    def _sitl_monitored_node_specs(self):
+        """(display label, ros node name) or (label, None) for non-ROS checks."""
+        specs = [
+            ('PX4', None),
+            ('Gz bridge', '/ros_gz_bridge'),
+            ('Vision', '/gz_vision_publisher'),
+            ('RViz br.', '/px4_rviz_bridge'),
+            ('RViz', '/rviz2'),
+            ('Robot', '/robot_state_publisher'),
+        ]
+        if self._online_planner_enabled():
+            specs.append(('Planner', '/online_planner'))
+        specs.append(('Tracking', '/tvc_traj_player'))
+        if self._current_tracking_controller_id() == CONTROLLER_LQR:
+            specs.append(('LQR', '/lqr_px4_controller'))
+        return specs
+
+    def _poll_sitl_nodes_status(self):
+        if not hasattr(self, 'lbl_sitl_nodes_status'):
+            return
+        active_nodes = set()
+        result = self._ros2_run_in_workspace('ros2 node list', timeout=4.0)
+        if result is not None and result.returncode == 0:
+            for line in (result.stdout or '').splitlines():
+                name = line.strip()
+                if name:
+                    active_nodes.add(name)
+        px4_up = self._px4_sitl_process_active()
+        chunks = []
+        for label, node_name in self._sitl_monitored_node_specs():
+            if node_name is None:
+                up = px4_up
+            else:
+                up = node_name in active_nodes
+            color = '#2e7d32' if up else '#888'
+            mark = '●' if up else '○'
+            chunks.append(f'<span style="color:{color}">{mark} {label}</span>')
+        self.lbl_sitl_nodes_status.setText(' '.join(chunks))
+
+    def _update_sitl_nodes_timer(self):
+        if not hasattr(self, '_sitl_nodes_timer'):
+            return
+        sitl_running = self._sitl_proc_running()
+        track_running = self._traj_player_proc_running()
+        should_poll = sitl_running or track_running
+        if should_poll:
+            if not self._sitl_nodes_timer.isActive():
+                self._sitl_nodes_timer.start()
+            self._poll_sitl_nodes_status()
+        else:
+            self._sitl_nodes_timer.stop()
+            if hasattr(self, 'lbl_sitl_nodes_status'):
+                self.lbl_sitl_nodes_status.setText('Nodes: —')
 
     def _current_tracking_controller_id(self):
         if not hasattr(self, 'tracking_controller_combo'):
@@ -6548,6 +6831,9 @@ class MainWindow(QMainWindow):
             ),
             'actuator': dict(self._tracking_config.get('actuator') or default_actuator_tracking_config()),
             'params': dict(self._tracking_config.get('params', {})),
+            'enable_online_planner': self._online_planner_enabled(),
+            'online_planner_rate_hz': self._online_planner_rate_hz(),
+            'show_gazebo_gui': self._show_gazebo_gui_enabled(),
         }
         if hasattr(self, 'px4_tune_level_combo'):
             out['px4_tune'] = self._collect_px4_tune_config()
@@ -6586,6 +6872,33 @@ class MainWindow(QMainWindow):
         self._apply_numerical_sim_config(self._tracking_config.get('numerical_sim'))
         if cfg.get('px4_tune'):
             self._apply_px4_tune_config(cfg['px4_tune'])
+        if hasattr(self, 'chk_enable_online_planner'):
+            self.chk_enable_online_planner.blockSignals(True)
+            self.chk_enable_online_planner.setChecked(
+                bool(cfg.get('enable_online_planner', True))
+            )
+            self.chk_enable_online_planner.blockSignals(False)
+            self._tracking_config['enable_online_planner'] = (
+                self.chk_enable_online_planner.isChecked()
+            )
+        if hasattr(self, 'spin_online_planner_rate'):
+            self.spin_online_planner_rate.blockSignals(True)
+            self.spin_online_planner_rate.setValue(
+                float(cfg.get('online_planner_rate_hz', 10.0))
+            )
+            self.spin_online_planner_rate.blockSignals(False)
+            self._tracking_config['online_planner_rate_hz'] = (
+                self._online_planner_rate_hz()
+            )
+        if hasattr(self, 'chk_show_gazebo_gui'):
+            self.chk_show_gazebo_gui.blockSignals(True)
+            self.chk_show_gazebo_gui.setChecked(
+                bool(cfg.get('show_gazebo_gui', False))
+            )
+            self.chk_show_gazebo_gui.blockSignals(False)
+            self._tracking_config['show_gazebo_gui'] = (
+                self.chk_show_gazebo_gui.isChecked()
+            )
         self._update_px4_tune_visibility()
         self._on_tracking_sim_mode_changed()
 
@@ -6791,6 +7104,395 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, 'Tracking simulation error', msg)
         self.status_text.append(f'Tracking sim error: {msg}')
 
+    def _online_planner_rate_hz(self) -> float:
+        if hasattr(self, 'spin_online_planner_rate'):
+            return float(self.spin_online_planner_rate.value())
+        return float(self._tracking_config.get('online_planner_rate_hz', 10.0))
+
+    def _online_planner_launch_extra_args(self):
+        """ROS launch overrides for online_planner (platform + mission waypoints + cost)."""
+        kw = sitl_launch_kwargs(self._current_rocket_platform_id())
+        args = [
+            self._launch_arg('rocket_platform', kw['rocket_platform']),
+            self._launch_arg('replan_rate_hz', self._online_planner_rate_hz()),
+        ]
+        wp_str = self._encode_waypoints_for_online_planner()
+        if wp_str:
+            args.append(self._launch_arg('waypoints_enu', wp_str))
+        cost_cfg = self._collect_online_planner_cost_config()
+        if cost_cfg:
+            w_json, tw_json, b_json = self._encode_online_planner_cost_json()
+            if w_json:
+                args.append(self._launch_arg('planner_weights_json', w_json))
+            if tw_json:
+                args.append(self._launch_arg('planner_terminal_weights_json', tw_json))
+            if b_json:
+                args.append(self._launch_arg('planner_bounds_json', b_json))
+            args.append(self._launch_arg('dt', cost_cfg['dt']))
+            args.append(self._launch_arg('horizon_N', cost_cfg['horizon_N']))
+            args.append(self._launch_arg('max_iter', cost_cfg['max_iter']))
+        return args
+
+    def _sitl_proc_running(self) -> bool:
+        proc = getattr(self, '_tvc_launch_proc', None)
+        if proc is None:
+            return False
+        if proc.poll() is not None:
+            setattr(self, '_tvc_launch_proc', None)
+            return False
+        return True
+
+    def _online_planner_proc_alive(self) -> bool:
+        proc = getattr(self, '_online_planner_proc', None)
+        if proc is None:
+            return False
+        if proc.poll() is not None:
+            setattr(self, '_online_planner_proc', None)
+            return False
+        return True
+
+    def _online_planner_node_active(self) -> bool:
+        """True if /online_planner is registered in the ROS graph."""
+        result = self._ros2_run_in_workspace('ros2 node list', timeout=4.0)
+        if result is None or result.returncode != 0:
+            return False
+        return '/online_planner' in (result.stdout or '')
+
+    def _online_planner_running(self) -> bool:
+        """Launch process alive, or ROS node present (e.g. after GUI restart)."""
+        if self._online_planner_proc_alive():
+            return True
+        return self._online_planner_node_active()
+
+    def _ros2_run_in_workspace(self, shell_cmd: str, timeout: float = 2.0):
+        """Run a one-shot shell command with workspace ROS env."""
+        ws = self._ros2_workspace_root()
+        setup = os.path.join(ws, 'install', 'setup.bash')
+        if os.path.isfile(setup):
+            cmd = ['bash', '-lc', f'source "{setup}" && {shell_cmd}']
+        else:
+            cmd = ['bash', '-lc', shell_cmd]
+        try:
+            return subprocess.run(
+                cmd,
+                cwd=ws,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def _parse_ros2_string_echo(self, stdout: str) -> str:
+        for line in (stdout or '').splitlines():
+            stripped = line.strip()
+            if stripped.startswith('data:'):
+                value = stripped.split('data:', 1)[1].strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                return value
+        return ''
+
+    def _set_online_planner_param(self, name: str, value) -> bool:
+        if isinstance(value, str):
+            escaped = value.replace("'", "'\\''")
+            val_str = f"'{escaped}'"
+        else:
+            val_str = str(value)
+        result = self._ros2_run_in_workspace(
+            f'ros2 param set /online_planner {name} {val_str}',
+            timeout=3.0,
+        )
+        return result is not None and result.returncode == 0
+
+    def _push_online_planner_config(self):
+        """Push Trajectory-tab waypoints and cost params to a running planner."""
+        if not self._online_planner_running():
+            return
+        wp_str = self._encode_waypoints_for_online_planner()
+        if wp_str:
+            ok_wp = self._set_online_planner_param('waypoints_enu', wp_str)
+            n = len(self._mission_waypoints_for_online_planner())
+            if ok_wp:
+                self.status_text.append(
+                    f'Online planner: pushed {n} mission waypoint(s) from Trajectory tab.'
+                )
+            else:
+                self.status_text.append(
+                    'Online planner: failed to push waypoints_enu param.'
+                )
+        else:
+            self.status_text.append(
+                'Online planner: Trajectory tab has no mission waypoints to push.'
+            )
+
+        cost_cfg = self._collect_online_planner_cost_config()
+        if cost_cfg:
+            w_json, tw_json, b_json = self._encode_online_planner_cost_json()
+            ok_cost = True
+            if w_json:
+                ok_cost &= self._set_online_planner_param('planner_weights_json', w_json)
+            if tw_json:
+                ok_cost &= self._set_online_planner_param(
+                    'planner_terminal_weights_json', tw_json,
+                )
+            if b_json:
+                ok_cost &= self._set_online_planner_param('planner_bounds_json', b_json)
+            ok_cost &= self._set_online_planner_param('dt', cost_cfg['dt'])
+            ok_cost &= self._set_online_planner_param('horizon_N', cost_cfg['horizon_N'])
+            ok_cost &= self._set_online_planner_param('max_iter', cost_cfg['max_iter'])
+            w = cost_cfg['weights']
+            if ok_cost:
+                self.status_text.append(
+                    'Online planner: synced Trajectory cost '
+                    f'(p={w.get("p")}, v={w.get("v")}, R={w.get("R")}, '
+                    f'k_term={w.get("terminal_cost_multiplier")}, '
+                    f'dt={cost_cfg["dt"]}, N={cost_cfg["horizon_N"]}).'
+                )
+            else:
+                self.status_text.append(
+                    'Online planner: failed to push some cost/discretization params.'
+                )
+        self._update_online_planner_wp_info_label()
+
+    def _push_online_planner_waypoints(self):
+        """Backward-compatible alias."""
+        self._push_online_planner_config()
+
+    def _invoke_advance_waypoint_service(self):
+        result = self._ros2_run_in_workspace(
+            'ros2 service call /online_planner/advance_waypoint std_srvs/srv/Trigger',
+            timeout=10.0,
+        )
+        if result is None or result.returncode != 0:
+            err = ''
+            if result is not None:
+                err = (result.stderr or result.stdout or '').strip()
+            self.status_text.append(
+                'Online planner: failed to call advance_waypoint service.'
+                + (f' {err}' if err else '')
+            )
+            return
+        out = result.stdout or ''
+        if 'success=True' in out.replace(' ', ''):
+            msg = ''
+            for line in out.splitlines():
+                if 'message:' in line:
+                    msg = line.split('message:', 1)[1].strip().strip("'\"")
+                    break
+            detail = f' -> {msg}' if msg else ''
+            self.status_text.append(
+                f'Online planner: advanced to next waypoint (cyclic){detail}.'
+            )
+        else:
+            self.status_text.append(
+                f'Online planner: advance_waypoint rejected.\n{out.strip()}'
+            )
+
+    def _online_planner_advance_retry(self):
+        if self._online_planner_running():
+            self._invoke_advance_waypoint_service()
+            return
+        self._online_planner_advance_retries_left -= 1
+        if self._online_planner_advance_retries_left > 0:
+            QTimer.singleShot(2000, self._online_planner_advance_retry)
+            return
+        self.status_text.append(
+            'Online planner: start timed out. '
+            'Check logs/gui_background/online_planner_proc_*.log'
+        )
+
+    def _online_planner_advance_waypoint(self):
+        if not self._online_planner_enabled():
+            QMessageBox.information(
+                self, 'Online planner',
+                '请先勾选 “Online safety planner (RViz)”。',
+            )
+            return
+        if not self._sitl_proc_running():
+            QMessageBox.information(
+                self, 'Online planner',
+                '请先点击 Start SITL。',
+            )
+            return
+        if not self._online_planner_running():
+            self.status_text.append(
+                'Online planner 未在运行（已勾选但未启动或已退出），正在自动启动…'
+            )
+            self.start_online_planner()
+            self._online_planner_advance_retries_left = 10
+            QTimer.singleShot(2000, self._online_planner_advance_retry)
+            return
+        self._invoke_advance_waypoint_service()
+
+    def _on_online_planner_rate_changed(self, value: float):
+        self._tracking_config['online_planner_rate_hz'] = float(value)
+        if self._online_planner_running():
+            ok = self._set_online_planner_param('replan_rate_hz', float(value))
+            if not ok:
+                self.status_text.append(
+                    f'Online planner: failed to set replan_rate_hz={value:.1f}'
+                )
+
+    def _parse_online_planner_rate_from_diag(self, diag: str):
+        """Return (actual_hz or None, target_hz or None) from diagnostics prefix."""
+        import re
+        m = re.search(r'rate=([\d.]+|—)/([\d.]+)Hz', diag or '')
+        if not m:
+            return None, None
+        actual = None if m.group(1) == '—' else float(m.group(1))
+        target = float(m.group(2))
+        return actual, target
+
+    def _update_online_planner_actual_hz_label(self, diag: str):
+        if not hasattr(self, 'lbl_online_planner_actual_hz'):
+            return
+        actual, target = self._parse_online_planner_rate_from_diag(diag)
+        if target is None:
+            self.lbl_online_planner_actual_hz.setText('Actual: —')
+            self.lbl_online_planner_actual_hz.setStyleSheet(
+                'color: #888; font-family: monospace; font-size: 11px;'
+            )
+            return
+        if actual is None:
+            self.lbl_online_planner_actual_hz.setText(f'Actual: — / {target:.1f} Hz')
+            self.lbl_online_planner_actual_hz.setStyleSheet(
+                'color: #888; font-family: monospace; font-size: 11px;'
+            )
+            return
+        ratio = actual / target if target > 1e-6 else 0.0
+        if ratio >= 0.85:
+            color = '#2e7d32'
+        elif ratio >= 0.5:
+            color = '#f9a825'
+        else:
+            color = '#c62828'
+        import re
+        busy_m = re.search(r'busy (\d+)%', diag or '')
+        busy_suffix = f' (busy {busy_m.group(1)}%)' if busy_m else ''
+        self.lbl_online_planner_actual_hz.setText(
+            f'Actual: {actual:.1f} / {target:.1f} Hz{busy_suffix}'
+        )
+        self.lbl_online_planner_actual_hz.setStyleSheet(
+            f'color: {color}; font-family: monospace; font-size: 11px; font-weight: bold;'
+        )
+
+    def _poll_online_planner_diagnostics(self):
+        if not hasattr(self, 'lbl_online_planner_diag'):
+            return
+        if not self._online_planner_running():
+            if (
+                self._online_planner_enabled()
+                and self._sitl_proc_running()
+            ):
+                self.lbl_online_planner_diag.setText(
+                    'Planner: not running (auto-starts ~8s after SITL, or click Next WP)'
+                )
+            else:
+                self.lbl_online_planner_diag.setText('Planner: stopped')
+            self.lbl_online_planner_diag.setStyleSheet('color: #888;')
+            self._update_online_planner_actual_hz_label('')
+            return
+        result = self._ros2_run_in_workspace(
+            'ros2 topic echo /online_planner/diagnostics --once',
+            timeout=2.0,
+        )
+        if result is None or result.returncode != 0:
+            self.lbl_online_planner_diag.setText('Planner: waiting for diagnostics…')
+            self.lbl_online_planner_diag.setStyleSheet('color: #888;')
+            return
+        diag = self._parse_ros2_string_echo(result.stdout)
+        if not diag:
+            self.lbl_online_planner_diag.setText('Planner: waiting for diagnostics…')
+            self.lbl_online_planner_diag.setStyleSheet('color: #888;')
+            return
+        self.lbl_online_planner_diag.setText(f'Planner: {diag}')
+        self.lbl_online_planner_diag.setStyleSheet('color: #9cf;')
+        self._update_online_planner_actual_hz_label(diag)
+
+    def _update_online_planner_diag_timer(self):
+        if not hasattr(self, '_online_planner_diag_timer'):
+            return
+        if self._online_planner_running():
+            if not self._online_planner_diag_timer.isActive():
+                self._online_planner_diag_timer.start()
+            self._poll_online_planner_diagnostics()
+        else:
+            self._online_planner_diag_timer.stop()
+            if hasattr(self, 'lbl_online_planner_diag'):
+                if (
+                    self._online_planner_enabled()
+                    and self._sitl_proc_running()
+                ):
+                    self.lbl_online_planner_diag.setText(
+                        'Planner: not running (auto-starts ~8s after SITL, or click Next WP)'
+                    )
+                else:
+                    self.lbl_online_planner_diag.setText('Planner: stopped')
+                self.lbl_online_planner_diag.setStyleSheet('color: #888;')
+            self._update_online_planner_actual_hz_label('')
+
+    def _online_planner_enabled(self) -> bool:
+        return (
+            hasattr(self, 'chk_enable_online_planner')
+            and self.chk_enable_online_planner.isChecked()
+        )
+
+    def _on_online_planner_checkbox_changed(self, state):
+        enabled = bool(state)
+        self._tracking_config['enable_online_planner'] = enabled
+        tvc_running = (
+            self._tvc_launch_proc is not None and self._tvc_launch_proc.poll() is None
+        )
+        if not tvc_running:
+            self._update_online_planner_diag_timer()
+            return
+        if enabled:
+            self.start_online_planner()
+        else:
+            self.stop_online_planner()
+        self._update_online_planner_diag_timer()
+
+    def start_online_planner(self):
+        """Launch online_planner for SITL safety monitoring / RViz preview."""
+        if not self._online_planner_enabled():
+            return
+        self._sync_waypoints_from_table()
+        self._update_online_planner_wp_info_label()
+        wp_str = self._encode_waypoints_for_online_planner()
+        if not wp_str:
+            self.status_text.append(
+                'Online planner: Trajectory tab has no mission waypoints '
+                '(need ≥2 rows: start + target). Launch may use defaults.'
+            )
+        else:
+            n = len(self._mission_waypoints_for_online_planner())
+            cost_cfg = self._collect_online_planner_cost_config()
+            cost_note = ''
+            if cost_cfg:
+                w = cost_cfg['weights']
+                cost_note = (
+                    f'; cost p={w.get("p")}, v={w.get("v")}, R={w.get("R")}, '
+                    f'k_term={w.get("terminal_cost_multiplier")}'
+                )
+            self.status_text.append(
+                f'Online planner: {n} mission waypoint(s) from Trajectory tab '
+                f'({len(self.waypoints)} rows, skipping start pose){cost_note}.'
+            )
+        extra = self._online_planner_launch_extra_args()
+        self._start_background_process(
+            '_online_planner_proc',
+            self._ros2_shell_command('online_planner.launch.py', extra),
+            'Online planner (online_planner.launch.py)',
+        )
+        QTimer.singleShot(2000, self._push_online_planner_config)
+        self._update_online_planner_diag_timer()
+
+    def stop_online_planner(self):
+        """Stop online_planner background launch."""
+        self._stop_background_process('_online_planner_proc', 'Online planner')
+        self._update_online_planner_diag_timer()
+
     def start_px4_sitl_for_tracking(self):
         """Start PX4 SITL with controller choice from Tracking tab."""
         cid = self._current_tracking_controller_id()
@@ -6804,6 +7506,15 @@ class MainWindow(QMainWindow):
             return
         self.start_px4_sitl()
 
+    def _show_gazebo_gui_enabled(self) -> bool:
+        return (
+            hasattr(self, 'chk_show_gazebo_gui')
+            and self.chk_show_gazebo_gui.isChecked()
+        )
+
+    def _on_show_gazebo_gui_changed(self, state):
+        self._tracking_config['show_gazebo_gui'] = bool(state)
+
     def _sitl_launch_extra_args(self):
         """ROS launch overrides for the active rocket platform and tracking controller."""
         kw = sitl_launch_kwargs(self._current_rocket_platform_id())
@@ -6816,10 +7527,13 @@ class MainWindow(QMainWindow):
             launch_ctrl = 'false'
         if launch_ctrl is not None:
             args.append(self._launch_arg('launch_controller', launch_ctrl))
+        args.append(self._launch_arg('gz_gui', str(self._show_gazebo_gui_enabled()).lower()))
         return args
 
     def start_px4_sitl(self):
         """Launch TVC SITL stack (PX4 + Gazebo; external LQR optional)."""
+        self._sync_waypoints_from_table()
+        self._update_online_planner_wp_info_label()
         platform_id = self._current_rocket_platform_id()
         extra = self._sitl_launch_extra_args()
         self._start_background_process(
@@ -6830,10 +7544,15 @@ class MainWindow(QMainWindow):
         self.status_text.append(
             f'PX4 SITL starting ({platform_label(platform_id)}) — '
             f'PX4 built-in control; Gazebo model follows the selected platform.'
+            + ('' if self._show_gazebo_gui_enabled() else ' Gazebo: headless (RViz only).')
         )
+        if self._online_planner_enabled():
+            # Wait for SITL stack + EKF/vision before first replan.
+            QTimer.singleShot(8000, self.start_online_planner)
 
     def stop_px4_sitl(self):
         """Stop tvc.launch.py process group."""
+        self.stop_online_planner()
         self._stop_background_process('_tvc_launch_proc', 'PX4 SITL')
 
     def start_tracking_node(self):
@@ -6913,6 +7632,9 @@ class MainWindow(QMainWindow):
             self._ros2_shell_command('tvc_traj_player.launch.py', extra),
             'Tracking node (tvc_traj_player.launch.py)',
         )
+        if self._online_planner_running():
+            QTimer.singleShot(1500, self._push_online_planner_config)
+        self._refresh_sim_button_states()
 
     def stop_tracking_node(self):
         """Stop tvc_traj_player and clear all trajectory layers in RViz."""
@@ -6924,6 +7646,7 @@ class MainWindow(QMainWindow):
         """Terminate background ROS2 launches when the GUI exits."""
         for attr, label in (
             ('_traj_player_proc', 'Tracking node'),
+            ('_online_planner_proc', 'Online planner'),
             ('_tvc_launch_proc', 'PX4 SITL'),
         ):
             proc = getattr(self, attr, None)
@@ -6937,6 +7660,7 @@ class MainWindow(QMainWindow):
                     except (ProcessLookupError, OSError):
                         pass
                 setattr(self, attr, None)
+                self._close_background_process_log(attr)
         super().closeEvent(event)
 
     def optimization_error(self, error_msg):

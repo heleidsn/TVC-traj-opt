@@ -184,6 +184,9 @@ def all_default_tracking_config() -> Dict[str, Any]:
     return {
         'controller': CONTROLLER_PX4,
         'sim_mode': SIM_NUMERICAL,
+        'enable_online_planner': True,
+        'online_planner_rate_hz': 10.0,
+        'show_gazebo_gui': False,
         'numerical_sim': default_numerical_sim_config(),
         'actuator': default_actuator_tracking_config(),
         'params': {
