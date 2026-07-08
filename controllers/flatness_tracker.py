@@ -191,6 +191,15 @@ class FlatnessCascadeTracker:
         """
         Cascade on ξ with optional flatness feedforward.
 
+        The position/velocity loop closes once, on the measured ξ (not COM);
+        its acceleration command goes straight into the attitude/rate/actuator
+        stage. It must NOT be re-run through ``PX4CascadeTracker.compute``,
+        which would re-close a second position loop on the *measured COM* —
+        that second, COM-based loop dominates the first (its error is nearly
+        identical to plain COM tracking error, since the ξ-COM gap is only a
+        few cm), which is why ξ mode used to look almost indistinguishable
+        from COM mode.
+
         Returns (u_lqr, cascade_signals) like :class:`PX4CascadeTracker`.
         """
         del acc_ref
@@ -223,7 +232,11 @@ class FlatnessCascadeTracker:
         ddz_cmd = self.cascade._pos_vel_axis(
             2, pos_err[2], meas['dz'], d['dz'], acc_ff[2], dt, xy=False,
         )
-        x_ref_com, u_opt_ff = flat_state_control_at(
+        # Flatness inversion at the *commanded* (feedback-inclusive) acceleration
+        # gives the snap-based non-minimum-phase feedforward term (u_opt_ff);
+        # the COM state it also returns is not used — attitude comes from
+        # ddxi/ddz directly below.
+        _, u_opt_ff = flat_state_control_at(
             self.fp,
             d['xi_x'], d['dxi_x'], ddxi_x_cmd, d.get('dddxi_x', 0.0), d.get('ddddxi_x', 0.0),
             d['xi_y'], d['dxi_y'], ddxi_y_cmd, d.get('dddxi_y', 0.0), d.get('ddddxi_y', 0.0),
@@ -243,12 +256,24 @@ class FlatnessCascadeTracker:
         if use_ff:
             u_ff = control_opt_to_lqr(u_opt_ff, self.mass, self.g)
 
-        u, signals = self.cascade.compute(
-            x12, x_ref_com, np.zeros(3, dtype=float), dt,
-            u_ff=u_ff, use_ff=use_ff,
+        roll = float(2.0 * x12[6])
+        pitch = float(2.0 * x12[7])
+        yaw = float(2.0 * np.arcsin(np.clip(x12[8], -1.0, 1.0)))
+        p, q_rate, r = float(x12[9]), float(x12[10]), float(x12[11])
+
+        angacc_x, angacc_y, angacc_z, az, att_sp, rate_sp = self.cascade._attitude_from_acc(
+            roll, pitch, yaw, p, q_rate, r,
+            ddxi_x_cmd, ddxi_y_cmd, ddz_cmd, float(d['psi']), dt,
         )
-        signals['pos'] = np.array([d['xi_x'], d['xi_y'], d['z']], dtype=float)
-        signals['vel'] = vel_sp
+        u = self.cascade._actuators_from_angacc(
+            angacc_x, angacc_y, angacc_z, az, u_ff=u_ff, use_ff=use_ff,
+        )
+        signals = {
+            'pos': np.array([d['xi_x'], d['xi_y'], d['z']], dtype=float),
+            'vel': vel_sp,
+            'att_rad': att_sp,
+            'rate_rad_s': rate_sp,
+        }
         return u, signals
 
 

@@ -10,7 +10,7 @@
   "nmp_numerical_sim": {
     "sim_dt": 0.005,
     "control_dt": 0.01,
-    "terminal_hold_duration_s": 3.0,
+    "terminal_hold_duration_s": 1.0,
     "total_duration_s": 0.0
   },
   "actuator": {
@@ -26,7 +26,7 @@
       "share_rp_gains": true,
       "use_acc_feedforward": false,
       "Kp_pos_xy": 1.0,
-      "Kp_vel_xy": 3.0,
+      "Kp_vel_xy": 6.0,
       "Ki_vel_xy": 0.0,
       "Kd_vel_xy": 0.0,
       "Kp_pos_z": 1.0,
@@ -114,7 +114,7 @@
     "flatness_ff": {
       "share_rp_gains": true,
       "Kp_pos_xy": 1.0,
-      "Kp_vel_xy": 5.0,
+      "Kp_vel_xy": 6.0,
       "Ki_vel_xy": 0.0,
       "Kd_vel_xy": 0.0,
       "Kp_pos_z": 1.0,

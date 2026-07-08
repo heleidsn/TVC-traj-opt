@@ -191,10 +191,7 @@ def run_tracking_simulation(
     else:
         x13 = state12_to_state13(np.asarray(x0, dtype=float).reshape(12))
 
-    if px4_tracking:
-        t_end = max(ref.duration(), 0.1)
-    else:
-        t_end = numerical_sim_end_time(ref, params)
+    t_end = numerical_sim_end_time(ref, params)
     terminal_hold_s = float(
         params.get('terminal_hold_duration_s', TRACKING_TERMINAL_HOLD_DURATION_S),
     )
@@ -398,6 +395,7 @@ def run_tracking_simulation(
             float(phy_gui.get('r_thrust_y', 0.0)),
             float(phy_gui.get('r_thrust_z', -0.2)),
         ], dtype=float),
+        'rocket_geometry': phy_gui.get('rocket_geometry'),
     }
     if actuator.any_enabled():
         result['u_cmd_hist'] = np.asarray(u_cmd_hist, dtype=float)

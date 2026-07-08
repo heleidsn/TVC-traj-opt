@@ -434,19 +434,25 @@ def draw_nmp_panels(
     # ── Angle (deg) ──
     ax = axes['angle']
     _clear_ax(ax)
-    ax.plot(t, series['pitch_deg'], 'C0-', lw=1.5, label='pitch plan')
-    if show_all:
-        ax.plot(t, series['roll_deg'], 'C1-', lw=1.5, label='roll plan')
-    ax.plot(t, series['yaw_deg'], 'C2-', lw=1.2, label='yaw plan')
-    ax.plot(t, series['pitch_flat_deg'], 'C0--', lw=0.9, alpha=0.7, label='pitch flat rec')
-    if show_all:
-        ax.plot(t, series['roll_flat_deg'], 'C1--', lw=0.9, alpha=0.7, label='roll flat rec')
-    if trk is not None:
+    if trk is None:
+        ax.plot(t, series['pitch_deg'], 'C0-', lw=1.5, label='pitch plan')
+        if show_all:
+            ax.plot(t, series['roll_deg'], 'C1-', lw=1.5, label='roll plan')
+        ax.plot(t, series['yaw_deg'], 'C2-', lw=1.2, label='yaw plan')
+        ax.plot(t, series['pitch_flat_deg'], 'C0--', lw=0.9, alpha=0.7, label='pitch flat rec')
+        if show_all:
+            ax.plot(t, series['roll_flat_deg'], 'C1--', lw=0.9, alpha=0.7, label='roll flat rec')
+    else:
         tt = trk['t']
         ax.plot(tt, trk['pitch_sim_deg'], 'C3-', lw=1.5, label='pitch sim')
         if show_all:
             ax.plot(tt, trk['roll_sim_deg'], 'C4-', lw=1.5, label='roll sim')
         ax.plot(tt, trk['yaw_sim_deg'], 'C5-', lw=1.0, alpha=0.85, label='yaw sim')
+        if 'pitch_ref_deg' in trk:
+            ax.plot(tt, trk['pitch_ref_deg'], 'C0--', lw=1.1, alpha=0.75, label='pitch ref')
+            if show_all:
+                ax.plot(tt, trk['roll_ref_deg'], 'C1--', lw=1.1, alpha=0.75, label='roll ref')
+            ax.plot(tt, trk['yaw_ref_deg'], 'C2--', lw=0.9, alpha=0.75, label='yaw ref')
     ax.set_ylabel('deg')
     ax.set_title('Attitude')
     ax.legend(loc='best', fontsize=5.5, ncol=2)
@@ -454,19 +460,25 @@ def draw_nmp_panels(
     # ── Angular velocity (deg/s) ──
     ax = axes['angvel']
     _clear_ax(ax)
-    ax.plot(t, series['q_deg_s'], 'C0-', lw=1.5, label='q pitch-rate plan')
-    if show_all:
-        ax.plot(t, series['p_deg_s'], 'C1-', lw=1.5, label='p roll-rate plan')
-    ax.plot(t, series['r_deg_s'], 'C2-', lw=1.2, label='r yaw-rate plan')
-    ax.plot(t, series['q_flat_deg_s'], 'C0--', lw=0.9, alpha=0.7, label='q flat rec')
-    if show_all:
-        ax.plot(t, series['p_flat_deg_s'], 'C1--', lw=0.9, alpha=0.7, label='p flat rec')
-    if trk is not None:
+    if trk is None:
+        ax.plot(t, series['q_deg_s'], 'C0-', lw=1.5, label='q pitch-rate plan')
+        if show_all:
+            ax.plot(t, series['p_deg_s'], 'C1-', lw=1.5, label='p roll-rate plan')
+        ax.plot(t, series['r_deg_s'], 'C2-', lw=1.2, label='r yaw-rate plan')
+        ax.plot(t, series['q_flat_deg_s'], 'C0--', lw=0.9, alpha=0.7, label='q flat rec')
+        if show_all:
+            ax.plot(t, series['p_flat_deg_s'], 'C1--', lw=0.9, alpha=0.7, label='p flat rec')
+    else:
         tt = trk['t']
         ax.plot(tt, trk['q_sim_deg_s'], 'C3-', lw=1.5, label='q sim')
         if show_all:
             ax.plot(tt, trk['p_sim_deg_s'], 'C4-', lw=1.5, label='p sim')
         ax.plot(tt, trk['r_sim_deg_s'], 'C5-', lw=1.0, alpha=0.85, label='r sim')
+        if 'q_ref_deg_s' in trk:
+            ax.plot(tt, trk['q_ref_deg_s'], 'C0--', lw=1.1, alpha=0.75, label='q ref')
+            if show_all:
+                ax.plot(tt, trk['p_ref_deg_s'], 'C1--', lw=1.1, alpha=0.75, label='p ref')
+            ax.plot(tt, trk['r_ref_deg_s'], 'C2--', lw=0.9, alpha=0.75, label='r ref')
     ax.set_ylabel('deg/s')
     ax.set_title('Angular velocity')
     ax.legend(loc='best', fontsize=5.5, ncol=2)
@@ -475,14 +487,15 @@ def draw_nmp_panels(
     ax = axes['gimbal']
     _clear_ax(ax)
     us = series.get('us')
-    if us is not None:
-        ax.plot(t, np.degrees(us[:, 0]), 'C0-', lw=1.5, label='th_p plan')
+    if trk is None:
+        if us is not None:
+            ax.plot(t, np.degrees(us[:, 0]), 'C0-', lw=1.5, label='th_p plan')
+            if show_all:
+                ax.plot(t, np.degrees(us[:, 1]), 'C1-', lw=1.5, label='th_r plan')
+        ax.plot(t, series['th_p_flat_deg'], 'C0--', lw=0.9, alpha=0.65, label='th_p flat rec')
         if show_all:
-            ax.plot(t, np.degrees(us[:, 1]), 'C1-', lw=1.5, label='th_r plan')
-    ax.plot(t, series['th_p_flat_deg'], 'C0--', lw=0.9, alpha=0.65, label='th_p flat rec')
-    if show_all:
-        ax.plot(t, series['th_r_flat_deg'], 'C1--', lw=0.9, alpha=0.65, label='th_r flat rec')
-    if trk is not None and trk.get('u_sim') is not None:
+            ax.plot(t, series['th_r_flat_deg'], 'C1--', lw=0.9, alpha=0.65, label='th_r flat rec')
+    elif trk.get('u_sim') is not None:
         tt = trk['t']
         u_sim = trk['u_sim']
         ax.plot(tt, np.degrees(u_sim[:, 0]), 'C3-', lw=1.4, label='th_p sim')
@@ -497,19 +510,21 @@ def draw_nmp_panels(
     _clear_ax(ax)
     hover = series['mass'] * series['g']
     ax.axhline(hover, color='#888', ls=':', lw=0.7)
-    if us is not None:
-        ax.plot(t, us[:, 2], 'C0-', lw=1.5, label='T plan')
-    ax.plot(t, series['thrust_flat'], 'C0--', lw=0.9, alpha=0.65, label='T flat rec')
-    if trk is not None and trk.get('u_sim') is not None:
+    if trk is None:
+        if us is not None:
+            ax.plot(t, us[:, 2], 'C0-', lw=1.5, label='T plan')
+        ax.plot(t, series['thrust_flat'], 'C0--', lw=0.9, alpha=0.65, label='T flat rec')
+    elif trk.get('u_sim') is not None:
         tt = trk['t']
         u_sim = trk['u_sim']
         ax.plot(tt, u_sim[:, 2], 'C3-', lw=1.4, label='T sim')
     ax.set_ylabel('Thrust (N)')
     ax.set_title('Thrust & yaw torque')
     ax2 = _ensure_twin(ax)
-    if us is not None:
-        ax2.plot(t, us[:, 3], 'C1-', lw=1.2, label='τ_yaw plan')
-    if trk is not None and trk.get('u_sim') is not None:
+    if trk is None:
+        if us is not None:
+            ax2.plot(t, us[:, 3], 'C1-', lw=1.2, label='τ_yaw plan')
+    elif trk.get('u_sim') is not None:
         ax2.plot(tt, u_sim[:, 3], 'C4-', lw=1.1, label='τ_yaw sim')
     ax2.set_ylabel('τ_yaw (N·m)', fontsize=8)
     ax2.tick_params(labelsize=7)

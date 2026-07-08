@@ -8,11 +8,39 @@ import numpy as np
 from tvc_traj_gui_plots import draw_cost_panel
 from tvc_traj_gui_plot_layout import apply_responsive_layout, place_legend
 from tvc_traj_gui_3d import apply_equal_aspect_3d, equal_axis_cube_from_points
+from controllers.params import CONTROLLER_FLATNESS
+from controllers.flatness import FlatnessParams, estimate_flat_state_from_state12
 
 _REF_STYLE = dict(linestyle=':', linewidth=1.2, alpha=0.65)
 _SIM_STYLE = dict(linestyle='-', linewidth=1.6, alpha=0.9)
 _COLORS = ('tab:blue', 'tab:orange', 'tab:green')
 _LABELS3 = ('x', 'y', 'z')
+_LABELS3_XI = ('ξ_x', 'ξ_y', 'z')
+
+
+def _flatness_params_from_plan(plan):
+    fp_phy = (plan or {}).get('flatness_physics') if isinstance(plan, dict) else None
+    if not isinstance(fp_phy, dict):
+        return None
+    req = ('mass', 'Ixx', 'Iyy', 'Izz', 'r_thrust_z')
+    if not all(k in fp_phy for k in req):
+        return None
+    return FlatnessParams.from_gui(
+        fp_phy['mass'], fp_phy['Ixx'], fp_phy['Iyy'], fp_phy['Izz'], fp_phy['r_thrust_z'],
+        g=float(fp_phy.get('g', 9.81)),
+    )
+
+
+def _xi_pos_vel_arrays(x_arr, fp):
+    """(pos[N,3], vel[N,3]) = (ξ_x, ξ_y, z) and their rates from a 12-state history."""
+    n = x_arr.shape[0]
+    pos = np.zeros((n, 3), dtype=float)
+    vel = np.zeros((n, 3), dtype=float)
+    for i in range(n):
+        est = estimate_flat_state_from_state12(fp, x_arr[i, :12])
+        pos[i] = (est['xi_x'], est['xi_y'], est['z'])
+        vel[i] = (est['dxi_x'], est['dxi_y'], est['dz'])
+    return pos, vel
 
 
 def _quat12_to_euler_deg(qx, qy, qz, quat_to_euler_fn=None):
@@ -105,6 +133,24 @@ def _align_cascade_series(arr, n, result=None):
     return a[:n]
 
 
+def _ensure_twin_axis(ax):
+    """Reuse a cached twin y-axis instead of stacking a new one on every redraw.
+
+    ``ax.clear()`` does not remove a previously created ``ax.twinx()`` axes —
+    it's a separate Axes sharing the x-axis, so calling ``twinx()`` again on
+    every redraw leaves the old one's stale data (and x-limits, from whatever
+    duration that earlier run was) still in the shared x-axis group, stretching
+    the panel's visible time range past the current data.
+    """
+    twin = getattr(ax, '_tvc_twin', None)
+    if twin is None:
+        twin = ax.twinx()
+        ax._tvc_twin = twin
+    else:
+        twin.clear()
+    return twin
+
+
 def _style_axis(ax, title, xlabel='Time (s)', ylabel=''):
     ax.set_title(title, fontsize=9, fontweight='bold', pad=2)
     ax.set_xlabel(xlabel, fontsize=8)
@@ -117,14 +163,17 @@ def _style_axis(ax, title, xlabel='Time (s)', ylabel=''):
 _SP_STYLE = dict(linestyle='-.', linewidth=1.5, alpha=0.9)
 
 
-def _plot_xyz(ax, t, ref_arr, sim_arr, ylabel, title, deg=False, cmd_arr=None, canvas_width_px=800, result=None):
+def _plot_xyz(
+    ax, t, ref_arr, sim_arr, ylabel, title, deg=False, cmd_arr=None, canvas_width_px=800,
+    result=None, labels=_LABELS3,
+):
     """Plot plan (dotted), cascade setpoint (dash-dot), and simulation (solid)."""
     _style_axis(ax, title, ylabel=ylabel)
     n = len(t)
     if cmd_arr is not None:
         cmd_arr = _align_cascade_series(cmd_arr, n, result)
     for i, c in enumerate(_COLORS):
-        lbl = _LABELS3[i]
+        lbl = labels[i]
         r = ref_arr[:, i]
         s = sim_arr[:, i]
         if deg:
@@ -194,11 +243,30 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
         for i in range(len(t))
     ])
 
+    # When ξ was the control point, Position/Velocity/Acceleration show what was
+    # actually tracked (ξ_x, ξ_y, z) instead of COM — otherwise the panel can't
+    # reveal any difference from COM-mode tracking.
+    fp = None
+    if result.get('controller_id') == CONTROLLER_FLATNESS:
+        fp = _flatness_params_from_plan(plan)
+    if fp is not None:
+        pos_ref, vel_ref = _xi_pos_vel_arrays(x_ref, fp)
+        pos_sim, vel_sim = _xi_pos_vel_arrays(x_sim, fp)
+        pos_label, vel_label, acc_label = 'ξ position (m)', 'ξ velocity (m/s)', 'ξ acceleration (m/s²)'
+        pos_title, vel_title, acc_title = 'Position (ξ)', 'Velocity (ξ̇)', 'Acceleration (ξ̈)'
+        xyz_labels = _LABELS3_XI
+    else:
+        pos_ref, vel_ref = x_ref[:, 0:3], x_ref[:, 3:6]
+        pos_sim, vel_sim = x_sim[:, 0:3], x_sim[:, 3:6]
+        pos_label, vel_label, acc_label = 'Position (m)', 'Velocity (m/s)', 'Acceleration (m/s²)'
+        pos_title, vel_title, acc_title = 'Position', 'Velocity', 'Acceleration'
+        xyz_labels = _LABELS3
+
     acc_ref = np.column_stack([
-        _numerical_derivative(x_ref[:, 3 + i], t) for i in range(3)
+        _numerical_derivative(vel_ref[:, i], t) for i in range(3)
     ])
     acc_sim = np.column_stack([
-        _numerical_derivative(x_sim[:, 3 + i], t) for i in range(3)
+        _numerical_derivative(vel_sim[:, i], t) for i in range(3)
     ])
     angacc_ref = np.column_stack([
         _numerical_derivative(x_ref[:, 9 + i], t) for i in range(3)
@@ -235,24 +303,24 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
         sp_rate = _align_cascade_series(cascade.get('rate_rad_s'), len(t), result)
 
     mapping = [
-        ('ax_pos', x_ref[:, 0:3], x_sim[:, 0:3], 'Position (m)', 'Position', False, None),
+        ('ax_pos', pos_ref, pos_sim, pos_label, pos_title, False, None, xyz_labels),
         ('ax_att', euler_ref, euler_sim, 'Euler (deg)', 'Attitude', False,
-         np.degrees(sp_att) if sp_att is not None else None),
-        ('ax_vel', x_ref[:, 3:6], x_sim[:, 3:6], 'Velocity (m/s)', 'Velocity', False, sp_vel),
+         np.degrees(sp_att) if sp_att is not None else None, _LABELS3),
+        ('ax_vel', vel_ref, vel_sim, vel_label, vel_title, False, sp_vel, xyz_labels),
         ('ax_angvel', np.degrees(x_ref[:, 9:12]), np.degrees(x_sim[:, 9:12]),
          'Angular vel (°/s)', 'Angular velocity', False,
-         np.degrees(sp_rate) if sp_rate is not None else None),
-        ('ax_acc', acc_ref, acc_sim, 'Acceleration (m/s²)', 'Acceleration', False, None),
-        ('ax_angacc', angacc_ref, angacc_sim, 'Angular acc (rad/s²)', 'Angular acceleration', False, None),
+         np.degrees(sp_rate) if sp_rate is not None else None, _LABELS3),
+        ('ax_acc', acc_ref, acc_sim, acc_label, acc_title, False, None, xyz_labels),
+        ('ax_angacc', angacc_ref, angacc_sim, 'Angular acc (rad/s²)', 'Angular acceleration', False, None, _LABELS3),
     ]
-    for key, plan, sim, ylab, title, deg, cmd_arr in mapping:
+    for key, ref_arr, sim_arr, ylab, title, deg, cmd_arr, lbls in mapping:
         ax = axes.get(key)
         if ax is None:
             continue
         ax.clear()
         _plot_xyz(
-            ax, t, plan, sim, ylab, title, deg=deg, cmd_arr=cmd_arr,
-            canvas_width_px=width_px, result=result,
+            ax, t, ref_arr, sim_arr, ylab, title, deg=deg, cmd_arr=cmd_arr,
+            canvas_width_px=width_px, result=result, labels=lbls,
         )
 
     ax_g = axes.get('ax_gimbal')
@@ -277,7 +345,7 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
     if ax_t is not None:
         ax_t.clear()
         _style_axis(ax_t, 'Thrust & yaw torque', ylabel='Thrust (N)')
-        ax_t2 = ax_t.twinx()
+        ax_t2 = _ensure_twin_axis(ax_t)
         ax_t2.tick_params(axis='y', labelsize=7)
         sim_tag = 'act' if act_on else 'sim'
         ax_t.plot(t, u_ref[:, 2], color='tab:blue', label='T plan', **_REF_STYLE)

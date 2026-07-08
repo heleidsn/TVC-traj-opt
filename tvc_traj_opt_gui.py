@@ -41,6 +41,10 @@ DEFAULT_TRAJ_CSV_DIR = os.path.join(ROOT_DIR, 'trajs')
 DEFAULT_TRAJ_CSV_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'latest.csv')
 DEFAULT_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'saved_waypoints.json')
 NMP_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'nmp_saved_waypoints.json')
+NMP_MODEL_PARAMS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'nmp_model_params.json')
+NMP_MODEL_PARAM_KEYS = (
+    'mass', 'Ixx', 'Iyy', 'Izz', 'r_thrust_z', 'body_length', 'com_from_bottom',
+)
 CONTROLLERS_DIR = os.path.join(ROOT_DIR, 'controllers')
 DEFAULT_TRACKING_PARAMS_PATH = os.path.join(CONTROLLERS_DIR, 'tracking_params.json')
 DEFAULT_TRACKING_GIF_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'tracking_anim.gif')
@@ -170,6 +174,7 @@ from tvc_rocket_platforms import (
     normalize_platform_id,
     constraint_spin_ranges,
     physics_spin_ranges,
+    rocket_visual_geometry,
     sitl_launch_kwargs,
     platform_description,
     platform_label,
@@ -594,6 +599,35 @@ def _load_nmp_waypoints_from_file(path):
     if not raw:
         return None
     return [_normalize_waypoint_row(w) for w in raw]
+
+
+def _load_nmp_model_overrides():
+    """Return {platform_id: {mass, Ixx, Iyy, Izz, r_thrust_z, body_length,
+    com_from_bottom}} saved overrides for the NMP tab, or {}."""
+    if not os.path.isfile(NMP_MODEL_PARAMS_PATH):
+        return {}
+    try:
+        with open(NMP_MODEL_PARAMS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for pid in (PLATFORM_PROXY, PLATFORM_REAL):
+        entry = data.get(pid)
+        if not isinstance(entry, dict):
+            continue
+        row = {}
+        for key in NMP_MODEL_PARAM_KEYS:
+            if key in entry:
+                try:
+                    row[key] = float(entry[key])
+                except (TypeError, ValueError):
+                    pass
+        if row:
+            out[pid] = row
+    return out
 
 
 def waypoints_to_json_list(waypoints):
@@ -1441,6 +1475,7 @@ class MainWindow(QMainWindow):
         ]
         self._nmp_waypoint_table_updating = False
         self._nmp_platform_guard = False
+        self._nmp_model_overrides = _load_nmp_model_overrides()
         self.init_ui()
         self._update_params_file_label()
         if os.path.isfile(self.params_file_path):
@@ -2400,6 +2435,12 @@ class MainWindow(QMainWindow):
             inner.setMaximumHeight(16777215 if state['open'] else 0)
             _sync_header()
             self._refresh_tab_scroll_areas()
+            if state['open']:
+                # Nested scroll areas report a stale sizeHint the instant they're
+                # unhidden (Qt hasn't laid them out while hidden); redo the geometry
+                # pass once the event loop catches up so the section doesn't stay
+                # clipped on its first expansion.
+                QTimer.singleShot(0, self._refresh_tab_scroll_areas)
 
         header_btn.clicked.connect(_toggle)
         _sync_header()
@@ -3300,6 +3341,62 @@ class MainWindow(QMainWindow):
         plat_row.addWidget(self.nmp_real_radio)
         plat_row.addStretch(1)
         model_layout.addLayout(plat_row)
+        model_param_grid = QGridLayout()
+        model_param_grid.setHorizontalSpacing(8)
+        model_param_grid.setVerticalSpacing(4)
+
+        def _add_model_spin(row, col, label, tooltip):
+            model_param_grid.addWidget(QLabel(label), row, col * 2)
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setSingleStep(0.001)
+            spin.setToolTip(tooltip)
+            spin.valueChanged.connect(self._on_nmp_model_param_changed)
+            model_param_grid.addWidget(spin, row, col * 2 + 1)
+            return spin
+
+        self.nmp_mass_spin = _add_model_spin(
+            0, 0, 'Mass [kg]:', 'Vehicle mass used for planning/tracking/GIF.',
+        )
+        self.nmp_ixx_spin = _add_model_spin(
+            0, 1, 'Ixx [kg·m²]:', 'Roll-axis moment of inertia.',
+        )
+        self.nmp_iyy_spin = _add_model_spin(
+            1, 0, 'Iyy [kg·m²]:', 'Pitch-axis moment of inertia.',
+        )
+        self.nmp_izz_spin = _add_model_spin(
+            1, 1, 'Izz [kg·m²]:', 'Yaw-axis moment of inertia.',
+        )
+        self.nmp_body_len_spin = _add_model_spin(
+            2, 0, 'Body length [m]:',
+            'Total rocket length (bottom to nose tip), for the GIF/3D rocket model.',
+        )
+        self.nmp_com_from_bottom_spin = _add_model_spin(
+            2, 1, 'COM from bottom [m]:',
+            'Distance from the rocket\'s bottom to the center of mass, for the GIF/3D rocket model.',
+        )
+        self.nmp_r_thrust_dist_spin = _add_model_spin(
+            3, 0, 'Thrust point below COM [m]:',
+            'Distance from COM to the TVC gimbal/thrust point.',
+        )
+        model_layout.addLayout(model_param_grid)
+
+        model_btn_row = QHBoxLayout()
+        self.btn_nmp_save_model_params = QPushButton('Save model')
+        self.btn_nmp_save_model_params.setToolTip(
+            'Save mass/inertia/geometry above as the default for the selected '
+            f'platform.\n{NMP_MODEL_PARAMS_PATH}'
+        )
+        self.btn_nmp_save_model_params.clicked.connect(self.save_nmp_model_params)
+        self.btn_nmp_reset_model_params = QPushButton('Reset to platform default')
+        self.btn_nmp_reset_model_params.setToolTip(
+            'Discard any saved override and reload the built-in default for this platform.'
+        )
+        self.btn_nmp_reset_model_params.clicked.connect(self.reset_nmp_model_params)
+        model_btn_row.addWidget(self.btn_nmp_save_model_params)
+        model_btn_row.addWidget(self.btn_nmp_reset_model_params)
+        model_btn_row.addStretch(1)
+        model_layout.addLayout(model_btn_row)
         self.lbl_nmp_model_desc = QLabel(platform_description(PLATFORM_PROXY))
         self.lbl_nmp_model_desc.setWordWrap(True)
         self.lbl_nmp_model_desc.setStyleSheet('color: #555;')
@@ -3484,6 +3581,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(track_group)
 
         layout.addStretch(1)
+        self._apply_nmp_model_params_for_platform(PLATFORM_PROXY)
         self._populate_nmp_waypoint_table()
         self._refresh_nmp_model_info()
         QTimer.singleShot(0, self._refresh_tab_scroll_areas)
@@ -3494,9 +3592,111 @@ class MainWindow(QMainWindow):
             return PLATFORM_REAL
         return PLATFORM_PROXY
 
+    def _nmp_model_params_builtin_default(self, platform_id):
+        """Built-in (non-override) mass/inertia/geometry defaults for a platform."""
+        phy = default_physics(platform_id)
+        geo = rocket_visual_geometry(platform_id)
+        return {
+            'mass': float(phy['mass']),
+            'Ixx': float(phy['Ixx']),
+            'Iyy': float(phy['Iyy']),
+            'Izz': float(phy['Izz']),
+            'r_thrust_z': abs(float(phy['r_thrust_z'])),
+            'body_length': float(geo['nose_tip_z'] - geo['body_bottom_z']),
+            'com_from_bottom': float(-geo['body_bottom_z']),
+        }
+
+    def _nmp_model_params_default(self, platform_id):
+        """Saved override merged over the platform's built-in default."""
+        row = self._nmp_model_params_builtin_default(platform_id)
+        row.update(self._nmp_model_overrides.get(platform_id, {}))
+        return row
+
+    def _apply_nmp_model_params_for_platform(self, platform_id):
+        if not hasattr(self, 'nmp_mass_spin'):
+            return
+        values = self._nmp_model_params_default(platform_id)
+        mass_lo, mass_hi, mass_dec = physics_spin_ranges(platform_id)['mass']
+        inertia_lo, inertia_hi, inertia_dec = physics_spin_ranges(platform_id)['inertia']
+        _, thrust_hi, thrust_dec = physics_spin_ranges(platform_id)['r_thrust']
+        specs = (
+            (self.nmp_mass_spin, 'mass', mass_lo, mass_hi, mass_dec),
+            (self.nmp_ixx_spin, 'Ixx', inertia_lo, inertia_hi, inertia_dec),
+            (self.nmp_iyy_spin, 'Iyy', inertia_lo, inertia_hi, inertia_dec),
+            (self.nmp_izz_spin, 'Izz', inertia_lo, inertia_hi, inertia_dec),
+            (self.nmp_body_len_spin, 'body_length', 0.05, 10.0, 3),
+            (self.nmp_com_from_bottom_spin, 'com_from_bottom', 0.0, 10.0, 3),
+            (self.nmp_r_thrust_dist_spin, 'r_thrust_z', 0.0, abs(float(thrust_hi)), thrust_dec),
+        )
+        for spin, key, lo, hi, dec in specs:
+            spin.blockSignals(True)
+            spin.setDecimals(dec)
+            spin.setSingleStep(10 ** (-dec))
+            spin.setRange(float(lo), float(hi))
+            spin.setValue(float(values[key]))
+            spin.blockSignals(False)
+
+    def _on_nmp_model_param_changed(self, _value=None):
+        self._refresh_nmp_model_info()
+
+    def _nmp_model_params_from_spins(self):
+        return {
+            'mass': float(self.nmp_mass_spin.value()),
+            'Ixx': float(self.nmp_ixx_spin.value()),
+            'Iyy': float(self.nmp_iyy_spin.value()),
+            'Izz': float(self.nmp_izz_spin.value()),
+            'r_thrust_z': abs(float(self.nmp_r_thrust_dist_spin.value())),
+            'body_length': float(self.nmp_body_len_spin.value()),
+            'com_from_bottom': float(self.nmp_com_from_bottom_spin.value()),
+        }
+
+    def save_nmp_model_params(self):
+        pid = self._current_nmp_platform_id()
+        self._nmp_model_overrides[pid] = self._nmp_model_params_from_spins()
+        os.makedirs(os.path.dirname(NMP_MODEL_PARAMS_PATH), exist_ok=True)
+        try:
+            with open(NMP_MODEL_PARAMS_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self._nmp_model_overrides, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, 'NMP', f'Could not save model parameters:\n{e}')
+            return
+        if hasattr(self, 'status_text'):
+            self.status_text.append(
+                f'NMP: saved model parameters for {platform_label(pid)} to:\n  '
+                f'{NMP_MODEL_PARAMS_PATH}'
+            )
+
+    def reset_nmp_model_params(self):
+        pid = self._current_nmp_platform_id()
+        self._nmp_model_overrides.pop(pid, None)
+        self._apply_nmp_model_params_for_platform(pid)
+        self._refresh_nmp_model_info()
+        if hasattr(self, 'status_text'):
+            self.status_text.append(f'NMP: reset {platform_label(pid)} model to built-in default.')
+
+    def _nmp_rocket_geometry_dict(self):
+        if not hasattr(self, 'nmp_body_len_spin'):
+            return None
+        body_length = float(self.nmp_body_len_spin.value())
+        com_from_bottom = float(self.nmp_com_from_bottom_spin.value())
+        body_bottom_z = -com_from_bottom
+        base_geo = rocket_visual_geometry(self._current_nmp_platform_id())
+        return {
+            'body_bottom_z': body_bottom_z,
+            'nose_tip_z': body_bottom_z + body_length,
+            'fin_z': body_bottom_z + 0.33 * body_length,
+            'shaft_lw': base_geo.get('shaft_lw', 4.5),
+            'fin_lw': base_geo.get('fin_lw', 2.6),
+        }
+
     def _nmp_physics_dict(self):
         phy = dict(default_physics(self._current_nmp_platform_id()))
         phy['g'] = 9.81
+        if hasattr(self, 'nmp_mass_spin'):
+            phy.update(self._nmp_model_params_from_spins())
+            phy['r_thrust_z'] = -abs(phy['r_thrust_z'])
+            phy.pop('body_length', None)
+            phy.pop('com_from_bottom', None)
         return phy
 
     def _nmp_bounds_dict(self):
@@ -3514,6 +3714,7 @@ class MainWindow(QMainWindow):
             return
         pid = self._current_nmp_platform_id()
         self.lbl_nmp_model_desc.setText(platform_description(pid))
+        self._apply_nmp_model_params_for_platform(pid)
         self._refresh_nmp_model_info()
         if hasattr(self, 'status_text'):
             self.status_text.append(f'NMP model: {platform_label(pid)}')
@@ -3736,9 +3937,12 @@ class MainWindow(QMainWindow):
         self._draw_nmp_plot_tab()
 
     def _nmp_flatness_physics_dict(self):
-        traj = getattr(self, 'nmp_last_trajectory', None)
-        if traj and traj.get('flatness_physics'):
-            return dict(traj['flatness_physics'])
+        """Live model params (mass/inertia/thrust point) from the Model section.
+
+        Always reflects the current spinboxes, not a stale planned-trajectory
+        snapshot, so waypoint-mode direct flight uses whatever model is
+        currently configured.
+        """
         phy = self._nmp_physics_dict()
         return {
             'mass': phy['mass'],
@@ -4068,6 +4272,7 @@ class MainWindow(QMainWindow):
     def _nmp_physics_for_tracking(self):
         phy = dict(self._nmp_physics_dict())
         phy['platform_id'] = self._current_nmp_platform_id()
+        phy['rocket_geometry'] = self._nmp_rocket_geometry_dict()
         return phy
 
     def _collect_nmp_tracking_params(self):
@@ -4361,7 +4566,7 @@ class MainWindow(QMainWindow):
         gif_view_row = QHBoxLayout()
         gif_view_row.addWidget(QLabel('View:'))
         self.tracking_gif_3d_radio = QRadioButton('3D')
-        self.tracking_gif_2d_radio = QRadioButton('2D (XY)')
+        self.tracking_gif_2d_radio = QRadioButton('2D (XZ)')
         self.tracking_gif_3d_radio.setChecked(True)
         self._tracking_gif_view_group = QButtonGroup(self)
         self._tracking_gif_view_group.addButton(self.tracking_gif_3d_radio, 0)
