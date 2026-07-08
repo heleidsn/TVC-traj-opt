@@ -40,6 +40,7 @@ LEFT_STATUS_TEXT_HEIGHT = 72
 DEFAULT_TRAJ_CSV_DIR = os.path.join(ROOT_DIR, 'trajs')
 DEFAULT_TRAJ_CSV_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'latest.csv')
 DEFAULT_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'saved_waypoints.json')
+NMP_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'nmp_saved_waypoints.json')
 CONTROLLERS_DIR = os.path.join(ROOT_DIR, 'controllers')
 DEFAULT_TRACKING_PARAMS_PATH = os.path.join(CONTROLLERS_DIR, 'tracking_params.json')
 DEFAULT_TRACKING_GIF_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'tracking_anim.gif')
@@ -152,6 +153,7 @@ from controllers.params import (
 from controllers.param_groups import param_groups_for
 from controllers.px4_params import migrate_px4_params
 from controllers.simulator import run_tracking_simulation
+from controllers.waypoint_ref import build_waypoint_flight_reference
 from controllers.acados_nmpc_tracker import acados_nmpc_available
 from controllers.px4_tune import (
     TUNE_LEVEL_LABELS,
@@ -577,6 +579,21 @@ class _SavedCostLogger:
 def nominal_segment_duration(dt, N):
     """Default leg duration [s] when adding a waypoint (dt × N)."""
     return float(dt) * int(N)
+
+
+def _load_nmp_waypoints_from_file(path):
+    """Return normalized waypoint rows from a saved NMP waypoints JSON file, or None."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = data.get('waypoints', data if isinstance(data, list) else [])
+    if not raw:
+        return None
+    return [_normalize_waypoint_row(w) for w in raw]
 
 
 def waypoints_to_json_list(waypoints):
@@ -1260,7 +1277,7 @@ class TrackingSimulationThread(QThread):
 
     def __init__(
         self, xs, us, time_states, controller_id, params, phy_gui,
-        flat_outputs=None, flatness_physics=None,
+        flat_outputs=None, flatness_physics=None, x0=None,
     ):
         super().__init__()
         self.xs = xs
@@ -1271,6 +1288,7 @@ class TrackingSimulationThread(QThread):
         self.phy_gui = dict(phy_gui)
         self.flat_outputs = flat_outputs
         self.flatness_physics = flatness_physics
+        self.x0 = x0
 
     def run(self):
         try:
@@ -1281,6 +1299,7 @@ class TrackingSimulationThread(QThread):
                 self.controller_id,
                 self.params,
                 self.phy_gui,
+                x0=self.x0,
                 flat_outputs=self.flat_outputs,
                 flatness_physics=self.flatness_physics,
             )
@@ -1342,16 +1361,17 @@ class NmpPlanningThread(QThread):
 
 
 class TrackingGifThread(QThread):
-    """Background 3D tracking GIF renderer."""
+    """Background tracking GIF renderer (3D or 2D)."""
 
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, result, plan, output_path):
+    def __init__(self, result, plan, output_path, view_mode='3d'):
         super().__init__()
         self.result = result
         self.plan = plan
         self.output_path = output_path
+        self.view_mode = view_mode
 
     def run(self):
         try:
@@ -1360,6 +1380,7 @@ class TrackingGifThread(QThread):
                 self.result,
                 self.plan,
                 output_path=self.output_path,
+                view_mode=self.view_mode,
             )
             self.finished.emit(path)
         except Exception as e:
@@ -1411,7 +1432,10 @@ class MainWindow(QMainWindow):
         self._last_tracking_result = None
         self.nmp_last_trajectory = None
         self._nmp_plan_thread = None
-        self.nmp_waypoints = [
+        self._nmp_tracking_sim_thread = None
+        self._nmp_last_tracking_result = None
+        self._nmp_active_tracking_traj = None
+        self.nmp_waypoints = _load_nmp_waypoints_from_file(NMP_SAVED_WAYPOINTS_PATH) or [
             [0.0, 0.0, 0.0, 0.0, 0.0],
             [1.0, 0.0, 1.0, 0.0, 5.0],
         ]
@@ -3295,7 +3319,21 @@ class MainWindow(QMainWindow):
         self.nmp_waypoint_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.nmp_waypoint_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.nmp_waypoint_table.setAlternatingRowColors(True)
-        self.nmp_waypoint_table.setMinimumHeight(120)
+        self.nmp_waypoint_table.setMinimumHeight(88)
+        self.nmp_waypoint_table.setMaximumHeight(130)
+        nmp_wp_hdr = self.nmp_waypoint_table.horizontalHeader()
+        nmp_wp_hdr.setSectionResizeMode(QHeaderView.Interactive)
+        nmp_wp_widths = {
+            WP_COL_IDX: 28,
+            WP_COL_X: 54,
+            WP_COL_Y: 54,
+            WP_COL_Z: 54,
+            WP_COL_YAW: 58,
+            WP_COL_LEG_DT: 54,
+            WP_COL_T_ARR: 54,
+        }
+        for col, width in nmp_wp_widths.items():
+            self.nmp_waypoint_table.setColumnWidth(col, width)
         self.nmp_waypoint_table.itemChanged.connect(self._on_nmp_waypoint_table_item_changed)
         wp_layout.addWidget(self.nmp_waypoint_table)
         wp_btn_row = QHBoxLayout()
@@ -3303,40 +3341,147 @@ class MainWindow(QMainWindow):
         self.btn_nmp_add_wp.clicked.connect(self.add_nmp_waypoint)
         self.btn_nmp_remove_wp = QPushButton('Remove')
         self.btn_nmp_remove_wp.clicked.connect(self.remove_nmp_waypoint)
+        self.btn_nmp_save_wp = QPushButton('Save')
+        self.btn_nmp_save_wp.setToolTip(
+            'Save these waypoints so the NMP tab opens with them next time.\n'
+            f'{NMP_SAVED_WAYPOINTS_PATH}'
+        )
+        self.btn_nmp_save_wp.clicked.connect(self.save_nmp_waypoints)
         wp_btn_row.addWidget(self.btn_nmp_add_wp)
         wp_btn_row.addWidget(self.btn_nmp_remove_wp)
+        wp_btn_row.addWidget(self.btn_nmp_save_wp)
         wp_btn_row.addStretch(1)
         wp_layout.addLayout(wp_btn_row)
-        layout.addWidget(wp_group)
-
-        plan_group = QGroupBox('3. Flatness planning (Method 8)')
-        plan_layout = QGridLayout(plan_group)
+        plan_row = QGridLayout()
         self.nmp_dt_spin = QDoubleSpinBox()
         self.nmp_dt_spin.setRange(0.01, 0.2)
         self.nmp_dt_spin.setValue(0.05)
         self.nmp_dt_spin.setDecimals(3)
         self.nmp_dt_spin.setSingleStep(0.01)
         self.nmp_dt_spin.setToolTip('Sample period for flat-output reconstruction [s].')
-        plan_layout.addWidget(QLabel('Sample dt [s]:'), 0, 0)
-        plan_layout.addWidget(self.nmp_dt_spin, 0, 1)
+        plan_row.addWidget(QLabel('Sample dt [s]:'), 0, 0)
+        plan_row.addWidget(self.nmp_dt_spin, 0, 1)
         self.btn_nmp_plan = QPushButton('Plan flat trajectory')
         self.btn_nmp_plan.setToolTip(
             'Min-snap on ξ_x, ξ_y, z, ψ between waypoints; reconstruct COM state and controls.'
         )
         self.btn_nmp_plan.clicked.connect(self.start_nmp_planning)
-        plan_layout.addWidget(self.btn_nmp_plan, 1, 0, 1, 2)
+        plan_row.addWidget(self.btn_nmp_plan, 1, 0, 1, 2)
         self.lbl_nmp_plan_status = QLabel('No NMP plan yet.')
         self.lbl_nmp_plan_status.setWordWrap(True)
         self.lbl_nmp_plan_status.setStyleSheet('color: #555;')
-        plan_layout.addWidget(self.lbl_nmp_plan_status, 2, 0, 1, 2)
-        self.btn_nmp_send_to_tracking = QPushButton('Use plan in Tracking tab')
-        self.btn_nmp_send_to_tracking.setEnabled(False)
-        self.btn_nmp_send_to_tracking.setToolTip(
-            'Copy the NMP plan to the main trajectory cache and Tracking → Current trajectory.'
+        plan_row.addWidget(self.lbl_nmp_plan_status, 2, 0, 1, 2)
+        wp_layout.addLayout(plan_row)
+        layout.addWidget(wp_group)
+
+        track_group = QGroupBox('3. Tracking (PX4 cascade)')
+        track_layout = QVBoxLayout(track_group)
+        track_intro = QLabel(
+            'Closed-loop waypoint tracking with PX4 cascade. Choose whether the '
+            'position loop tracks COM (center of mass) or ξ (center of oscillation).'
         )
-        self.btn_nmp_send_to_tracking.clicked.connect(self._nmp_send_plan_to_tracking)
-        plan_layout.addWidget(self.btn_nmp_send_to_tracking, 3, 0, 1, 2)
-        layout.addWidget(plan_group)
+        track_intro.setWordWrap(True)
+        track_intro.setStyleSheet('color: #444;')
+        track_layout.addWidget(track_intro)
+        ref_row = QHBoxLayout()
+        ref_row.addWidget(QLabel('Reference:'))
+        self.nmp_ref_planned_radio = QRadioButton('Flat planned trajectory')
+        self.nmp_ref_waypoint_radio = QRadioButton('Direct waypoint flight')
+        self.nmp_ref_planned_radio.setChecked(True)
+        self.nmp_ref_planned_radio.setToolTip(
+            'Track the min-snap flat trajectory from “Plan flat trajectory”.'
+        )
+        self.nmp_ref_waypoint_radio.setToolTip(
+            'No planning: GotoSetpoint-style holds — switch target at each arrival time.'
+        )
+        self._nmp_ref_mode_group = QButtonGroup(self)
+        self._nmp_ref_mode_group.addButton(self.nmp_ref_planned_radio, 0)
+        self._nmp_ref_mode_group.addButton(self.nmp_ref_waypoint_radio, 1)
+        self.nmp_ref_planned_radio.toggled.connect(self._on_nmp_tracking_timing_changed)
+        self.nmp_ref_waypoint_radio.toggled.connect(self._on_nmp_tracking_timing_changed)
+        ref_row.addWidget(self.nmp_ref_planned_radio)
+        ref_row.addWidget(self.nmp_ref_waypoint_radio)
+        ref_row.addStretch(1)
+        track_layout.addLayout(ref_row)
+        plot_mode_row = QHBoxLayout()
+        plot_mode_row.addWidget(QLabel('NMP plot:'))
+        self.nmp_plot_all_radio = QRadioButton('All state')
+        self.nmp_plot_2d_radio = QRadioButton('2D (x-only)')
+        self.nmp_plot_all_radio.setChecked(True)
+        self.nmp_plot_all_radio.setToolTip('Show x/y/z states and all attitude/gimbal channels.')
+        self.nmp_plot_2d_radio.setToolTip(
+            'Hide y-axis channels (y, vy, roll, p, roll gimbal) for x-direction motion.'
+        )
+        self._nmp_plot_mode_group = QButtonGroup(self)
+        self._nmp_plot_mode_group.addButton(self.nmp_plot_all_radio, 0)
+        self._nmp_plot_mode_group.addButton(self.nmp_plot_2d_radio, 1)
+        self.nmp_plot_all_radio.toggled.connect(self._on_nmp_plot_mode_changed)
+        plot_mode_row.addWidget(self.nmp_plot_all_radio)
+        plot_mode_row.addWidget(self.nmp_plot_2d_radio)
+        plot_mode_row.addStretch(1)
+        track_layout.addLayout(plot_mode_row)
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel('Control point:'))
+        self.nmp_ctrl_com_radio = QRadioButton('COM (center of mass)')
+        self.nmp_ctrl_xi_radio = QRadioButton('ξ (oscillation point)')
+        self.nmp_ctrl_com_radio.setChecked(True)
+        self.nmp_ctrl_com_radio.setToolTip('PX4 cascade on COM position (default).')
+        self.nmp_ctrl_xi_radio.setToolTip(
+            'Flatness cascade: outer loop on ξ_x/ξ_y, inner loop still PX4 cascade.'
+        )
+        self._nmp_ctrl_point_group = QButtonGroup(self)
+        self._nmp_ctrl_point_group.addButton(self.nmp_ctrl_com_radio, 0)
+        self._nmp_ctrl_point_group.addButton(self.nmp_ctrl_xi_radio, 1)
+        self.nmp_ctrl_com_radio.toggled.connect(self._on_nmp_control_point_changed)
+        self.nmp_ctrl_xi_radio.toggled.connect(self._on_nmp_control_point_changed)
+        ctrl_row.addWidget(self.nmp_ctrl_com_radio)
+        ctrl_row.addWidget(self.nmp_ctrl_xi_radio)
+        ctrl_row.addStretch(1)
+        track_layout.addLayout(ctrl_row)
+        self.nmp_params_group, nmp_param_outer = self._make_collapsible_group(
+            'Controller parameters',
+            track_layout,
+            expanded=False,
+        )
+        self.nmp_params_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self._create_nmp_tracking_timing_panel(nmp_param_outer)
+        nmp_param_io = QHBoxLayout()
+        self.btn_save_nmp_tracking_params = QPushButton('Save params')
+        self.btn_save_nmp_tracking_params.setToolTip(
+            f'Save NMP controller/timing parameters to {DEFAULT_TRACKING_PARAMS_PATH}'
+        )
+        self.btn_save_nmp_tracking_params.clicked.connect(self.save_tracking_params)
+        nmp_param_io.addWidget(self.btn_save_nmp_tracking_params)
+        nmp_param_io.addStretch(1)
+        nmp_param_outer.addLayout(nmp_param_io)
+        self.nmp_params_scroll = QScrollArea()
+        self.nmp_params_scroll.setWidgetResizable(True)
+        self.nmp_params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nmp_params_scroll.setMinimumHeight(240)
+        self.nmp_params_scroll.setMaximumHeight(420)
+        self.nmp_params_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.nmp_params_grid_host = QWidget()
+        self.nmp_params_groups_layout = QVBoxLayout(self.nmp_params_grid_host)
+        self.nmp_params_groups_layout.setSpacing(5)
+        self.nmp_params_groups_layout.setContentsMargins(2, 2, 2, 2)
+        self.nmp_params_scroll.setWidget(self.nmp_params_grid_host)
+        nmp_param_outer.addWidget(self.nmp_params_scroll)
+        self._rebuild_nmp_tracking_param_widgets()
+        self.btn_nmp_run_tracking = QPushButton('Run tracking sim')
+        self.btn_nmp_run_tracking.setToolTip(
+            'Numerical closed-loop tracking with PX4 cascade '
+            '(planned trajectory or direct waypoint flight).'
+        )
+        self.btn_nmp_run_tracking.clicked.connect(self.run_nmp_tracking_sim)
+        track_layout.addWidget(self.btn_nmp_run_tracking)
+        self.lbl_nmp_tracking_status = QLabel(
+            'Choose reference mode, then run tracking sim '
+            '(planned mode needs “Plan flat trajectory” first).'
+        )
+        self.lbl_nmp_tracking_status.setWordWrap(True)
+        self.lbl_nmp_tracking_status.setStyleSheet('color: #555;')
+        track_layout.addWidget(self.lbl_nmp_tracking_status)
+        layout.addWidget(track_group)
 
         layout.addStretch(1)
         self._populate_nmp_waypoint_table()
@@ -3401,9 +3546,9 @@ class MainWindow(QMainWindow):
                 self.nmp_waypoint_table.setItem(
                     i, WP_COL_IDX, self._make_waypoint_table_item(i, editable=False),
                 )
-                self.nmp_waypoint_table.setItem(i, WP_COL_X, self._make_waypoint_table_item(f'{x:.3f}'))
-                self.nmp_waypoint_table.setItem(i, WP_COL_Y, self._make_waypoint_table_item(f'{y:.3f}'))
-                self.nmp_waypoint_table.setItem(i, WP_COL_Z, self._make_waypoint_table_item(f'{z:.3f}'))
+                self.nmp_waypoint_table.setItem(i, WP_COL_X, self._make_waypoint_table_item(f'{x:.1f}'))
+                self.nmp_waypoint_table.setItem(i, WP_COL_Y, self._make_waypoint_table_item(f'{y:.1f}'))
+                self.nmp_waypoint_table.setItem(i, WP_COL_Z, self._make_waypoint_table_item(f'{z:.1f}'))
                 self.nmp_waypoint_table.setItem(i, WP_COL_YAW, self._make_waypoint_table_item(f'{yaw:.1f}'))
                 if i == 0:
                     self.nmp_waypoint_table.setItem(
@@ -3411,11 +3556,11 @@ class MainWindow(QMainWindow):
                     )
                 else:
                     self.nmp_waypoint_table.setItem(
-                        i, WP_COL_LEG_DT, self._make_waypoint_table_item(f'{leg:.3f}'),
+                        i, WP_COL_LEG_DT, self._make_waypoint_table_item(f'{leg:.1f}'),
                     )
                 self.nmp_waypoint_table.setItem(
                     i, WP_COL_T_ARR,
-                    self._make_waypoint_table_item(f'{t_arr:.3f}', editable=(i > 0)),
+                    self._make_waypoint_table_item(f'{t_arr:.1f}', editable=(i > 0)),
                 )
         finally:
             self.nmp_waypoint_table.blockSignals(False)
@@ -3448,6 +3593,8 @@ class MainWindow(QMainWindow):
             return
         self._sync_nmp_waypoints_from_table()
         self._populate_nmp_waypoint_table()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
 
     def add_nmp_waypoint(self):
         self._sync_nmp_waypoints_from_table()
@@ -3459,6 +3606,8 @@ class MainWindow(QMainWindow):
             last[0], last[1], last[2] + 0.5, last[3], last[4] + dt_leg,
         ])
         self._populate_nmp_waypoint_table()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
 
     def remove_nmp_waypoint(self):
         self._sync_nmp_waypoints_from_table()
@@ -3471,6 +3620,23 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.nmp_waypoints):
             del self.nmp_waypoints[row]
         self._populate_nmp_waypoint_table()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
+
+    def save_nmp_waypoints(self):
+        """Persist current NMP waypoints so they auto-load next time the GUI starts."""
+        self._sync_nmp_waypoints_from_table()
+        os.makedirs(os.path.dirname(NMP_SAVED_WAYPOINTS_PATH), exist_ok=True)
+        try:
+            with open(NMP_SAVED_WAYPOINTS_PATH, 'w', encoding='utf-8') as f:
+                json.dump({'waypoints': waypoints_to_json_list(self.nmp_waypoints)}, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, 'NMP', f'Could not save waypoints:\n{e}')
+            return
+        if hasattr(self, 'status_text'):
+            self.status_text.append(
+                f'NMP: saved {len(self.nmp_waypoints)} waypoints to:\n  {NMP_SAVED_WAYPOINTS_PATH}'
+            )
 
     def start_nmp_planning(self):
         if self._nmp_plan_thread and self._nmp_plan_thread.isRunning():
@@ -3543,10 +3709,12 @@ class MainWindow(QMainWindow):
         self.lbl_nmp_plan_status.setText(
             f'Plan OK: {n_pts} samples, duration {dur:.2f} s, compute {elapsed:.2f} s.'
         )
-        self.btn_nmp_send_to_tracking.setEnabled(True)
+        self._nmp_last_tracking_result = None
         self.status_text.append(
             f'NMP plan ready — {n_pts} points, {dur:.2f} s ({platform_label(self._current_nmp_platform_id())}).'
         )
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
         self._draw_nmp_plot_tab()
         if hasattr(self, 'plot_tabs'):
             for i in range(self.plot_tabs.count()):
@@ -3554,40 +3722,487 @@ class MainWindow(QMainWindow):
                     self.plot_tabs.setCurrentIndex(i)
                     break
 
-    def _nmp_send_plan_to_tracking(self):
-        if not self.nmp_last_trajectory or self.nmp_last_trajectory.get('xs') is None:
-            QMessageBox.warning(self, 'NMP', 'No NMP plan to export.')
-            return
-        traj = self.nmp_last_trajectory
-        self.last_trajectory = dict(traj)
-        self.last_trajectory['method'] = 7
-        if hasattr(self, 'tracking_source_combo'):
-            self.tracking_source_combo.setCurrentIndex(0)
-            self._on_tracking_source_changed(0)
-        self.status_text.append('NMP plan copied to Tracking → Current trajectory.')
-        QMessageBox.information(
-            self, 'NMP',
-            'Trajectory copied to the main cache.\n'
-            'Tracking → Source: Current trajectory; use PX4 cascade for closed-loop sim.',
+    def _current_nmp_tracking_ref_mode(self):
+        if hasattr(self, 'nmp_ref_waypoint_radio') and self.nmp_ref_waypoint_radio.isChecked():
+            return 'waypoint'
+        return 'planned'
+
+    def _current_nmp_plot_mode(self):
+        if hasattr(self, 'nmp_plot_2d_radio') and self.nmp_plot_2d_radio.isChecked():
+            return '2d'
+        return 'all'
+
+    def _on_nmp_plot_mode_changed(self, _checked=False):
+        self._draw_nmp_plot_tab()
+
+    def _nmp_flatness_physics_dict(self):
+        traj = getattr(self, 'nmp_last_trajectory', None)
+        if traj and traj.get('flatness_physics'):
+            return dict(traj['flatness_physics'])
+        phy = self._nmp_physics_dict()
+        return {
+            'mass': phy['mass'],
+            'Ixx': phy['Ixx'],
+            'Iyy': phy['Iyy'],
+            'Izz': phy['Izz'],
+            'r_thrust_z': phy['r_thrust_z'],
+            'g': phy.get('g', 9.81),
+        }
+
+    def _create_nmp_tracking_timing_panel(self, parent_layout):
+        """NMP-specific plant step, control period, and simulation horizon."""
+        timing_group = QGroupBox('Tracking timing')
+        grid = QGridLayout(timing_group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+
+        cfg = dict(
+            self._tracking_config.get('nmp_numerical_sim')
+            or self._tracking_config.get('numerical_sim')
+            or default_numerical_sim_config()
         )
+
+        self.nmp_sim_dt_spin = QDoubleSpinBox()
+        self.nmp_sim_dt_spin.setRange(0.001, 0.05)
+        self.nmp_sim_dt_spin.setDecimals(4)
+        self.nmp_sim_dt_spin.setSingleStep(0.001)
+        self.nmp_sim_dt_spin.setToolTip('Plant integration step [s] for NMP tracking simulation.')
+        self.nmp_sim_dt_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.nmp_control_dt_spin = QDoubleSpinBox()
+        self.nmp_control_dt_spin.setRange(0.005, 0.2)
+        self.nmp_control_dt_spin.setDecimals(4)
+        self.nmp_control_dt_spin.setSingleStep(0.005)
+        self.nmp_control_dt_spin.setToolTip('Controller update period [s] for both COM and ξ tracking.')
+        self.nmp_control_dt_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.nmp_terminal_hold_spin = QDoubleSpinBox()
+        self.nmp_terminal_hold_spin.setRange(0.0, 120.0)
+        self.nmp_terminal_hold_spin.setDecimals(2)
+        self.nmp_terminal_hold_spin.setSingleStep(0.5)
+        self.nmp_terminal_hold_spin.setToolTip(
+            'Extra hover time after the selected NMP reference ends. Ignored when Total duration > 0.'
+        )
+        self.nmp_terminal_hold_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.nmp_total_duration_spin = QDoubleSpinBox()
+        self.nmp_total_duration_spin.setRange(0.0, 600.0)
+        self.nmp_total_duration_spin.setDecimals(2)
+        self.nmp_total_duration_spin.setSingleStep(1.0)
+        self.nmp_total_duration_spin.setSpecialValueText('Auto (reference + hold)')
+        self.nmp_total_duration_spin.setToolTip(
+            'Fixed NMP tracking simulation length from t=0 [s]. 0 = automatic: '
+            'selected reference duration + terminal hold.'
+        )
+        self.nmp_total_duration_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.lbl_nmp_control_hz = QLabel()
+        self.lbl_nmp_control_hz.setStyleSheet('color: #555;')
+        self.lbl_nmp_substeps = QLabel()
+        self.lbl_nmp_substeps.setStyleSheet('color: #555;')
+        self.lbl_nmp_sim_duration = QLabel()
+        self.lbl_nmp_sim_duration.setStyleSheet('color: #555;')
+        self.lbl_nmp_sim_duration.setWordWrap(True)
+
+        grid.addWidget(QLabel('sim_dt [s]:'), 0, 0)
+        grid.addWidget(self.nmp_sim_dt_spin, 0, 1)
+        grid.addWidget(QLabel('control_dt [s]:'), 0, 2)
+        grid.addWidget(self.nmp_control_dt_spin, 0, 3)
+        grid.addWidget(QLabel('hold [s]:'), 1, 0)
+        grid.addWidget(self.nmp_terminal_hold_spin, 1, 1)
+        grid.addWidget(QLabel('total [s]:'), 1, 2)
+        grid.addWidget(self.nmp_total_duration_spin, 1, 3)
+        grid.addWidget(self.lbl_nmp_control_hz, 2, 0, 1, 2)
+        grid.addWidget(self.lbl_nmp_substeps, 2, 2, 1, 2)
+        grid.addWidget(self.lbl_nmp_sim_duration, 3, 0, 1, 4)
+
+        parent_layout.addWidget(timing_group)
+        self._nmp_sim_timing_guard = True
+        self.nmp_sim_dt_spin.setValue(float(cfg.get('sim_dt', 0.005)))
+        self.nmp_control_dt_spin.setValue(float(cfg.get('control_dt', 0.02)))
+        self.nmp_terminal_hold_spin.setValue(float(cfg.get('terminal_hold_duration_s', 3.0)))
+        self.nmp_total_duration_spin.setValue(float(cfg.get('total_duration_s', 0.0)))
+        self._nmp_sim_timing_guard = False
+        self._on_nmp_tracking_timing_changed()
+
+    def _nmp_reference_duration_s(self):
+        """Selected NMP reference span [s], used only for timing preview."""
+        if self._current_nmp_tracking_ref_mode() == 'waypoint':
+            self._sync_nmp_waypoints_from_table()
+            if len(self.nmp_waypoints) >= 2:
+                return max(
+                    float(self.nmp_waypoints[-1][4]) - float(self.nmp_waypoints[0][4]),
+                    0.0,
+                )
+            return None
+        traj = getattr(self, 'nmp_last_trajectory', None)
+        if traj and traj.get('xs') is not None:
+            ts = traj.get('time_states')
+            if ts is not None and len(ts) >= 2:
+                arr = np.asarray(ts, dtype=float)
+                return max(float(arr[-1] - arr[0]), 0.0)
+            dt = traj.get('dt')
+            xs = traj.get('xs')
+            if dt is not None and xs is not None and len(xs) >= 2:
+                return max(float((len(xs) - 1) * float(dt)), 0.0)
+        return None
+
+    def _on_nmp_tracking_timing_changed(self, _value=None):
+        if getattr(self, '_nmp_sim_timing_guard', False):
+            return
+        sim_dt = float(self.nmp_sim_dt_spin.value())
+        control_dt = float(self.nmp_control_dt_spin.value())
+        if control_dt < sim_dt:
+            self._nmp_sim_timing_guard = True
+            self.nmp_control_dt_spin.setValue(sim_dt)
+            self._nmp_sim_timing_guard = False
+            control_dt = sim_dt
+        ratio = max(1, int(round(control_dt / sim_dt)))
+        aligned_control_dt = ratio * sim_dt
+        if abs(aligned_control_dt - control_dt) > 1e-9:
+            self._nmp_sim_timing_guard = True
+            self.nmp_control_dt_spin.setValue(aligned_control_dt)
+            self._nmp_sim_timing_guard = False
+            control_dt = aligned_control_dt
+        hz = 1.0 / control_dt if control_dt > 0 else 0.0
+        self.lbl_nmp_control_hz.setText(f'Control rate: {hz:.1f} Hz')
+        self.lbl_nmp_substeps.setText(f'Plant substeps per control update: {ratio}')
+
+        hold = float(self.nmp_terminal_hold_spin.value())
+        total = float(self.nmp_total_duration_spin.value())
+        ref_s = self._nmp_reference_duration_s()
+        if total > 0.0:
+            dur_txt = f'Simulation length: {total:.2f} s (fixed total)'
+        elif ref_s is not None:
+            dur_txt = (
+                f'Simulation length: {ref_s + hold:.2f} s '
+                f'(reference {ref_s:.2f} s + hold {hold:.2f} s)'
+            )
+        else:
+            dur_txt = (
+                f'Simulation length: selected reference duration + {hold:.2f} s hold '
+                f'(plan a trajectory or use waypoint mode)'
+            )
+        self.lbl_nmp_sim_duration.setText(dur_txt)
+        self._tracking_config['nmp_numerical_sim'] = {
+            'sim_dt': sim_dt,
+            'control_dt': control_dt,
+            'terminal_hold_duration_s': hold,
+            'total_duration_s': total,
+        }
+
+    def _nmp_tracking_sim_params_for_sim(self):
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
+        cfg = self._tracking_config.get('nmp_numerical_sim') or default_numerical_sim_config()
+        return {
+            'sim_dt': float(cfg.get('sim_dt', 0.005)),
+            'control_dt': float(cfg.get('control_dt', 0.02)),
+            'terminal_hold_duration_s': float(cfg.get('terminal_hold_duration_s', 3.0)),
+            'total_duration_s': float(cfg.get('total_duration_s', 0.0)),
+        }
+
+    def _nmp_tracking_reference_pack(self):
+        """Return arrays + metadata for the selected NMP tracking reference."""
+        ref_mode = self._current_nmp_tracking_ref_mode()
+        if ref_mode == 'waypoint':
+            self._sync_nmp_waypoints_from_table()
+            if len(self.nmp_waypoints) < 2:
+                raise ValueError('Need at least 2 waypoints for direct flight.')
+            for i in range(len(self.nmp_waypoints) - 1):
+                if self.nmp_waypoints[i][4] >= self.nmp_waypoints[i + 1][4]:
+                    raise ValueError(
+                        f'Arrival time must increase between waypoints {i} and {i + 1}.',
+                    )
+            pack = build_waypoint_flight_reference(
+                self.nmp_waypoints,
+                self._nmp_flatness_physics_dict(),
+                dt=self.nmp_dt_spin.value(),
+                terminal_hold_s=0.0,
+            )
+            traj = {
+                'xs': pack['xs'],
+                'us': pack['us'],
+                'time_states': pack['time_states'],
+                'dt': pack['dt'],
+                'flat_outputs': pack['flat_outputs'],
+                'flatness_physics': pack['flatness_physics'],
+                'platform_id': self._current_nmp_platform_id(),
+                'method_name': pack['method_name'],
+                'waypoint_mode': True,
+            }
+            return (
+                np.asarray(pack['xs'], dtype=float),
+                np.asarray(pack['us'], dtype=float) if pack.get('us') is not None else None,
+                np.asarray(pack['time_states'], dtype=float),
+                pack.get('flat_outputs'),
+                pack.get('flatness_physics'),
+                pack.get('x0'),
+                traj,
+                'waypoint',
+            )
+
+        traj = getattr(self, 'nmp_last_trajectory', None)
+        if not traj or traj.get('xs') is None:
+            raise ValueError('Plan a flat trajectory first, or switch to direct waypoint flight.')
+        xs, us, time_states = self._nmp_trajectory_arrays_for_tracking()
+        if xs is None:
+            raise ValueError('No planned trajectory available.')
+        return (
+            xs, us, time_states,
+            traj.get('flat_outputs'),
+            traj.get('flatness_physics'),
+            None,
+            traj,
+            'planned',
+        )
+
+    def _current_nmp_controller_id(self):
+        if hasattr(self, 'nmp_ctrl_xi_radio') and self.nmp_ctrl_xi_radio.isChecked():
+            return CONTROLLER_FLATNESS
+        return CONTROLLER_PX4
+
+    def _on_nmp_control_point_changed(self, _checked=False):
+        if not hasattr(self, 'nmp_params_groups_layout'):
+            return
+        self._store_nmp_tracking_params_for_controller()
+        self._rebuild_nmp_tracking_param_widgets()
+
+    def _make_nmp_tracking_param_widget(self, spec, params, controller_id):
+        w = self._make_tracking_param_widget(spec, params, controller_id)
+        if spec.get('checkbox') and spec.get('key') == 'share_rp_gains':
+            try:
+                w.stateChanged.disconnect()
+            except TypeError:
+                pass
+            w.stateChanged.connect(self._on_nmp_share_rp_changed)
+        return w
+
+    def _populate_nmp_tracking_param_group(self, grid, specs, params, controller_id):
+        row = 0
+        col_slot = 0
+        for spec in specs:
+            key = spec['key']
+            if spec.get('full_width'):
+                if col_slot == 1:
+                    row += 1
+                    col_slot = 0
+                w = self._make_nmp_tracking_param_widget(spec, params, controller_id)
+                if spec.get('checkbox'):
+                    w.setText(spec['label'])
+                    grid.addWidget(w, row, 0, 1, 4)
+                else:
+                    grid.addWidget(QLabel(spec['label']), row, 0)
+                    grid.addWidget(w, row, 1, 1, 3)
+                self._nmp_tracking_param_widgets[key] = w
+                row += 1
+                continue
+
+            base_col = col_slot * 2
+            grid.addWidget(QLabel(spec['label']), row, base_col)
+            w = self._make_nmp_tracking_param_widget(spec, params, controller_id)
+            grid.addWidget(w, row, base_col + 1)
+            self._nmp_tracking_param_widgets[key] = w
+            if col_slot == 1:
+                row += 1
+                col_slot = 0
+            else:
+                col_slot = 1
+        if col_slot == 1:
+            row += 1
+        return row
+
+    def _store_nmp_tracking_params_for_controller(self, controller_id=None):
+        cid = controller_id or getattr(
+            self, '_nmp_param_controller_id', self._current_nmp_controller_id()
+        )
+        if cid not in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
+            return
+        params_map = self._tracking_config.setdefault('params', {})
+        stored = params_map.setdefault(cid, default_params_for(cid))
+        for key, widget in getattr(self, '_nmp_tracking_param_widgets', {}).items():
+            if isinstance(widget, QCheckBox):
+                stored[key] = widget.isChecked()
+            elif isinstance(widget, QSpinBox):
+                stored[key] = int(widget.value())
+            else:
+                stored[key] = float(widget.value())
+        if cid == CONTROLLER_PX4:
+            params_map[cid] = migrate_px4_params(stored)
+
+    def _rebuild_nmp_tracking_param_widgets(self):
+        if not hasattr(self, 'nmp_params_groups_layout'):
+            return
+        while self.nmp_params_groups_layout.count():
+            item = self.nmp_params_groups_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._nmp_tracking_param_widgets = {}
+
+        cid = self._current_nmp_controller_id()
+        self._nmp_param_controller_id = cid
+        params = self._tracking_config.setdefault('params', {}).setdefault(
+            cid, default_params_for(cid)
+        )
+        if cid == CONTROLLER_PX4:
+            params.update(migrate_px4_params(params))
+            self._tracking_config['params'][cid] = params
+        px4_extra = params if cid in (CONTROLLER_PX4, CONTROLLER_FLATNESS) else None
+        for group in param_groups_for(cid, px4_params=px4_extra):
+            box = QGroupBox(group.get('title', 'Parameters'))
+            grid = QGridLayout(box)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(3)
+            self._populate_nmp_tracking_param_group(
+                grid, group.get('specs') or [], params, cid
+            )
+            self.nmp_params_groups_layout.addWidget(box)
+        self.nmp_params_groups_layout.addStretch(1)
+        QTimer.singleShot(0, self._refresh_tab_scroll_areas)
+
+    def _on_nmp_share_rp_changed(self, _state=None):
+        self._store_nmp_tracking_params_for_controller()
+        self._rebuild_nmp_tracking_param_widgets()
+
+    def _nmp_physics_for_tracking(self):
+        phy = dict(self._nmp_physics_dict())
+        phy['platform_id'] = self._current_nmp_platform_id()
+        return phy
+
+    def _collect_nmp_tracking_params(self):
+        cid = self._current_nmp_controller_id()
+        self._store_nmp_tracking_params_for_controller(cid)
+        params = dict(default_params_for(cid))
+        if hasattr(self, '_tracking_config'):
+            saved = self._tracking_config.get('params', {}).get(cid)
+            if saved:
+                params.update(saved)
+        if hasattr(self, '_store_actuator_config'):
+            self._store_actuator_config()
+        if hasattr(self, '_actuator_params_for_sim'):
+            params.update(self._actuator_params_for_sim())
+        params.update(self._nmp_tracking_sim_params_for_sim())
+        bounds = self._nmp_bounds_dict()
+        params.update(bounds)
+        return params
+
+    def _nmp_trajectory_arrays_for_tracking(self):
+        traj = getattr(self, 'nmp_last_trajectory', None)
+        if not traj or traj.get('xs') is None:
+            return None, None, None
+        xs = np.asarray(traj['xs'], dtype=float)
+        us = traj.get('us')
+        if us is not None:
+            us = np.asarray(us, dtype=float)
+        ts = traj.get('time_states')
+        if ts is not None and len(ts) == len(xs):
+            t_list = np.asarray(ts, dtype=float)
+        else:
+            dt = float(traj.get('dt', 0.05))
+            t_list = np.arange(len(xs), dtype=float) * dt
+        if us is not None and us.shape[0] == xs.shape[0]:
+            us = us[:-1]
+        elif us is not None and us.shape[0] != max(xs.shape[0] - 1, 0):
+            us = None
+        return xs, us, t_list
+
+    def run_nmp_tracking_sim(self):
+        if self._nmp_tracking_sim_thread is not None and self._nmp_tracking_sim_thread.isRunning():
+            return
+        try:
+            xs, us, time_states, flat_outputs, flatness_physics, x0, traj, ref_mode = (
+                self._nmp_tracking_reference_pack()
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, 'NMP', str(exc))
+            return
+        cid = self._current_nmp_controller_id()
+        params = self._collect_nmp_tracking_params()
+        ctrl_label = 'ξ (oscillation)' if cid == CONTROLLER_FLATNESS else 'COM'
+        ref_label = 'waypoints' if ref_mode == 'waypoint' else 'flat plan'
+        self.btn_nmp_run_tracking.setEnabled(False)
+        self.lbl_nmp_tracking_status.setText(
+            f'Running tracking sim — {ref_label}, PX4 cascade on {ctrl_label}…',
+        )
+        self.status_text.append(
+            f'NMP: tracking sim ({ref_label}, {ctrl_label})…',
+        )
+        self._nmp_active_tracking_traj = traj
+        self._nmp_tracking_sim_thread = TrackingSimulationThread(
+            xs, us, time_states, cid, params, self._nmp_physics_for_tracking(),
+            flat_outputs=flat_outputs, flatness_physics=flatness_physics, x0=x0,
+        )
+        self._nmp_tracking_sim_thread.finished.connect(self._on_nmp_tracking_sim_finished)
+        self._nmp_tracking_sim_thread.error.connect(self._on_nmp_tracking_sim_error)
+        self._nmp_tracking_sim_thread.start()
+
+    def _on_nmp_tracking_sim_finished(self, result):
+        self.btn_nmp_run_tracking.setEnabled(True)
+        self._nmp_last_tracking_result = result
+        self._last_tracking_result = result
+        summary = tracking_summary_text(result)
+        ctrl_label = 'ξ' if self._current_nmp_controller_id() == CONTROLLER_FLATNESS else 'COM'
+        ref_label = (
+            'waypoint flight'
+            if self._current_nmp_tracking_ref_mode() == 'waypoint'
+            else 'flat plan'
+        )
+        self.lbl_nmp_tracking_status.setText(
+            f'{summary}  |  ref: {ref_label}  |  control: {ctrl_label}',
+        )
+        self.status_text.append(f'NMP tracking: {summary}')
+        active_traj = getattr(self, '_nmp_active_tracking_traj', None) or self.nmp_last_trajectory
+        if active_traj:
+            self.last_trajectory = dict(active_traj)
+        if self._display_panels_ready():
+            self._draw_tracking_plot_tabs(result)
+            self._draw_nmp_plot_tab()
+            if hasattr(self, 'plot_tabs'):
+                for i in range(self.plot_tabs.count()):
+                    if self.plot_tabs.tabText(i) == 'NMP / Flatness':
+                        self.plot_tabs.setCurrentIndex(i)
+                        break
+
+    def _on_nmp_tracking_sim_error(self, msg):
+        self.btn_nmp_run_tracking.setEnabled(True)
+        self.lbl_nmp_tracking_status.setText('Tracking simulation failed.')
+        QMessageBox.critical(self, 'NMP tracking error', msg)
+        self.status_text.append(f'NMP tracking error: {msg}')
 
     def _draw_nmp_plot_tab(self):
         if not hasattr(self, 'canvas_nmp'):
             return
-        traj = getattr(self, 'nmp_last_trajectory', None)
+        traj = getattr(self, '_nmp_active_tracking_traj', None) or getattr(self, 'nmp_last_trajectory', None)
         phy = None
         if traj:
             phy = traj.get('flatness_physics') or self._nmp_physics_dict()
-        series = build_nmp_series(traj, phy=phy)
+        series = build_nmp_series(
+            traj,
+            phy=phy,
+            tracking_result=getattr(self, '_nmp_last_tracking_result', None),
+        )
         summary = ''
         if traj and series is not None:
             max_dx = float(np.max(np.abs(series['offset_x_meas']))) * 1000
             max_dy = float(np.max(np.abs(series['offset_y_meas']))) * 1000
+            ctrl = 'ξ' if self._current_nmp_controller_id() == CONTROLLER_FLATNESS else 'COM'
+            ref = (
+                'waypoint'
+                if traj.get('waypoint_mode') or self._current_nmp_tracking_ref_mode() == 'waypoint'
+                else 'planned'
+            )
             summary = (
                 f'Platform: {platform_label(traj.get("platform_id", self._current_nmp_platform_id()))}  |  '
-                f'max |x−ξ_x|={max_dx:.1f} mm  max |y−ξ_y|={max_dy:.1f} mm'
+                f'plan max |x−ξ_x|={max_dx:.1f} mm  max |y−ξ_y|={max_dy:.1f} mm  |  '
+                f'ref: {ref}  ctrl: {ctrl}'
             )
-        draw_nmp_panels(nmp_axes_dict(self), series, summary=summary)
+        draw_nmp_panels(
+            nmp_axes_dict(self),
+            series,
+            summary=summary,
+            mode=self._current_nmp_plot_mode(),
+        )
         self.canvas_nmp.draw_idle()
         self._refresh_all_plot_layouts()
 
@@ -3743,6 +4358,19 @@ class MainWindow(QMainWindow):
         self.tracking_gif_status.setWordWrap(True)
         self.tracking_gif_status.setStyleSheet('color: #555;')
         gif_layout.addWidget(self.tracking_gif_status)
+        gif_view_row = QHBoxLayout()
+        gif_view_row.addWidget(QLabel('View:'))
+        self.tracking_gif_3d_radio = QRadioButton('3D')
+        self.tracking_gif_2d_radio = QRadioButton('2D (XY)')
+        self.tracking_gif_3d_radio.setChecked(True)
+        self._tracking_gif_view_group = QButtonGroup(self)
+        self._tracking_gif_view_group.addButton(self.tracking_gif_3d_radio, 0)
+        self._tracking_gif_view_group.addButton(self.tracking_gif_2d_radio, 1)
+        self.tracking_gif_3d_radio.toggled.connect(self._on_tracking_gif_view_changed)
+        gif_view_row.addWidget(self.tracking_gif_3d_radio)
+        gif_view_row.addWidget(self.tracking_gif_2d_radio)
+        gif_view_row.addStretch(1)
+        gif_layout.addLayout(gif_view_row)
         self.tracking_gif_label = QLabel()
         self.tracking_gif_label.setAlignment(Qt.AlignCenter)
         self.tracking_gif_label.setMinimumHeight(320)
@@ -3802,8 +4430,8 @@ class MainWindow(QMainWindow):
             'hspace': 0.38, 'wspace': 0.28,
         }
         self.ax_nmp_position = self.fig_nmp.add_subplot(gs_nmp[0, 0])
-        self.ax_nmp_velocity = self.fig_nmp.add_subplot(gs_nmp[0, 1])
-        self.ax_nmp_angle = self.fig_nmp.add_subplot(gs_nmp[1, 0])
+        self.ax_nmp_angle = self.fig_nmp.add_subplot(gs_nmp[0, 1])
+        self.ax_nmp_velocity = self.fig_nmp.add_subplot(gs_nmp[1, 0])
         self.ax_nmp_angvel = self.fig_nmp.add_subplot(gs_nmp[1, 1])
         self.ax_nmp_gimbal = self.fig_nmp.add_subplot(gs_nmp[2, 0])
         self.ax_nmp_thrust = self.fig_nmp.add_subplot(gs_nmp[2, 1])
@@ -3908,22 +4536,33 @@ class MainWindow(QMainWindow):
         self._refresh_all_plot_layouts()
         self._start_tracking_gif_generation(result)
 
+    def _current_tracking_gif_view_mode(self):
+        if hasattr(self, 'tracking_gif_2d_radio') and self.tracking_gif_2d_radio.isChecked():
+            return '2d'
+        return '3d'
+
+    def _on_tracking_gif_view_changed(self, _checked=False):
+        if self._last_tracking_result is not None:
+            self._start_tracking_gif_generation(self._last_tracking_result)
+
     def _start_tracking_gif_generation(self, result=None):
-        """Render 3D attitude GIF in a background thread."""
+        """Render tracking GIF in a background thread."""
         result = result or getattr(self, '_last_tracking_result', None)
         if result is None:
             return
         if self._tracking_gif_thread is not None and self._tracking_gif_thread.isRunning():
             return
         plan = getattr(self, 'last_trajectory', None)
-        self.tracking_gif_status.setText('Generating 3D tracking GIF…')
+        view_mode = self._current_tracking_gif_view_mode()
+        label = '2D' if view_mode == '2d' else '3D'
+        self.tracking_gif_status.setText(f'Generating {label} tracking GIF…')
         self.btn_regenerate_tracking_gif.setEnabled(False)
         self.btn_save_tracking_gif.setEnabled(False)
         if self._tracking_gif_movie is not None:
             self._tracking_gif_movie.stop()
             self._tracking_gif_movie = None
         self._tracking_gif_thread = TrackingGifThread(
-            result, plan, DEFAULT_TRACKING_GIF_PATH,
+            result, plan, DEFAULT_TRACKING_GIF_PATH, view_mode=view_mode,
         )
         self._tracking_gif_thread.finished.connect(self._on_tracking_gif_finished)
         self._tracking_gif_thread.error.connect(self._on_tracking_gif_error)
@@ -5970,8 +6609,6 @@ class MainWindow(QMainWindow):
         if self.method_combo.currentIndex() == 7 and hasattr(self, 'canvas_nmp'):
             self.nmp_last_trajectory = dict(self.last_trajectory)
             self.nmp_last_trajectory['platform_id'] = self._current_rocket_platform_id()
-            if hasattr(self, 'btn_nmp_send_to_tracking'):
-                self.btn_nmp_send_to_tracking.setEnabled(True)
             if hasattr(self, 'lbl_nmp_plan_status'):
                 self.lbl_nmp_plan_status.setText(
                     'Plan loaded from Trajectory tab (Method 8).'
@@ -6819,6 +7456,10 @@ class MainWindow(QMainWindow):
         self._store_tracking_params_for_controller(self._current_tracking_controller_id())
         self._store_actuator_config()
         self._store_numerical_sim_config()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._store_nmp_tracking_params_for_controller()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
         out = {
             'controller': self._current_tracking_controller_id(),
             'sim_mode': (
@@ -6828,6 +7469,11 @@ class MainWindow(QMainWindow):
             ),
             'numerical_sim': dict(
                 self._tracking_config.get('numerical_sim') or default_numerical_sim_config()
+            ),
+            'nmp_numerical_sim': dict(
+                self._tracking_config.get('nmp_numerical_sim')
+                or self._tracking_config.get('numerical_sim')
+                or default_numerical_sim_config()
             ),
             'actuator': dict(self._tracking_config.get('actuator') or default_actuator_tracking_config()),
             'params': dict(self._tracking_config.get('params', {})),
@@ -6854,6 +7500,8 @@ class MainWindow(QMainWindow):
         self._tracking_config['actuator'] = dict(actuator_cfg)
         numerical_cfg = cfg.get('numerical_sim') or self._migrate_numerical_sim_from_controller_params(cfg)
         self._tracking_config['numerical_sim'] = dict(numerical_cfg)
+        nmp_numerical_cfg = cfg.get('nmp_numerical_sim') or numerical_cfg
+        self._tracking_config['nmp_numerical_sim'] = dict(nmp_numerical_cfg)
         controller = cfg.get('controller', CONTROLLER_PX4)
         if hasattr(self, 'tracking_controller_combo'):
             for i in range(self.tracking_controller_combo.count()):
@@ -6868,8 +7516,20 @@ class MainWindow(QMainWindow):
                 self.tracking_sim_numerical_radio.setChecked(True)
         self._tracking_config['controller'] = controller
         self._rebuild_tracking_param_widgets()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._rebuild_nmp_tracking_param_widgets()
         self._apply_actuator_config(self._tracking_config.get('actuator'))
         self._apply_numerical_sim_config(self._tracking_config.get('numerical_sim'))
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._nmp_sim_timing_guard = True
+            self.nmp_sim_dt_spin.setValue(float(nmp_numerical_cfg.get('sim_dt', 0.005)))
+            self.nmp_control_dt_spin.setValue(float(nmp_numerical_cfg.get('control_dt', 0.02)))
+            self.nmp_terminal_hold_spin.setValue(
+                float(nmp_numerical_cfg.get('terminal_hold_duration_s', 3.0))
+            )
+            self.nmp_total_duration_spin.setValue(float(nmp_numerical_cfg.get('total_duration_s', 0.0)))
+            self._nmp_sim_timing_guard = False
+            self._on_nmp_tracking_timing_changed()
         if cfg.get('px4_tune'):
             self._apply_px4_tune_config(cfg['px4_tune'])
         if hasattr(self, 'chk_enable_online_planner'):

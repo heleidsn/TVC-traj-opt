@@ -14,6 +14,7 @@ import numpy as np
 from matplotlib import animation
 from matplotlib.lines import Line2D
 
+from controllers.flatness import FlatnessParams, estimate_flat_state_from_state12
 from tvc_common import R_from_quat, quat_norm
 from tvc_rocket_platforms import normalize_platform_id, rocket_visual_geometry
 from tvc_traj_gui_3d import (
@@ -45,6 +46,37 @@ def _platform_id_from_result(result):
     if result is None:
         return 'proxy'
     return normalize_platform_id(result.get('platform_id'))
+
+
+def _flatness_params_from_plan(plan):
+    if not plan:
+        return None
+    fp = plan.get('flatness_physics') if isinstance(plan, dict) else None
+    if not isinstance(fp, dict):
+        return None
+    req = ('mass', 'Ixx', 'Iyy', 'Izz', 'r_thrust_z')
+    if not all(k in fp for k in req):
+        return None
+    return FlatnessParams.from_gui(
+        fp['mass'], fp['Ixx'], fp['Iyy'], fp['Izz'], fp['r_thrust_z'],
+        g=float(fp.get('g', 9.81)),
+    )
+
+
+def _xi_positions_from_state_history(x_hist, fp):
+    """Reconstruct ξ_x, ξ_y, z in world frame from state history."""
+    if fp is None:
+        return None
+    x_hist = np.asarray(x_hist, dtype=float)
+    if x_hist.ndim != 2 or x_hist.shape[1] < 12:
+        return None
+    out = np.zeros((x_hist.shape[0], 3), dtype=float)
+    for i in range(x_hist.shape[0]):
+        est = estimate_flat_state_from_state12(fp, x_hist[i, :12])
+        out[i, 0] = est['xi_x']
+        out[i, 1] = est['xi_y']
+        out[i, 2] = est['z']
+    return out
 
 
 def _draw_static_paths(ax, x_ref, x_sim, plan_xs=None):
@@ -142,15 +174,34 @@ def generate_tracking_gif(
     max_frames=120,
     figsize=(8.0, 8.0),
     dpi=120,
+    view_mode: str = '3d',
 ) -> str:
     """
     Render tracking simulation to an animated GIF.
 
-    Uses a square figure and equal axis scaling. Thrust is drawn as an arrow
-    whose tip sits at the thrust application point (COM + R @ r_thrust).
+    ``view_mode`` is ``'3d'`` (default) or ``'2d'`` (top-down XY).
 
     Returns absolute path to the written GIF file.
     """
+    mode = str(view_mode or '3d').strip().lower()
+    if mode == '2d':
+        return _generate_tracking_gif_2d(
+            result, plan, output_path, fps, max_frames, figsize, dpi,
+        )
+    return _generate_tracking_gif_3d(
+        result, plan, output_path, fps, max_frames, figsize, dpi,
+    )
+
+
+def _generate_tracking_gif_3d(
+    result,
+    plan=None,
+    output_path=None,
+    fps=12,
+    max_frames=120,
+    figsize=(8.0, 8.0),
+    dpi=120,
+) -> str:
     if result is None or 'x_sim' not in result:
         raise ValueError('No tracking simulation result to animate.')
 
@@ -164,6 +215,8 @@ def generate_tracking_gif(
     plan_xs = None
     if plan and plan.get('xs') is not None:
         plan_xs = np.asarray(plan['xs'], dtype=float)[:, 0:3]
+    fp = _flatness_params_from_plan(plan)
+    xi_sim = _xi_positions_from_state_history(x_sim, fp)
 
     if output_path is None:
         output_path = os.path.join(
@@ -180,6 +233,8 @@ def generate_tracking_gif(
     rocket_geom = rocket_visual_geometry(_platform_id_from_result(result))
 
     all_pts = [x_sim[:, 0:3], x_ref[:, 0:3]]
+    if xi_sim is not None:
+        all_pts.append(xi_sim)
     if plan_xs is not None:
         all_pts.append(plan_xs)
 
@@ -208,9 +263,10 @@ def generate_tracking_gif(
     fig.subplots_adjust(left=0.02, right=0.98, top=0.94, bottom=0.06)
 
     trail_line, = ax.plot([], [], [], color='tab:red', linewidth=1.6, alpha=0.85)
+    xi_trail_line, = ax.plot([], [], [], color='tab:cyan', linewidth=1.4, alpha=0.80)
     rocket_parts = {
         'shaft': None, 'nose': None, 'fins': [], 'thrust_lines': [],
-        'thrust_label': None, 'com': None,
+        'thrust_label': None, 'com': None, 'xi': None,
     }
 
     def _com_legend_handle():
@@ -220,8 +276,15 @@ def generate_tracking_gif(
             label='COM',
         )
 
+    def _xi_legend_handle():
+        return Line2D(
+            [0], [0], linestyle='None', marker='o', markersize=6,
+            markerfacecolor='cyan', markeredgecolor='black', markeredgewidth=0.6,
+            label='Xi',
+        )
+
     def _clear_rocket_artists():
-        for key in ('shaft', 'nose', 'thrust_label', 'com'):
+        for key in ('shaft', 'nose', 'thrust_label', 'com', 'xi'):
             artist = rocket_parts.get(key)
             if artist is not None:
                 try:
@@ -258,16 +321,27 @@ def generate_tracking_gif(
         handles, labels = ax.get_legend_handles_labels()
         handles.append(_com_legend_handle())
         labels.append('COM')
+        if xi_sim is not None:
+            handles.append(_xi_legend_handle())
+            labels.append('Xi')
         ax.legend(handles, labels, loc='upper left', fontsize=7, framealpha=0.88)
         trail_line.set_data([], [])
         trail_line.set_3d_properties([])
-        return (trail_line,)
+        xi_trail_line.set_data([], [])
+        xi_trail_line.set_3d_properties([])
+        return (trail_line, xi_trail_line)
 
     def _update(k):
         i = int(frame_idx[k])
         pos = x_sim[i, 0:3]
         trail_line.set_data(x_sim[: i + 1, 0], x_sim[: i + 1, 1])
         trail_line.set_3d_properties(x_sim[: i + 1, 2])
+        if xi_sim is not None:
+            xi_trail_line.set_data(xi_sim[: i + 1, 0], xi_sim[: i + 1, 1])
+            xi_trail_line.set_3d_properties(xi_sim[: i + 1, 2])
+        else:
+            xi_trail_line.set_data([], [])
+            xi_trail_line.set_3d_properties([])
 
         _clear_rocket_artists()
         q = quats[i]
@@ -293,6 +367,12 @@ def generate_tracking_gif(
             [com[0]], [com[1]], [com[2]],
             c='gold', s=42, marker='o', edgecolors='black', linewidths=0.6, zorder=10,
         )
+        if xi_sim is not None:
+            xi = xi_sim[i]
+            rocket_parts['xi'] = ax.scatter(
+                [xi[0]], [xi[1]], [xi[2]],
+                c='cyan', s=36, marker='o', edgecolors='black', linewidths=0.6, zorder=10,
+            )
 
         th_p, th_r, T = u_hist[i, 0], u_hist[i, 1], u_hist[i, 2]
         T_disp = float(T) if np.isfinite(T) else 0.0
@@ -332,12 +412,119 @@ def generate_tracking_gif(
             f'Tracking  t = {t[i]:.2f} s',
             fontsize=10, fontweight='bold',
         )
-        artists = [trail_line, rocket_parts['shaft'], rocket_parts['nose'], rocket_parts['com']]
+        artists = [trail_line, xi_trail_line, rocket_parts['shaft'], rocket_parts['nose'], rocket_parts['com']]
+        if rocket_parts['xi'] is not None:
+            artists.append(rocket_parts['xi'])
         artists.extend(rocket_parts['fins'])
         artists.extend(rocket_parts['thrust_lines'])
         if rocket_parts['thrust_label'] is not None:
             artists.append(rocket_parts['thrust_label'])
         return tuple(artists)
+
+    _init()
+    anim = animation.FuncAnimation(
+        fig, _update, frames=len(frame_idx), init_func=_init, blit=False,
+        interval=1000.0 / fps,
+    )
+    writer = animation.PillowWriter(fps=fps)
+    anim.save(output_path, writer=writer, dpi=dpi)
+    plt.close(fig)
+    return output_path
+
+
+def _generate_tracking_gif_2d(
+    result,
+    plan=None,
+    output_path=None,
+    fps=12,
+    max_frames=120,
+    figsize=(8.0, 8.0),
+    dpi=120,
+) -> str:
+    """Top-down XY tracking animation."""
+    if result is None or 'x_sim' not in result:
+        raise ValueError('No tracking simulation result to animate.')
+
+    t = np.asarray(result['t'], dtype=float)
+    x_sim = np.asarray(result['x_sim'], dtype=float)
+    x_ref = np.asarray(result['x_ref'], dtype=float)
+    n = len(t)
+    if n < 2:
+        raise ValueError('Tracking trajectory too short for animation.')
+
+    plan_xs = None
+    if plan and plan.get('xs') is not None:
+        plan_xs = np.asarray(plan['xs'], dtype=float)[:, 0:3]
+    fp = _flatness_params_from_plan(plan)
+    xi_sim = _xi_positions_from_state_history(x_sim, fp)
+
+    if output_path is None:
+        output_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            '..', 'trajs', 'tracking_anim_2d.gif',
+        )
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    frame_idx = np.linspace(0, n - 1, min(max_frames, n), dtype=int)
+    all_pts = [x_sim[:, 0:2], x_ref[:, 0:2]]
+    if xi_sim is not None:
+        all_pts.append(xi_sim[:, 0:2])
+    if plan_xs is not None:
+        all_pts.append(plan_xs[:, 0:2])
+    pts = np.vstack(all_pts)
+    lo = pts.min(axis=0)
+    hi = pts.max(axis=0)
+    pad = max(0.15 * max(hi[0] - lo[0], hi[1] - lo[1], 0.5), 0.25)
+    xlo, xhi = lo[0] - pad, hi[0] + pad
+    ylo, yhi = lo[1] - pad, hi[1] + pad
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.08)
+
+    ax.plot(x_ref[:, 0], x_ref[:, 1], 'b--', lw=1.2, alpha=0.65, label='Ref COM')
+    ax.plot(x_sim[:, 0], x_sim[:, 1], color='0.82', lw=0.9, alpha=0.6, label='Sim COM path')
+    if xi_sim is not None:
+        ax.plot(xi_sim[:, 0], xi_sim[:, 1], color='0.75', lw=0.9, alpha=0.6, label='Sim Xi path')
+    if plan_xs is not None:
+        ax.plot(plan_xs[:, 0], plan_xs[:, 1], 'g:', lw=1.0, alpha=0.55, label='Plan')
+    ax.set_xlim(xlo, xhi)
+    ax.set_ylim(ylo, yhi)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel('X (m)', fontsize=9)
+    ax.set_ylabel('Y (m)', fontsize=9)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc='upper left', fontsize=7, framealpha=0.88)
+
+    trail_line, = ax.plot([], [], color='tab:red', linewidth=2.0, alpha=0.95, label='COM trail')
+    xi_trail_line, = ax.plot([], [], color='tab:cyan', linewidth=1.8, alpha=0.9, label='Xi trail')
+    com_pt, = ax.plot([], [], 'o', color='gold', markersize=7, markeredgecolor='black',
+                      markeredgewidth=0.6, label='COM')
+    xi_pt, = ax.plot([], [], 'o', color='cyan', markersize=6, markeredgecolor='black',
+                     markeredgewidth=0.6, label='Xi')
+
+    def _init():
+        trail_line.set_data([], [])
+        xi_trail_line.set_data([], [])
+        com_pt.set_data([], [])
+        xi_pt.set_data([], [])
+        ax.set_title('Tracking animation (XY)', fontsize=10, fontweight='bold')
+        return (trail_line, xi_trail_line, com_pt, xi_pt)
+
+    def _update(k):
+        i = int(frame_idx[k])
+        trail_line.set_data(x_sim[: i + 1, 0], x_sim[: i + 1, 1])
+        pos = x_sim[i, 0:2]
+        com_pt.set_data([pos[0]], [pos[1]])
+        if xi_sim is not None:
+            xi_trail_line.set_data(xi_sim[: i + 1, 0], xi_sim[: i + 1, 1])
+            xi = xi_sim[i, 0:2]
+            xi_pt.set_data([xi[0]], [xi[1]])
+        else:
+            xi_trail_line.set_data([], [])
+            xi_pt.set_data([], [])
+        ax.set_title(f'Tracking XY  t = {t[i]:.2f} s', fontsize=10, fontweight='bold')
+        return (trail_line, xi_trail_line, com_pt, xi_pt)
 
     _init()
     anim = animation.FuncAnimation(

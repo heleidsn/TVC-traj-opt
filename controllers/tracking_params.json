@@ -7,6 +7,12 @@
     "terminal_hold_duration_s": 3.0,
     "total_duration_s": 0.0
   },
+  "nmp_numerical_sim": {
+    "sim_dt": 0.005,
+    "control_dt": 0.01,
+    "terminal_hold_duration_s": 3.0,
+    "total_duration_s": 0.0
+  },
   "actuator": {
     "enabled": false,
     "thrust_quant_enabled": false,
@@ -27,7 +33,7 @@
       "Kp_vel_z": 15.0,
       "Ki_vel_z": 0.0,
       "Kd_vel_z": 0.0,
-      "Kp_att_rp_deg": 10.0,
+      "Kp_att_rp_deg": 6.5,
       "Kp_rate_rp": 15.0,
       "Ki_rate_rp": 0.0,
       "Kd_rate_rp": 0.0,
@@ -108,7 +114,7 @@
     "flatness_ff": {
       "share_rp_gains": true,
       "Kp_pos_xy": 1.0,
-      "Kp_vel_xy": 3.0,
+      "Kp_vel_xy": 5.0,
       "Ki_vel_xy": 0.0,
       "Kd_vel_xy": 0.0,
       "Kp_pos_z": 1.0,
@@ -122,9 +128,13 @@
       "Kp_att_yaw_deg": 4.0,
       "Kp_rate_yaw": 5.0,
       "Ki_rate_yaw": 0.0,
-      "Kd_rate_yaw": 0.0
+      "Kd_rate_yaw": 0.0,
+      "use_acc_feedforward": false
     }
   },
+  "enable_online_planner": true,
+  "online_planner_rate_hz": 10.0,
+  "show_gazebo_gui": false,
   "px4_tune": {
     "level": "velocity",
     "duration_s": 2.0,

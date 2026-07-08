@@ -113,22 +113,24 @@ def lateral_flat_reconstruct(
     Map flat lateral output and derivatives to COM state and gimbal angle.
 
     channel='pitch' affects world x (gimbal pitch / qy); 'roll' affects world y.
+    Signs follow ``controllers.linear_model`` and ``NonlinearTVCPlant``:
+    ``xi_x = x + d_pitch*pitch`` and ``xi_y = y - d_roll*roll``.
     """
     g = fp.g
     if channel == 'pitch':
         wz2 = fp.omega_z_pitch ** 2
         pos = xi - ddxi / wz2
         vel = dxi - dddxi / wz2
-        q_comp = -ddxi / (2.0 * g)
-        rate_comp = -dddxi / g
-        delta = ddddxi / (g * wz2)
+        q_comp = ddxi / (2.0 * g)
+        rate_comp = dddxi / g
+        delta = -ddddxi / (g * wz2)
         return dict(pos=pos, vel=vel, q_comp=q_comp, rate_comp=rate_comp, delta=delta)
     wz2 = fp.omega_z_roll ** 2
     pos = xi - ddxi / wz2
     vel = dxi - dddxi / wz2
-    q_comp = ddxi / (2.0 * g)
-    rate_comp = dddxi / g
-    delta = -ddddxi / (g * wz2)
+    q_comp = -ddxi / (2.0 * g)
+    rate_comp = -dddxi / g
+    delta = ddddxi / (g * wz2)
     return dict(pos=pos, vel=vel, q_comp=q_comp, rate_comp=rate_comp, delta=delta)
 
 
@@ -228,7 +230,7 @@ def estimate_flat_outputs_from_state12(
     x12 = np.asarray(x12, dtype=float).reshape(12)
     pitch = 2.0 * x12[7]
     roll = 2.0 * x12[6]
-    xi_x = x12[0] - fp.flat_offset_pitch * pitch
+    xi_x = x12[0] + fp.flat_offset_pitch * pitch
     xi_y = x12[1] - fp.flat_offset_roll * roll
     return float(xi_x), float(xi_y)
 
@@ -240,7 +242,7 @@ def estimate_flat_rates_from_state12(
     """Inverse map: COM velocity + body rates -> flat-output rates (small-angle)."""
     x12 = np.asarray(x12, dtype=float).reshape(12)
     p, q_rate, r = float(x12[9]), float(x12[10]), float(x12[11])
-    dxi_x = float(x12[3]) - fp.flat_offset_pitch * 2.0 * q_rate
+    dxi_x = float(x12[3]) + fp.flat_offset_pitch * 2.0 * q_rate
     dxi_y = float(x12[4]) - fp.flat_offset_roll * 2.0 * p
     dz = float(x12[5])
     dpsi = r

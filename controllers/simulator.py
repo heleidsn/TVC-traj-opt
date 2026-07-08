@@ -326,7 +326,7 @@ def run_tracking_simulation(
                 u_cmd_hold = _clip_plant_control(
                     lqr_to_control_opt(u_lqr, mass, g), params,
                 )
-            if prev_u_cmd_hold is not None and not px4_tracking:
+            if prev_u_cmd_hold is not None and controller_id not in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
                 for axis in (0, 1):
                     du = u_cmd_hold[axis] - prev_u_cmd_hold[axis]
                     u_cmd_hold[axis] = prev_u_cmd_hold[axis] + np.clip(
