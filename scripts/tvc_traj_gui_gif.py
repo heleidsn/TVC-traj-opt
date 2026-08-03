@@ -24,6 +24,36 @@ from tvc_traj_gui_3d import (
     thrust_direction_world,
 )
 
+# Target display rate when encoding GIFs; long sims may drop fps to keep duration.
+_GIF_TARGET_FPS = 12.0
+_GIF_MAX_FRAMES = 480
+
+
+def gif_frame_schedule(
+    t,
+    playback_speed: float = 1.0,
+    target_fps: float = _GIF_TARGET_FPS,
+    max_frames: int = _GIF_MAX_FRAMES,
+):
+    """
+    Choose frame indices and encode fps so playback lasts ``sim_duration / speed``.
+
+    ``playback_speed=1`` → real-time; ``>1`` → accelerated (shorter GIF).
+    """
+    t = np.asarray(t, dtype=float)
+    n = len(t)
+    if n < 2:
+        return np.array([0], dtype=int), float(target_fps)
+    duration = max(float(t[-1] - t[0]), 1e-9)
+    speed = max(float(playback_speed), 1e-6)
+    play_dur = duration / speed
+    n_ideal = play_dur * float(target_fps)
+    n_frames = int(round(n_ideal))
+    n_frames = max(2, min(n_frames, int(max_frames), n))
+    fps = max(n_frames / play_dur, 0.5)
+    frame_idx = np.linspace(0, n - 1, n_frames, dtype=int)
+    return frame_idx, float(fps)
+
 
 def _state12_to_quat_wxyz(x12):
     """Rebuild unit quaternion [w,x,y,z] from linear-model state qx,qy,qz."""
@@ -192,37 +222,46 @@ def generate_tracking_gif(
     result,
     plan=None,
     output_path=None,
-    fps=12,
-    max_frames=120,
+    fps=None,
+    max_frames=None,
     figsize=(8.0, 8.0),
     dpi=120,
     view_mode: str = '3d',
+    playback_speed: float = 1.0,
 ) -> str:
     """
     Render tracking simulation to an animated GIF.
 
     ``view_mode`` is ``'3d'`` (default) or ``'2d'`` (side view, XZ).
+    ``playback_speed`` is 1.0 for real-time, or >1 to accelerate.
 
     Returns absolute path to the written GIF file.
     """
     mode = str(view_mode or '3d').strip().lower()
-    if mode == '2d':
-        return _generate_tracking_gif_2d(
-            result, plan, output_path, fps, max_frames, figsize, dpi,
-        )
-    return _generate_tracking_gif_3d(
-        result, plan, output_path, fps, max_frames, figsize, dpi,
+    kwargs = dict(
+        result=result,
+        plan=plan,
+        output_path=output_path,
+        fps=fps,
+        max_frames=max_frames,
+        figsize=figsize,
+        dpi=dpi,
+        playback_speed=playback_speed,
     )
+    if mode == '2d':
+        return _generate_tracking_gif_2d(**kwargs)
+    return _generate_tracking_gif_3d(**kwargs)
 
 
 def _generate_tracking_gif_3d(
     result,
     plan=None,
     output_path=None,
-    fps=12,
-    max_frames=120,
+    fps=None,
+    max_frames=None,
     figsize=(8.0, 8.0),
     dpi=120,
+    playback_speed: float = 1.0,
 ) -> str:
     if result is None or 'x_sim' not in result:
         raise ValueError('No tracking simulation result to animate.')
@@ -248,7 +287,14 @@ def _generate_tracking_gif_3d(
     output_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    frame_idx = np.linspace(0, n - 1, min(max_frames, n), dtype=int)
+    target_fps = float(fps) if fps is not None else _GIF_TARGET_FPS
+    frame_cap = int(max_frames) if max_frames is not None else _GIF_MAX_FRAMES
+    frame_idx, fps = gif_frame_schedule(
+        t,
+        playback_speed=playback_speed,
+        target_fps=target_fps,
+        max_frames=frame_cap,
+    )
     quats = np.array([_state12_to_quat_wxyz(x_sim[i]) for i in range(n)])
     u_hist = _align_controls(result.get('u_hist'), n)
     r_thrust_body = _r_thrust_body_from_result(result)
@@ -486,10 +532,11 @@ def _generate_tracking_gif_2d(
     result,
     plan=None,
     output_path=None,
-    fps=12,
-    max_frames=120,
+    fps=None,
+    max_frames=None,
     figsize=(8.0, 8.0),
     dpi=120,
+    playback_speed: float = 1.0,
 ) -> str:
     """Side-view XZ tracking animation: same rocket stick model + thrust arrow as 3D."""
     if result is None or 'x_sim' not in result:
@@ -522,7 +569,14 @@ def _generate_tracking_gif_2d(
     output_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    frame_idx = np.linspace(0, n - 1, min(max_frames, n), dtype=int)
+    target_fps = float(fps) if fps is not None else _GIF_TARGET_FPS
+    frame_cap = int(max_frames) if max_frames is not None else _GIF_MAX_FRAMES
+    frame_idx, fps = gif_frame_schedule(
+        t,
+        playback_speed=playback_speed,
+        target_fps=target_fps,
+        max_frames=frame_cap,
+    )
     quats = np.array([_state12_to_quat_wxyz(x_sim[i]) for i in range(n)])
     u_hist = _align_controls(result.get('u_hist'), n)
     r_thrust_body = _r_thrust_body_from_result(result)

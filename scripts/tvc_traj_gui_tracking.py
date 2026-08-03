@@ -165,13 +165,15 @@ _SP_STYLE = dict(linestyle='-.', linewidth=1.5, alpha=0.9)
 
 def _plot_xyz(
     ax, t, ref_arr, sim_arr, ylabel, title, deg=False, cmd_arr=None, canvas_width_px=800,
-    result=None, labels=_LABELS3,
+    result=None, labels=_LABELS3, show_plan=True, show_sim=True, show_cascade=True,
 ):
     """Plot plan (dotted), cascade setpoint (dash-dot), and simulation (solid)."""
     _style_axis(ax, title, ylabel=ylabel)
     n = len(t)
-    if cmd_arr is not None:
+    if cmd_arr is not None and show_cascade:
         cmd_arr = _align_cascade_series(cmd_arr, n, result)
+    else:
+        cmd_arr = None
     for i, c in enumerate(_COLORS):
         lbl = labels[i]
         r = ref_arr[:, i]
@@ -179,14 +181,16 @@ def _plot_xyz(
         if deg:
             r = np.degrees(r) if ref_arr.shape[1] == 3 and np.max(np.abs(r)) < 10 else r
             s = np.degrees(s) if sim_arr.shape[1] == 3 and np.max(np.abs(s)) < 10 else s
-        ax.plot(t, r, color=c, label=f'{lbl} plan', **_REF_STYLE)
+        if show_plan:
+            ax.plot(t, r, color=c, label=f'{lbl} plan', **_REF_STYLE)
         if cmd_arr is not None and cmd_arr.shape[0] == n:
             cmd_i = cmd_arr[:, i]
             if np.any(np.isfinite(cmd_i)):
                 if deg and cmd_arr.shape[1] == 3 and np.max(np.abs(cmd_i)) < 10:
                     cmd_i = np.degrees(cmd_i)
                 ax.plot(t, cmd_i, color=c, label=f'{lbl} cascade', **_SP_STYLE)
-        ax.plot(t, s, color=c, label=f'{lbl} sim', **_SIM_STYLE)
+        if show_sim:
+            ax.plot(t, s, color=c, label=f'{lbl} sim', **_SIM_STYLE)
     n_leg = len(ax.get_legend_handles_labels()[0])
     place_legend(ax, canvas_width_px, n_items=max(n_leg, 1))
 
@@ -224,7 +228,10 @@ def _panel_width_px(axes):
     return 800
 
 
-def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
+def draw_tracking_state_panels(
+    axes, result, plan=None, quat_to_euler_fn=None,
+    show_plan=True, show_sim=True, show_cascade=True,
+):
     """Draw 4×2 state/control panels (reference vs simulation)."""
     if result is None or 't' not in result:
         return
@@ -321,6 +328,7 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
         _plot_xyz(
             ax, t, ref_arr, sim_arr, ylab, title, deg=deg, cmd_arr=cmd_arr,
             canvas_width_px=width_px, result=result, labels=lbls,
+            show_plan=show_plan, show_sim=show_sim, show_cascade=show_cascade,
         )
 
     ax_g = axes.get('ax_gimbal')
@@ -330,16 +338,22 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
         th_p_sim, th_r_sim = np.degrees(u_sim[:, 0]), np.degrees(u_sim[:, 1])
         th_p_plan, th_r_plan = np.degrees(u_ref[:, 0]), np.degrees(u_ref[:, 1])
         sim_tag = 'act' if act_on else 'sim'
-        ax_g.plot(t, th_p_plan, color='tab:blue', label='pitch plan', **_REF_STYLE)
-        ax_g.plot(t, th_p_sim, color='tab:blue', label=f'pitch {sim_tag}', **_SIM_STYLE)
-        ax_g.plot(t, th_r_plan, color='tab:orange', label='roll plan', **_REF_STYLE)
-        ax_g.plot(t, th_r_sim, color='tab:orange', label=f'roll {sim_tag}', **_SIM_STYLE)
-        if u_cascade is not None:
+        n_items = 0
+        if show_plan:
+            ax_g.plot(t, th_p_plan, color='tab:blue', label='pitch plan', **_REF_STYLE)
+            ax_g.plot(t, th_r_plan, color='tab:orange', label='roll plan', **_REF_STYLE)
+            n_items += 2
+        if show_sim:
+            ax_g.plot(t, th_p_sim, color='tab:blue', label=f'pitch {sim_tag}', **_SIM_STYLE)
+            ax_g.plot(t, th_r_sim, color='tab:orange', label=f'roll {sim_tag}', **_SIM_STYLE)
+            n_items += 2
+        if show_cascade and u_cascade is not None:
             th_p_cascade = np.degrees(u_cascade[:, 0])
             th_r_cascade = np.degrees(u_cascade[:, 1])
             ax_g.plot(t, th_p_cascade, color='tab:blue', label='pitch cascade', **_SP_STYLE)
             ax_g.plot(t, th_r_cascade, color='tab:orange', label='roll cascade', **_SP_STYLE)
-        place_legend(ax_g, width_px, n_items=6 if u_cascade is not None else 4)
+            n_items += 2
+        place_legend(ax_g, width_px, n_items=max(n_items, 1))
 
     ax_t = axes.get('ax_thrust')
     if ax_t is not None:
@@ -348,20 +362,27 @@ def draw_tracking_state_panels(axes, result, plan=None, quat_to_euler_fn=None):
         ax_t2 = _ensure_twin_axis(ax_t)
         ax_t2.tick_params(axis='y', labelsize=7)
         sim_tag = 'act' if act_on else 'sim'
-        ax_t.plot(t, u_ref[:, 2], color='tab:blue', label='T plan', **_REF_STYLE)
-        ax_t.plot(t, u_sim[:, 2], color='tab:blue', label=f'T {sim_tag}', **_SIM_STYLE)
-        ax_t2.plot(t, u_ref[:, 3], color='tab:red', label='τ plan', **_REF_STYLE)
-        ax_t2.plot(t, u_sim[:, 3], color='tab:red', label=f'τ {sim_tag}', **_SIM_STYLE)
-        thrust_lines = yaw_lines = 2
-        if u_cascade is not None:
+        thrust_lines = yaw_lines = 0
+        if show_plan:
+            ax_t.plot(t, u_ref[:, 2], color='tab:blue', label='T plan', **_REF_STYLE)
+            ax_t2.plot(t, u_ref[:, 3], color='tab:red', label='τ plan', **_REF_STYLE)
+            thrust_lines += 1
+            yaw_lines += 1
+        if show_sim:
+            ax_t.plot(t, u_sim[:, 2], color='tab:blue', label=f'T {sim_tag}', **_SIM_STYLE)
+            ax_t2.plot(t, u_sim[:, 3], color='tab:red', label=f'τ {sim_tag}', **_SIM_STYLE)
+            thrust_lines += 1
+            yaw_lines += 1
+        if show_cascade and u_cascade is not None:
             ax_t.plot(t, u_cascade[:, 2], color='tab:blue', label='T cascade', **_SP_STYLE)
             ax_t2.plot(t, u_cascade[:, 3], color='tab:red', label='τ cascade', **_SP_STYLE)
-            thrust_lines = yaw_lines = 3
+            thrust_lines += 1
+            yaw_lines += 1
         ax_t2.set_ylabel('Yaw torque (N·m)', fontsize=8)
         lines1, lab1 = ax_t.get_legend_handles_labels()
         lines2, lab2 = ax_t2.get_legend_handles_labels()
         place_legend(
-            ax_t, width_px, n_items=thrust_lines + yaw_lines,
+            ax_t, width_px, n_items=max(thrust_lines + yaw_lines, 1),
             handles=lines1 + lines2, labels=lab1 + lab2,
         )
 

@@ -149,10 +149,12 @@ from controllers.params import (
     SIM_NUMERICAL,
     SIM_SITL,
     all_default_tracking_config,
+    default_controller_params_map,
     default_numerical_sim_config,
     default_params_for,
     migrate_numerical_sim_config,
-    strip_legacy_tracking_options,
+    migrate_params_by_platform,
+    params_map_for_platform,
 )
 from controllers.param_groups import param_groups_for
 from controllers.px4_params import migrate_px4_params
@@ -1400,12 +1402,13 @@ class TrackingGifThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, result, plan, output_path, view_mode='3d'):
+    def __init__(self, result, plan, output_path, view_mode='3d', playback_speed=1.0):
         super().__init__()
         self.result = result
         self.plan = plan
         self.output_path = output_path
         self.view_mode = view_mode
+        self.playback_speed = float(playback_speed)
 
     def run(self):
         try:
@@ -1415,6 +1418,7 @@ class TrackingGifThread(QThread):
                 self.plan,
                 output_path=self.output_path,
                 view_mode=self.view_mode,
+                playback_speed=self.playback_speed,
             )
             self.finished.emit(path)
         except Exception as e:
@@ -1463,6 +1467,7 @@ class MainWindow(QMainWindow):
         self._tracking_gif_thread = None
         self._tracking_gif_movie = None
         self._tracking_gif_path = DEFAULT_TRACKING_GIF_PATH
+        self._tracking_gif_regen_pending = False
         self._last_tracking_result = None
         self.nmp_last_trajectory = None
         self._nmp_plan_thread = None
@@ -1475,6 +1480,7 @@ class MainWindow(QMainWindow):
         ]
         self._nmp_waypoint_table_updating = False
         self._nmp_platform_guard = False
+        self._cached_nmp_platform_id = PLATFORM_PROXY
         self._nmp_model_overrides = _load_nmp_model_overrides()
         self.init_ui()
         self._update_params_file_label()
@@ -2423,11 +2429,15 @@ class MainWindow(QMainWindow):
         section_layout.addWidget(inner)
         parent_layout.addWidget(section)
 
-        state = {'open': bool(expanded)}
+        state = {'open': bool(expanded), 'title': str(title)}
 
         def _sync_header():
             arrow = '▾' if state['open'] else '▸'
-            header_btn.setText(f'{arrow}  {title}')
+            header_btn.setText(f'{arrow}  {state["title"]}')
+
+        def _set_title(new_title):
+            state['title'] = str(new_title)
+            _sync_header()
 
         def _toggle():
             state['open'] = not state['open']
@@ -2446,6 +2456,7 @@ class MainWindow(QMainWindow):
         _sync_header()
         inner.setVisible(expanded)
         inner.setMaximumHeight(16777215 if expanded else 0)
+        section._tvc_set_title = _set_title
 
         return section, inner_layout
 
@@ -3119,8 +3130,15 @@ class MainWindow(QMainWindow):
             expanded=False,
         )
         self.tracking_params_group.setToolTip(
-            'Click the section title (▸/▾) to expand or collapse controller gains.'
+            'Click the section title (▸/▾) to expand or collapse controller gains.\n'
+            'Gains are stored separately per rocket platform (Proxy vs Real).'
         )
+        self.lbl_tracking_params_platform = QLabel()
+        self.lbl_tracking_params_platform.setWordWrap(True)
+        self.lbl_tracking_params_platform.setStyleSheet(
+            'color: #1565c0; font-weight: bold;'
+        )
+        param_outer.addWidget(self.lbl_tracking_params_platform)
         self.tracking_params_scroll = QScrollArea()
         self.tracking_params_scroll.setWidgetResizable(True)
         self.tracking_params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -3541,6 +3559,12 @@ class MainWindow(QMainWindow):
             expanded=False,
         )
         self.nmp_params_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.lbl_nmp_params_platform = QLabel()
+        self.lbl_nmp_params_platform.setWordWrap(True)
+        self.lbl_nmp_params_platform.setStyleSheet(
+            'color: #1565c0; font-weight: bold;'
+        )
+        nmp_param_outer.addWidget(self.lbl_nmp_params_platform)
         self._create_nmp_tracking_timing_panel(nmp_param_outer)
         nmp_param_io = QHBoxLayout()
         self.btn_save_nmp_tracking_params = QPushButton('Save params')
@@ -3712,10 +3736,16 @@ class MainWindow(QMainWindow):
     def _on_nmp_platform_changed(self, _button=None):
         if self._nmp_platform_guard:
             return
+        previous_id = getattr(self, '_cached_nmp_platform_id', PLATFORM_PROXY)
         pid = self._current_nmp_platform_id()
+        if previous_id != pid:
+            self._store_nmp_tracking_params_for_controller()
+            self._cached_nmp_platform_id = pid
+            self._rebuild_nmp_tracking_param_widgets()
         self.lbl_nmp_model_desc.setText(platform_description(pid))
         self._apply_nmp_model_params_for_platform(pid)
         self._refresh_nmp_model_info()
+        self._refresh_tracking_params_platform_labels()
         if hasattr(self, 'status_text'):
             self.status_text.append(f'NMP model: {platform_label(pid)}')
 
@@ -4222,7 +4252,11 @@ class MainWindow(QMainWindow):
         )
         if cid not in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
             return
-        params_map = self._tracking_config.setdefault('params', {})
+        platform_id = (
+            getattr(self, '_cached_nmp_platform_id', None)
+            or self._current_nmp_platform_id()
+        )
+        params_map = self._tracking_params_map_for(platform_id)
         stored = params_map.setdefault(cid, default_params_for(cid))
         for key, widget in getattr(self, '_nmp_tracking_param_widgets', {}).items():
             if isinstance(widget, QCheckBox):
@@ -4246,12 +4280,13 @@ class MainWindow(QMainWindow):
 
         cid = self._current_nmp_controller_id()
         self._nmp_param_controller_id = cid
-        params = self._tracking_config.setdefault('params', {}).setdefault(
-            cid, default_params_for(cid)
-        )
+        platform_id = self._current_nmp_platform_id()
+        self._cached_nmp_platform_id = platform_id
+        params_map = self._tracking_params_map_for(platform_id)
+        params = params_map.setdefault(cid, default_params_for(cid))
         if cid == CONTROLLER_PX4:
             params.update(migrate_px4_params(params))
-            self._tracking_config['params'][cid] = params
+            params_map[cid] = params
         px4_extra = params if cid in (CONTROLLER_PX4, CONTROLLER_FLATNESS) else None
         for group in param_groups_for(cid, px4_params=px4_extra):
             box = QGroupBox(group.get('title', 'Parameters'))
@@ -4263,6 +4298,7 @@ class MainWindow(QMainWindow):
             )
             self.nmp_params_groups_layout.addWidget(box)
         self.nmp_params_groups_layout.addStretch(1)
+        self._refresh_tracking_params_platform_labels()
         QTimer.singleShot(0, self._refresh_tab_scroll_areas)
 
     def _on_nmp_share_rp_changed(self, _state=None):
@@ -4280,7 +4316,7 @@ class MainWindow(QMainWindow):
         self._store_nmp_tracking_params_for_controller(cid)
         params = dict(default_params_for(cid))
         if hasattr(self, '_tracking_config'):
-            saved = self._tracking_config.get('params', {}).get(cid)
+            saved = self._tracking_params_map_for(self._current_nmp_platform_id()).get(cid)
             if saved:
                 params.update(saved)
         if hasattr(self, '_store_actuator_config'):
@@ -4532,6 +4568,26 @@ class MainWindow(QMainWindow):
         states_widget = QWidget()
         states_layout = QVBoxLayout(states_widget)
         states_layout.setContentsMargins(0, 0, 0, 0)
+        states_series_row = QHBoxLayout()
+        states_series_row.setContentsMargins(4, 2, 4, 0)
+        states_series_row.addWidget(QLabel('Show:'))
+        self.chk_states_show_plan = QCheckBox('plan')
+        self.chk_states_show_sim = QCheckBox('sim')
+        self.chk_states_show_cascade = QCheckBox('cascade')
+        for chk in (
+            self.chk_states_show_plan,
+            self.chk_states_show_sim,
+            self.chk_states_show_cascade,
+        ):
+            chk.setChecked(True)
+            chk.setToolTip(
+                'Toggle which series appear on the States plots '
+                '(plan = reference, sim = plant, cascade = inner-loop setpoints).'
+            )
+            chk.stateChanged.connect(self._on_states_series_visibility_changed)
+            states_series_row.addWidget(chk)
+        states_series_row.addStretch(1)
+        states_layout.addLayout(states_series_row)
         states_layout.addWidget(self.canvas_states)
         install_responsive_canvas(
             self.canvas_states, self.fig_states, base_width_px=1100, base_height_px=900,
@@ -4574,6 +4630,32 @@ class MainWindow(QMainWindow):
         self.tracking_gif_3d_radio.toggled.connect(self._on_tracking_gif_view_changed)
         gif_view_row.addWidget(self.tracking_gif_3d_radio)
         gif_view_row.addWidget(self.tracking_gif_2d_radio)
+        gif_view_row.addSpacing(16)
+        self.chk_tracking_gif_realtime = QCheckBox('Real-time playback')
+        self.chk_tracking_gif_realtime.setChecked(True)
+        self.chk_tracking_gif_realtime.setToolTip(
+            'Checked: GIF duration matches simulation time.\n'
+            'Unchecked: play faster using the speed multiplier.'
+        )
+        self.chk_tracking_gif_realtime.stateChanged.connect(
+            self._on_tracking_gif_playback_options_changed
+        )
+        gif_view_row.addWidget(self.chk_tracking_gif_realtime)
+        gif_view_row.addWidget(QLabel('Speed:'))
+        self.spin_tracking_gif_speed = QDoubleSpinBox()
+        self.spin_tracking_gif_speed.setRange(1.0, 50.0)
+        self.spin_tracking_gif_speed.setDecimals(1)
+        self.spin_tracking_gif_speed.setSingleStep(1.0)
+        self.spin_tracking_gif_speed.setValue(5.0)
+        self.spin_tracking_gif_speed.setSuffix('×')
+        self.spin_tracking_gif_speed.setToolTip(
+            'Playback speed when Real-time is off (simulation time / this factor).'
+        )
+        self.spin_tracking_gif_speed.setEnabled(False)
+        self.spin_tracking_gif_speed.valueChanged.connect(
+            self._on_tracking_gif_playback_options_changed
+        )
+        gif_view_row.addWidget(self.spin_tracking_gif_speed)
         gif_view_row.addStretch(1)
         gif_layout.addLayout(gif_view_row)
         self.tracking_gif_label = QLabel()
@@ -4719,6 +4801,38 @@ class MainWindow(QMainWindow):
             self.canvas_metrics.draw_idle()
         self._refresh_all_plot_layouts()
 
+    def _states_series_visibility(self):
+        """Which plan / sim / cascade series to draw on the States tab."""
+        return {
+            'show_plan': (
+                bool(self.chk_states_show_plan.isChecked())
+                if hasattr(self, 'chk_states_show_plan') else True
+            ),
+            'show_sim': (
+                bool(self.chk_states_show_sim.isChecked())
+                if hasattr(self, 'chk_states_show_sim') else True
+            ),
+            'show_cascade': (
+                bool(self.chk_states_show_cascade.isChecked())
+                if hasattr(self, 'chk_states_show_cascade') else True
+            ),
+        }
+
+    def _on_states_series_visibility_changed(self, _state=None):
+        result = getattr(self, '_last_tracking_result', None)
+        if result is None or not hasattr(self, 'ax_trk_pos'):
+            return
+        plan = getattr(self, 'last_trajectory', None)
+        draw_tracking_state_panels(
+            tracking_state_axes_dict(self),
+            result,
+            plan,
+            quat_to_euler_fn=quat_to_euler,
+            **self._states_series_visibility(),
+        )
+        self.canvas_states.draw_idle()
+        self._refresh_all_plot_layouts()
+
     def _draw_tracking_plot_tabs(self, result):
         """Update States, 3D, and Metrics tabs after numerical tracking."""
         plan = getattr(self, 'last_trajectory', None)
@@ -4727,6 +4841,7 @@ class MainWindow(QMainWindow):
             result,
             plan,
             quat_to_euler_fn=quat_to_euler,
+            **self._states_series_visibility(),
         )
         draw_tracking_3d_panel(self.ax_3d_trk, result, plan)
         draw_tracking_metrics_panels(
@@ -4746,7 +4861,28 @@ class MainWindow(QMainWindow):
             return '2d'
         return '3d'
 
+    def _tracking_gif_playback_speed(self):
+        """1.0 = real-time; >1 accelerates when Real-time checkbox is off."""
+        if (
+            hasattr(self, 'chk_tracking_gif_realtime')
+            and self.chk_tracking_gif_realtime.isChecked()
+        ):
+            return 1.0
+        if hasattr(self, 'spin_tracking_gif_speed'):
+            return float(self.spin_tracking_gif_speed.value())
+        return 1.0
+
     def _on_tracking_gif_view_changed(self, _checked=False):
+        if self._last_tracking_result is not None:
+            self._start_tracking_gif_generation(self._last_tracking_result)
+
+    def _on_tracking_gif_playback_options_changed(self, _value=None):
+        if hasattr(self, 'spin_tracking_gif_speed') and hasattr(
+            self, 'chk_tracking_gif_realtime'
+        ):
+            self.spin_tracking_gif_speed.setEnabled(
+                not self.chk_tracking_gif_realtime.isChecked()
+            )
         if self._last_tracking_result is not None:
             self._start_tracking_gif_generation(self._last_tracking_result)
 
@@ -4756,18 +4892,27 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         if self._tracking_gif_thread is not None and self._tracking_gif_thread.isRunning():
+            # Options changed while rendering — rebuild once the current job finishes.
+            self._tracking_gif_regen_pending = True
             return
+        self._tracking_gif_regen_pending = False
         plan = getattr(self, 'last_trajectory', None)
         view_mode = self._current_tracking_gif_view_mode()
+        speed = self._tracking_gif_playback_speed()
         label = '2D' if view_mode == '2d' else '3D'
-        self.tracking_gif_status.setText(f'Generating {label} tracking GIF…')
+        if speed <= 1.0 + 1e-9:
+            timing = 'real-time'
+        else:
+            timing = f'{speed:.1f}× speed'
+        self.tracking_gif_status.setText(f'Generating {label} tracking GIF ({timing})…')
         self.btn_regenerate_tracking_gif.setEnabled(False)
         self.btn_save_tracking_gif.setEnabled(False)
         if self._tracking_gif_movie is not None:
             self._tracking_gif_movie.stop()
             self._tracking_gif_movie = None
         self._tracking_gif_thread = TrackingGifThread(
-            result, plan, DEFAULT_TRACKING_GIF_PATH, view_mode=view_mode,
+            result, plan, DEFAULT_TRACKING_GIF_PATH,
+            view_mode=view_mode, playback_speed=speed,
         )
         self._tracking_gif_thread.finished.connect(self._on_tracking_gif_finished)
         self._tracking_gif_thread.error.connect(self._on_tracking_gif_error)
@@ -4801,8 +4946,15 @@ class MainWindow(QMainWindow):
             self.tracking_gif_label.setMovie(self._tracking_gif_movie)
             self._update_tracking_gif_scaled_size()
             self._tracking_gif_movie.start()
+            speed = self._tracking_gif_playback_speed()
+            if speed <= 1.0 + 1e-9:
+                timing = 'real-time'
+            else:
+                timing = f'{speed:.1f}× speed'
+            view = self._current_tracking_gif_view_mode().upper()
             self.tracking_gif_status.setText(
-                '3D tracking GIF — red: body +Z (nose), orange: thrust direction (length ∝ T)\n'
+                f'{view} tracking GIF ({timing}) — red: body +Z (nose), '
+                f'orange: thrust direction (length ∝ T)\n'
                 f'{self._tracking_gif_path}'
             )
             self.btn_save_tracking_gif.setEnabled(True)
@@ -4819,12 +4971,18 @@ class MainWindow(QMainWindow):
         self._display_tracking_gif(path)
         if hasattr(self, 'status_text'):
             self.status_text.append(f'Tracking GIF saved: {path}')
+        if getattr(self, '_tracking_gif_regen_pending', False):
+            self._tracking_gif_regen_pending = False
+            QTimer.singleShot(0, self._start_tracking_gif_generation)
 
     def _on_tracking_gif_error(self, msg):
         self.btn_regenerate_tracking_gif.setEnabled(True)
         self.tracking_gif_status.setText('GIF generation failed.')
         if hasattr(self, 'status_text'):
             self.status_text.append(f'Tracking GIF error: {msg.splitlines()[0]}')
+        if getattr(self, '_tracking_gif_regen_pending', False):
+            self._tracking_gif_regen_pending = False
+            QTimer.singleShot(0, self._start_tracking_gif_generation)
 
     def regenerate_tracking_gif(self):
         if getattr(self, '_last_tracking_result', None) is None:
@@ -6129,9 +6287,18 @@ class MainWindow(QMainWindow):
         self._platform_phys_cache[previous_id] = self._snapshot_platform_settings()
 
         new_id = self._current_rocket_platform_id()
+        if previous_id != new_id:
+            # Flush Tracking-tab gains into the previous platform slot before switching.
+            self._store_tracking_params_for_controller(
+                self._tracking_config.get('controller')
+                or self._current_tracking_controller_id()
+            )
         cached = self._platform_phys_cache.get(new_id)
         self._apply_platform_settings(new_id, settings=cached)
         self._cached_platform_id = new_id
+        if previous_id != new_id:
+            self._rebuild_tracking_param_widgets()
+            self._refresh_tracking_params_platform_labels()
         if hasattr(self, 'status_text'):
             self.status_text.append(f'Rocket platform: {platform_label(new_id)}')
         if not self._restore_optimization_for_current_context(quiet=True):
@@ -6288,6 +6455,11 @@ class MainWindow(QMainWindow):
         self._refresh_min_time_duration_group_visible(self.method_combo.currentIndex())
         self._cached_platform_id = self._current_rocket_platform_id()
         self._refresh_physics_platform_hint()
+        if hasattr(self, 'tracking_params_groups_layout'):
+            self._rebuild_tracking_param_widgets()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._rebuild_nmp_tracking_param_widgets()
+        self._refresh_tracking_params_platform_labels()
         if self._current_rocket_platform_id() == PLATFORM_REAL:
             plat_def = default_constraints(PLATFORM_REAL)
             if self.T_max.value() <= 100.0 + 1e-6:
@@ -7503,6 +7675,58 @@ class MainWindow(QMainWindow):
         cid = self.tracking_controller_combo.itemData(idx)
         return cid if cid else CONTROLLER_PX4
 
+    def _ensure_tracking_params_by_platform(self):
+        """Ensure params_by_platform exists; keep flat params as a back-compat view."""
+        by_plat = self._tracking_config.get('params_by_platform')
+        if not isinstance(by_plat, dict) or not by_plat:
+            by_plat = migrate_params_by_platform(self._tracking_config)
+            self._tracking_config['params_by_platform'] = by_plat
+        for pid in (PLATFORM_PROXY, PLATFORM_REAL):
+            if pid not in by_plat or not isinstance(by_plat[pid], dict):
+                by_plat[pid] = default_controller_params_map()
+            for cid in CONTROLLER_IDS:
+                if cid not in by_plat[pid] or not isinstance(by_plat[pid][cid], dict):
+                    by_plat[pid][cid] = default_params_for(cid)
+        # Active view used by older code paths / JSON consumers.
+        active_pid = (
+            self._current_rocket_platform_id()
+            if hasattr(self, 'rocket_proxy_radio') else PLATFORM_PROXY
+        )
+        self._tracking_config['params'] = by_plat[normalize_platform_id(active_pid)]
+        return by_plat
+
+    def _tracking_params_map_for(self, platform_id):
+        """Controller-params map for the given rocket platform."""
+        by_plat = self._ensure_tracking_params_by_platform()
+        pid = normalize_platform_id(platform_id)
+        return by_plat.setdefault(pid, default_controller_params_map())
+
+    def _refresh_tracking_params_platform_labels(self):
+        """Show which platform the visible controller gains belong to."""
+        if hasattr(self, 'tracking_params_group') and hasattr(self, 'rocket_proxy_radio'):
+            pid = self._current_rocket_platform_id()
+            title = f'Controller parameters ({platform_label(pid)})'
+            set_title = getattr(self.tracking_params_group, '_tvc_set_title', None)
+            if callable(set_title):
+                set_title(title)
+            if hasattr(self, 'lbl_tracking_params_platform'):
+                self.lbl_tracking_params_platform.setText(
+                    f'Editing gains for: {platform_label(pid)}. '
+                    f'Proxy and Real keep separate parameter sets; '
+                    f'switch Rocket platform to edit the other.'
+                )
+        if hasattr(self, 'nmp_params_group') and hasattr(self, 'nmp_proxy_radio'):
+            nmp_pid = self._current_nmp_platform_id()
+            nmp_title = f'Controller parameters ({platform_label(nmp_pid)})'
+            set_nmp = getattr(self.nmp_params_group, '_tvc_set_title', None)
+            if callable(set_nmp):
+                set_nmp(nmp_title)
+            if hasattr(self, 'lbl_nmp_params_platform'):
+                self.lbl_nmp_params_platform.setText(
+                    f'Editing gains for: {platform_label(nmp_pid)}. '
+                    f'Shared with Tracking tab for the same platform.'
+                )
+
     def _on_tracking_controller_changed(self, _index=None):
         self._store_tracking_params_for_controller(self._tracking_config.get('controller'))
         cid = self._current_tracking_controller_id()
@@ -7539,9 +7763,14 @@ class MainWindow(QMainWindow):
     def _store_tracking_params_for_controller(self, controller_id):
         if not controller_id or controller_id not in CONTROLLER_IDS:
             return
-        if controller_id not in self._tracking_config.setdefault('params', {}):
-            self._tracking_config['params'][controller_id] = default_params_for(controller_id)
-        stored = self._tracking_config['params'][controller_id]
+        platform_id = (
+            getattr(self, '_cached_platform_id', None)
+            or self._current_rocket_platform_id()
+        )
+        params_map = self._tracking_params_map_for(platform_id)
+        if controller_id not in params_map:
+            params_map[controller_id] = default_params_for(controller_id)
+        stored = params_map[controller_id]
         for key, widget in self._tracking_param_widgets.items():
             if isinstance(widget, QCheckBox):
                 stored[key] = widget.isChecked()
@@ -7555,7 +7784,11 @@ class MainWindow(QMainWindow):
         self._store_tracking_params_for_controller(cid)
         self._store_actuator_config()
         self._store_numerical_sim_config()
-        params = dict(self._tracking_config['params'].get(cid, default_params_for(cid)))
+        params = dict(
+            self._tracking_params_map_for(self._current_rocket_platform_id()).get(
+                cid, default_params_for(cid)
+            )
+        )
         params.update(self._actuator_params_for_sim())
         params.update(self._numerical_sim_params_for_sim())
         params.update(self._constraints_for_tracking())
@@ -7631,12 +7864,12 @@ class MainWindow(QMainWindow):
         self._tracking_param_widgets = {}
 
         cid = self._current_tracking_controller_id()
-        params = self._tracking_config.setdefault('params', {}).setdefault(
-            cid, default_params_for(cid)
-        )
+        platform_id = self._current_rocket_platform_id()
+        params_map = self._tracking_params_map_for(platform_id)
+        params = params_map.setdefault(cid, default_params_for(cid))
         if cid == CONTROLLER_PX4:
             params.update(migrate_px4_params(params))
-            self._tracking_config['params'][cid] = params
+            params_map[cid] = params
         px4_extra = params if cid == CONTROLLER_PX4 else None
         groups = param_groups_for(cid, px4_params=px4_extra)
         for group in groups:
@@ -7649,6 +7882,7 @@ class MainWindow(QMainWindow):
             )
             self.tracking_params_groups_layout.addWidget(box)
         self.tracking_params_groups_layout.addStretch(1)
+        self._refresh_tracking_params_platform_labels()
         QTimer.singleShot(0, self._refresh_tab_scroll_areas)
 
     def _on_px4_share_rp_changed(self, _state=None):
@@ -7665,6 +7899,16 @@ class MainWindow(QMainWindow):
             self._store_nmp_tracking_params_for_controller()
         if hasattr(self, 'nmp_sim_dt_spin'):
             self._on_nmp_tracking_timing_changed()
+        by_plat = self._ensure_tracking_params_by_platform()
+        # Deep-copy so later UI edits do not mutate the saved snapshot.
+        params_by_platform = {
+            pid: {cid: dict(params) for cid, params in ctrl_map.items()}
+            for pid, ctrl_map in by_plat.items()
+        }
+        active_params = params_map_for_platform(
+            {'params_by_platform': params_by_platform},
+            self._current_rocket_platform_id(),
+        )
         out = {
             'controller': self._current_tracking_controller_id(),
             'sim_mode': (
@@ -7681,7 +7925,9 @@ class MainWindow(QMainWindow):
                 or default_numerical_sim_config()
             ),
             'actuator': dict(self._tracking_config.get('actuator') or default_actuator_tracking_config()),
-            'params': dict(self._tracking_config.get('params', {})),
+            'params_by_platform': params_by_platform,
+            # Back-compat: flat params = currently selected Trajectory platform.
+            'params': {cid: dict(p) for cid, p in active_params.items()},
             'enable_online_planner': self._online_planner_enabled(),
             'online_planner_rate_hz': self._online_planner_rate_hz(),
             'show_gazebo_gui': self._show_gazebo_gui_enabled(),
@@ -7693,14 +7939,13 @@ class MainWindow(QMainWindow):
     def _apply_tracking_config(self, cfg):
         if not cfg:
             return
-        params_map = cfg.get('params') or {}
-        for cid in CONTROLLER_IDS:
-            if cid in params_map:
-                raw = dict(params_map[cid])
-                if cid == CONTROLLER_PX4:
-                    raw = migrate_px4_params(raw)
-                raw = strip_legacy_tracking_options(raw)
-                self._tracking_config.setdefault('params', {})[cid] = raw
+        by_plat = migrate_params_by_platform(cfg)
+        self._tracking_config['params_by_platform'] = by_plat
+        active_pid = (
+            self._current_rocket_platform_id()
+            if hasattr(self, 'rocket_proxy_radio') else PLATFORM_PROXY
+        )
+        self._tracking_config['params'] = by_plat[normalize_platform_id(active_pid)]
         actuator_cfg = cfg.get('actuator') or self._migrate_actuator_from_controller_params(cfg)
         self._tracking_config['actuator'] = dict(actuator_cfg)
         numerical_cfg = cfg.get('numerical_sim') or self._migrate_numerical_sim_from_controller_params(cfg)
@@ -7723,6 +7968,7 @@ class MainWindow(QMainWindow):
         self._rebuild_tracking_param_widgets()
         if hasattr(self, 'nmp_params_groups_layout'):
             self._rebuild_nmp_tracking_param_widgets()
+        self._refresh_tracking_params_platform_labels()
         self._apply_actuator_config(self._tracking_config.get('actuator'))
         self._apply_numerical_sim_config(self._tracking_config.get('numerical_sim'))
         if hasattr(self, 'nmp_sim_dt_spin'):
