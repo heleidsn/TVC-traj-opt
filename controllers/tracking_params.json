@@ -2,8 +2,8 @@
   "controller": "px4_cascade",
   "sim_mode": "numerical",
   "numerical_sim": {
-    "sim_dt": 0.005,
-    "control_dt": 0.01,
+    "sim_dt": 0.001,
+    "control_dt": 0.05,
     "terminal_hold_duration_s": 3.0,
     "total_duration_s": 0.0
   },
@@ -16,7 +16,7 @@
   "actuator": {
     "enabled": false,
     "thrust_quant_enabled": false,
-    "thrust_resolution_N": 0.5,
+    "thrust_resolution_N": 10.0,
     "tau_gimbal": 0.032,
     "tau_thrust": 0.05,
     "tau_yaw_torque": 0.05
