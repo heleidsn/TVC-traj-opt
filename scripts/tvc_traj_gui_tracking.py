@@ -10,6 +10,13 @@ from tvc_traj_gui_plot_layout import apply_responsive_layout, place_legend
 from tvc_traj_gui_3d import apply_equal_aspect_3d, equal_axis_cube_from_points
 from controllers.params import CONTROLLER_FLATNESS
 from controllers.flatness import FlatnessParams, estimate_flat_state_from_state12
+from controllers.stability_margins import (
+    LOOP_ATTITUDE,
+    LOOP_POSITION,
+    LOOP_RATE,
+    LOOP_VELOCITY,
+    format_loop_margin_tag,
+)
 
 _REF_STYLE = dict(linestyle=':', linewidth=1.2, alpha=0.65)
 _SIM_STYLE = dict(linestyle='-', linewidth=1.6, alpha=0.9)
@@ -152,12 +159,49 @@ def _ensure_twin_axis(ax):
 
 
 def _style_axis(ax, title, xlabel='Time (s)', ylabel=''):
-    ax.set_title(title, fontsize=9, fontweight='bold', pad=2)
+    # Slightly smaller title when metrics are appended on a second line.
+    fs = 8 if isinstance(title, str) and '\n' in title else 9
+    ax.set_title(title, fontsize=fs, fontweight='bold', pad=2)
     ax.set_xlabel(xlabel, fontsize=8)
     if ylabel:
         ax.set_ylabel(ylabel, fontsize=8)
     ax.tick_params(axis='both', labelsize=7)
     ax.grid(True, alpha=0.3)
+
+
+def _states_title_with_loop_margins(base_title: str, result, loop_id: str) -> str:
+    """
+    Append Bode / PM tags from result['loop_margins'].
+
+    Expected structure:
+      loop_margins = {'pitch': analyze_all_loops(...), 'yaw': analyze_all_loops(...)}
+    Position/Velocity show XY (pitch) + Z (yaw); Rate/Attitude show pitch (roll/pitch cascade).
+    """
+    lm = (result or {}).get('loop_margins') or {}
+    if not lm:
+        return base_title
+    xy = lm.get('pitch') or lm.get('xy') or {}
+    z = lm.get('yaw') or lm.get('z') or {}
+    xy_loop = (xy.get('by_loop') or {}).get(loop_id)
+    z_loop = (z.get('by_loop') or {}).get(loop_id)
+
+    parts = []
+    if loop_id in (LOOP_POSITION, LOOP_VELOCITY):
+        tag_xy = format_loop_margin_tag(xy_loop)
+        tag_z = format_loop_margin_tag(z_loop)
+        if tag_xy:
+            parts.append(f'XY {tag_xy}')
+        if tag_z:
+            parts.append(f'Z {tag_z}')
+    else:
+        # Rate / attitude titles use pitch (roll/pitch) channel metrics.
+        tag = format_loop_margin_tag(xy_loop)
+        if tag:
+            parts.append(tag)
+
+    if not parts:
+        return base_title
+    return f'{base_title}\n' + ' | '.join(parts)
 
 
 _SP_STYLE = dict(linestyle='-.', linewidth=1.5, alpha=0.9)
@@ -310,12 +354,20 @@ def draw_tracking_state_panels(
         sp_rate = _align_cascade_series(cascade.get('rate_rad_s'), len(t), result)
 
     mapping = [
-        ('ax_pos', pos_ref, pos_sim, pos_label, pos_title, False, None, xyz_labels),
-        ('ax_att', euler_ref, euler_sim, 'Euler (deg)', 'Attitude', False,
+        ('ax_pos', pos_ref, pos_sim, pos_label,
+         _states_title_with_loop_margins(pos_title, result, LOOP_POSITION),
+         False, None, xyz_labels),
+        ('ax_att', euler_ref, euler_sim, 'Euler (deg)',
+         _states_title_with_loop_margins('Attitude', result, LOOP_ATTITUDE),
+         False,
          np.degrees(sp_att) if sp_att is not None else None, _LABELS3),
-        ('ax_vel', vel_ref, vel_sim, vel_label, vel_title, False, sp_vel, xyz_labels),
+        ('ax_vel', vel_ref, vel_sim, vel_label,
+         _states_title_with_loop_margins(vel_title, result, LOOP_VELOCITY),
+         False, sp_vel, xyz_labels),
         ('ax_angvel', np.degrees(x_ref[:, 9:12]), np.degrees(x_sim[:, 9:12]),
-         'Angular vel (°/s)', 'Angular velocity', False,
+         'Angular vel (°/s)',
+         _states_title_with_loop_margins('Angular velocity', result, LOOP_RATE),
+         False,
          np.degrees(sp_rate) if sp_rate is not None else None, _LABELS3),
         ('ax_acc', acc_ref, acc_sim, acc_label, acc_title, False, None, xyz_labels),
         ('ax_angacc', angacc_ref, angacc_sim, 'Angular acc (rad/s²)', 'Angular acceleration', False, None, _LABELS3),
@@ -537,9 +589,18 @@ def tracking_summary_text(result):
         level = result.get('tune_level', '?')
         sp = result.get('tune_setpoints') or {}
         sp_txt = ', '.join(f'{k}={v:g}' for k, v in sp.items())
+        act_on = bool(result.get('actuator_dynamics_enabled'))
+        act_txt = 'actuator ON' if act_on else 'actuator OFF'
+        if act_on and isinstance(result.get('actuator_config'), dict):
+            cfg = result['actuator_config']
+            act_txt += (
+                f" (τ_g={float(cfg.get('tau_gimbal', 0)):.3f}s"
+                f", τ_T={float(cfg.get('tau_thrust', 0)):.3f}s"
+                f", τ_yaw={float(cfg.get('tau_yaw_torque', 0)):.3f}s)"
+            )
         return (
             f"PX4 cascade tune ({level}): duration {result.get('tune_duration_s', 0):.1f} s — "
-            f"setpoints: {sp_txt}"
+            f"{act_txt} — setpoints: {sp_txt}"
         )
     txt = (
         f"Tracking ({result.get('controller_id', '?')}): "

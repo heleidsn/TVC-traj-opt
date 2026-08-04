@@ -126,6 +126,16 @@ from tvc_traj_gui_tracking import (
     tracking_summary_text,
 )
 from tvc_traj_gui_nmp import build_nmp_series, draw_nmp_panels, nmp_axes_dict
+from tvc_traj_gui_margins import draw_stability_margins_panels
+from controllers.stability_margins import (
+    AXIS_PITCH,
+    LOOP_ATTITUDE,
+    LOOP_IDS,
+    LOOP_POSITION,
+    LOOP_RATE,
+    LOOP_VELOCITY,
+    analyze_all_loops,
+)
 from controllers.actuator_dynamics import (
     BW_MAX_HZ,
     BW_MIN_HZ,
@@ -133,6 +143,7 @@ from controllers.actuator_dynamics import (
     TAU_MIN,
     THRUST_RES_MAX,
     THRUST_RES_MIN,
+    actuator_config_from_params,
     bandwidth_hz_to_tau,
     default_actuator_tracking_config,
     default_thrust_resolution_for_platform,
@@ -2557,23 +2568,27 @@ class MainWindow(QMainWindow):
         enabled = self.act_dyn_enable_cb.isChecked()
         self.act_dyn_lag_detail.setEnabled(enabled)
         self.act_dyn_lag_detail.setVisible(enabled)
+        if getattr(self, '_act_dyn_updating', False):
+            return
         self._store_actuator_config()
         self._refresh_tab_scroll_areas()
 
     def _on_act_thrust_quant_changed(self, _state=None):
         on = self.act_thrust_quant_cb.isChecked()
         self.act_thrust_resolution_spin.setEnabled(on)
+        if getattr(self, '_act_dyn_updating', False):
+            return
         self._store_actuator_config()
         self._refresh_tab_scroll_areas()
 
     def _on_act_thrust_resolution_changed(self, _value=None):
-        if self._act_dyn_updating:
+        if getattr(self, '_act_dyn_updating', False):
             return
         act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
         act['thrust_resolution_N'] = float(self.act_thrust_resolution_spin.value())
 
     def _on_act_dyn_tau_changed(self, key):
-        if self._act_dyn_updating:
+        if getattr(self, '_act_dyn_updating', False):
             return
         tau_spin = self._act_dyn_tau_spins.get(key)
         bw_spin = self._act_dyn_bw_spins.get(key)
@@ -2583,11 +2598,13 @@ class MainWindow(QMainWindow):
         act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
         act[key] = tau
         self._act_dyn_updating = True
-        bw_spin.setValue(tau_to_bandwidth_hz(tau))
-        self._act_dyn_updating = False
+        try:
+            bw_spin.setValue(tau_to_bandwidth_hz(tau))
+        finally:
+            self._act_dyn_updating = False
 
     def _on_act_dyn_bw_changed(self, key):
-        if self._act_dyn_updating:
+        if getattr(self, '_act_dyn_updating', False):
             return
         tau_spin = self._act_dyn_tau_spins.get(key)
         bw_spin = self._act_dyn_bw_spins.get(key)
@@ -2597,20 +2614,24 @@ class MainWindow(QMainWindow):
         act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
         act[key] = tau
         self._act_dyn_updating = True
-        tau_spin.setValue(tau)
-        self._act_dyn_updating = False
+        try:
+            tau_spin.setValue(tau)
+        finally:
+            self._act_dyn_updating = False
 
     def _refresh_act_dyn_spins(self):
         if not hasattr(self, '_act_dyn_tau_spins'):
             return
-        self._act_dyn_updating = True
         act = self._tracking_config.get('actuator') or default_actuator_tracking_config()
-        for key, tau_spin in self._act_dyn_tau_spins.items():
-            tau = float(act.get(key, 0.05))
-            bw_spin = self._act_dyn_bw_spins[key]
-            tau_spin.setValue(tau)
-            bw_spin.setValue(tau_to_bandwidth_hz(tau))
-        self._act_dyn_updating = False
+        self._act_dyn_updating = True
+        try:
+            for key, tau_spin in self._act_dyn_tau_spins.items():
+                tau = float(act.get(key, 0.05))
+                bw_spin = self._act_dyn_bw_spins[key]
+                tau_spin.setValue(tau)
+                bw_spin.setValue(tau_to_bandwidth_hz(tau))
+        finally:
+            self._act_dyn_updating = False
 
     def _store_actuator_config(self):
         if not hasattr(self, 'act_dyn_enable_cb'):
@@ -2640,13 +2661,22 @@ class MainWindow(QMainWindow):
         act['tau_gimbal'] = float(raw.get('tau_gimbal', 0.05))
         act['tau_thrust'] = float(raw.get('tau_thrust', 0.05))
         act['tau_yaw_torque'] = float(raw.get('tau_yaw_torque', 0.05))
+        # Commit desired config first, then push into widgets under a guard so
+        # checkbox/spin signals cannot overwrite with stale spin values.
         self._tracking_config['actuator'] = act
         self._act_dyn_updating = True
-        self.act_dyn_enable_cb.setChecked(act['enabled'])
-        self.act_thrust_quant_cb.setChecked(act['thrust_quant_enabled'])
-        self.act_thrust_resolution_spin.setValue(act['thrust_resolution_N'])
-        self._act_dyn_updating = False
-        self._refresh_act_dyn_spins()
+        try:
+            for key, tau_spin in self._act_dyn_tau_spins.items():
+                tau = float(act.get(key, 0.05))
+                self._act_dyn_bw_spins[key].setValue(tau_to_bandwidth_hz(tau))
+                tau_spin.setValue(tau)
+            self.act_thrust_resolution_spin.setValue(act['thrust_resolution_N'])
+            self.act_dyn_enable_cb.setChecked(act['enabled'])
+            self.act_thrust_quant_cb.setChecked(act['thrust_quant_enabled'])
+        finally:
+            self._act_dyn_updating = False
+        # Re-assert stored config (signals may have run during setChecked).
+        self._tracking_config['actuator'] = dict(act)
         self.act_dyn_lag_detail.setEnabled(act['enabled'])
         self.act_dyn_lag_detail.setVisible(act['enabled'])
         self.act_thrust_resolution_spin.setEnabled(act['thrust_quant_enabled'])
@@ -2857,7 +2887,8 @@ class MainWindow(QMainWindow):
             expanded=False,
         )
         self.px4_tune_group.setToolTip(
-            'Click the section title (▸/▾) to expand or collapse cascade step-response tuning.'
+            'Click the section title (▸/▾) to expand or collapse cascade step-response tuning.\n'
+            'Uses the same Actuator dynamics panel above (first-order lag / thrust quantization).'
         )
 
         level_row = QGridLayout()
@@ -2925,14 +2956,16 @@ class MainWindow(QMainWindow):
         self.btn_run_px4_tune = QPushButton('Run cascade tune sim')
         self.btn_run_px4_tune.setToolTip(
             'Hover step response at the selected cascade level.\n'
-            'Outer loops are bypassed; only the active level and inner loops run.'
+            'Outer loops are bypassed; only the active level and inner loops run.\n'
+            'Plant input includes Actuator dynamics (τ / thrust quantization) when enabled above.'
         )
         self.btn_run_px4_tune.clicked.connect(self.run_px4_cascade_tune_sim)
         tune_outer.addWidget(self.btn_run_px4_tune)
 
         self.lbl_px4_tune_result = QLabel(
             'Tune: rate → attitude → velocity → position. '
-            'States tab shows dashed cmd = inner-loop setpoints.'
+            'Uses Actuator dynamics when enabled. '
+            'States tab: dashed cmd = inner-loop setpoints; controls show cmd vs act.'
         )
         self.lbl_px4_tune_result.setWordWrap(True)
         self.lbl_px4_tune_result.setStyleSheet('color: #555;')
@@ -4706,7 +4739,216 @@ class MainWindow(QMainWindow):
         )
         self.plot_tabs.addTab(metrics_widget, 'Metrics')
 
-        # ── Tab 6: NMP / flatness (3×2) ──
+        # ── Tab: Stability margins (Bode / PM with vs without actuator) ──
+        margins_widget = QWidget()
+        margins_layout = QVBoxLayout(margins_widget)
+        margins_layout.setContentsMargins(4, 4, 4, 4)
+
+        margins_ctrl = QHBoxLayout()
+        margins_ctrl.addWidget(QLabel('Axis:'))
+        self.margins_axis_combo = QComboBox()
+        self.margins_axis_combo.addItem('Pitch / X', AXIS_PITCH)
+        self.margins_axis_combo.addItem('Roll / Y', 'roll')
+        self.margins_axis_combo.addItem('Yaw / Z', 'yaw')
+        self.margins_axis_combo.setToolTip(
+            'Plots all four cascade loops for this axis.\n'
+            'Pitch/Roll: horizontal via attitude.\n'
+            'Yaw: rate/att use yaw; Vel/Pos use vertical Z + thrust τ.'
+        )
+        margins_ctrl.addWidget(self.margins_axis_combo)
+        self.btn_margins_sync = QPushButton('Load from Tracking')
+        self.btn_margins_sync.setToolTip(
+            'Copy current Tracking controller gains + actuator τ into the spins below.\n'
+            'Does not redraw Bode — click Update Bode afterwards.'
+        )
+        self.btn_margins_sync.clicked.connect(self._sync_margins_controls_from_tracking)
+        margins_ctrl.addWidget(self.btn_margins_sync)
+        self.btn_update_margins = QPushButton('Update Bode')
+        self.btn_update_margins.setToolTip(
+            'Recompute all four loop Bodes from the spins and push them back to Tracking.'
+        )
+        self.btn_update_margins.clicked.connect(self._refresh_stability_margins_tab)
+        margins_ctrl.addWidget(self.btn_update_margins)
+        margins_ctrl.addStretch(1)
+        margins_layout.addLayout(margins_ctrl)
+
+        show_row = QHBoxLayout()
+        show_row.addWidget(QLabel('Show:'))
+        self._margins_loop_show_cbs = {}
+        for loop, label in (
+            (LOOP_RATE, 'Rate (角速度)'),
+            (LOOP_ATTITUDE, 'Attitude (角度)'),
+            (LOOP_VELOCITY, 'Velocity (速度)'),
+            (LOOP_POSITION, 'Position (位置)'),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.setToolTip(f'Show / hide the {label.split()[0]} Bode column')
+            cb.stateChanged.connect(self._on_margins_loop_visibility_changed)
+            self._margins_loop_show_cbs[loop] = cb
+            show_row.addWidget(cb)
+        show_row.addStretch(1)
+        margins_layout.addLayout(show_row)
+
+        # Editable gains + actuator τ used by the Bode (source of truth on this tab)
+        self._margins_ctrl_guard = False
+        gains_row = QHBoxLayout()
+        self.lbl_margins_rate = QLabel('Rate PID:')
+        gains_row.addWidget(self.lbl_margins_rate)
+        self.spin_margins_kp_rate = QDoubleSpinBox()
+        self.spin_margins_ki_rate = QDoubleSpinBox()
+        self.spin_margins_kd_rate = QDoubleSpinBox()
+        for spin, name, lo, hi, dec, default in (
+            (self.spin_margins_kp_rate, 'Kp', 0.0, 100.0, 2, 15.0),
+            (self.spin_margins_ki_rate, 'Ki', 0.0, 50.0, 2, 0.0),
+            (self.spin_margins_kd_rate, 'Kd', 0.0, 20.0, 3, 0.0),
+        ):
+            spin.setRange(lo, hi)
+            spin.setDecimals(dec)
+            spin.setSingleStep(10 ** (-dec))
+            spin.setValue(default)
+            spin.setPrefix(f'{name} ')
+            spin.setToolTip(f'Rate-loop {name} for the selected axis')
+            spin.valueChanged.connect(self._on_margins_control_changed)
+            gains_row.addWidget(spin)
+        gains_row.addSpacing(12)
+        self.lbl_margins_kp_att = QLabel('Att Kp:')
+        gains_row.addWidget(self.lbl_margins_kp_att)
+        self.spin_margins_kp_att = QDoubleSpinBox()
+        self.spin_margins_kp_att.setRange(0.0, 50.0)
+        self.spin_margins_kp_att.setDecimals(2)
+        self.spin_margins_kp_att.setSingleStep(0.1)
+        self.spin_margins_kp_att.setValue(6.5)
+        self.spin_margins_kp_att.setToolTip(
+            'Attitude P gain [1/deg] (SI effective gain = this value × err_rad).'
+        )
+        self.spin_margins_kp_att.valueChanged.connect(self._on_margins_control_changed)
+        gains_row.addWidget(self.spin_margins_kp_att)
+        gains_row.addStretch(1)
+        margins_layout.addLayout(gains_row)
+
+        outer_row = QHBoxLayout()
+        self.lbl_margins_vel = QLabel('Vel PID:')
+        outer_row.addWidget(self.lbl_margins_vel)
+        self.spin_margins_kp_vel = QDoubleSpinBox()
+        self.spin_margins_ki_vel = QDoubleSpinBox()
+        self.spin_margins_kd_vel = QDoubleSpinBox()
+        for spin, name, lo, hi, dec, default in (
+            (self.spin_margins_kp_vel, 'Kp', 0.0, 50.0, 2, 1.8),
+            (self.spin_margins_ki_vel, 'Ki', 0.0, 20.0, 2, 0.0),
+            (self.spin_margins_kd_vel, 'Kd', 0.0, 10.0, 3, 0.0),
+        ):
+            spin.setRange(lo, hi)
+            spin.setDecimals(dec)
+            spin.setSingleStep(10 ** (-dec))
+            spin.setValue(default)
+            spin.setPrefix(f'{name} ')
+            spin.setToolTip(f'Velocity-loop {name} (XY or Z depending on axis)')
+            spin.valueChanged.connect(self._on_margins_control_changed)
+            outer_row.addWidget(spin)
+        outer_row.addSpacing(12)
+        self.lbl_margins_kp_pos = QLabel('Pos Kp:')
+        outer_row.addWidget(self.lbl_margins_kp_pos)
+        self.spin_margins_kp_pos = QDoubleSpinBox()
+        self.spin_margins_kp_pos.setRange(0.0, 20.0)
+        self.spin_margins_kp_pos.setDecimals(2)
+        self.spin_margins_kp_pos.setSingleStep(0.05)
+        self.spin_margins_kp_pos.setValue(1.0)
+        self.spin_margins_kp_pos.setToolTip('Position P gain (XY or Z depending on axis)')
+        self.spin_margins_kp_pos.valueChanged.connect(self._on_margins_control_changed)
+        outer_row.addWidget(self.spin_margins_kp_pos)
+        outer_row.addStretch(1)
+        margins_layout.addLayout(outer_row)
+
+        act_row = QHBoxLayout()
+        self.chk_margins_actuator = QCheckBox('With actuator lag')
+        self.chk_margins_actuator.setChecked(True)
+        self.chk_margins_actuator.setToolTip(
+            'Dashed Bode uses first-order lag 1/(τs+1). Uncheck to compare only the ideal loop.'
+        )
+        self.chk_margins_actuator.stateChanged.connect(self._on_margins_control_changed)
+        act_row.addWidget(self.chk_margins_actuator)
+        self.lbl_margins_tau = QLabel('τ_gimbal [s]:')
+        act_row.addWidget(self.lbl_margins_tau)
+        self.spin_margins_tau = QDoubleSpinBox()
+        self.spin_margins_tau.setRange(TAU_MIN, TAU_MAX)
+        self.spin_margins_tau.setDecimals(3)
+        self.spin_margins_tau.setSingleStep(0.005)
+        self.spin_margins_tau.setValue(0.05)
+        self.spin_margins_tau.setToolTip('Gimbal τ (pitch/roll) or yaw-torque τ (yaw axis).')
+        self.spin_margins_tau.valueChanged.connect(self._on_margins_tau_changed)
+        act_row.addWidget(self.spin_margins_tau)
+        act_row.addWidget(QLabel('f_c [Hz]:'))
+        self.spin_margins_fc = QDoubleSpinBox()
+        self.spin_margins_fc.setRange(BW_MIN_HZ, BW_MAX_HZ)
+        self.spin_margins_fc.setDecimals(2)
+        self.spin_margins_fc.setSingleStep(0.1)
+        self.spin_margins_fc.setValue(tau_to_bandwidth_hz(0.05))
+        self.spin_margins_fc.setToolTip('−3 dB bandwidth; linked to τ = 1/(2π f_c).')
+        self.spin_margins_fc.valueChanged.connect(self._on_margins_fc_changed)
+        act_row.addWidget(self.spin_margins_fc)
+        self.lbl_margins_tau_thrust = QLabel('τ_thrust [s]:')
+        act_row.addWidget(self.lbl_margins_tau_thrust)
+        self.spin_margins_tau_thrust = QDoubleSpinBox()
+        self.spin_margins_tau_thrust.setRange(TAU_MIN, TAU_MAX)
+        self.spin_margins_tau_thrust.setDecimals(3)
+        self.spin_margins_tau_thrust.setSingleStep(0.005)
+        self.spin_margins_tau_thrust.setValue(0.05)
+        self.spin_margins_tau_thrust.setToolTip(
+            'Thrust τ for vertical Vel/Pos (Yaw/Z axis only).'
+        )
+        self.spin_margins_tau_thrust.valueChanged.connect(self._on_margins_control_changed)
+        act_row.addWidget(self.spin_margins_tau_thrust)
+        self.lbl_margins_act_hint = QLabel(
+            'Solid = no lag · Dashed = with τ  |  four loops shown together'
+        )
+        self.lbl_margins_act_hint.setStyleSheet('color: #555;')
+        act_row.addWidget(self.lbl_margins_act_hint)
+        act_row.addStretch(1)
+        margins_layout.addLayout(act_row)
+
+        self.fig_margins = Figure(figsize=(14, 7))
+        self.canvas_margins = FigureCanvas(self.fig_margins)
+        self.canvas_margins.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_margins.setMinimumSize(280, 220)
+        gs_mg = GridSpec(
+            2, 5, figure=self.fig_margins,
+            width_ratios=[1.0, 1.0, 1.0, 1.0, 0.95],
+            hspace=0.32, wspace=0.22,
+        )
+        self._margins_gridspec = gs_mg
+        self.fig_margins._tvc_gridspec_pads = {
+            'left': 0.05, 'right': 0.99, 'top': 0.90, 'bottom': 0.08,
+            'hspace': 0.32, 'wspace': 0.22,
+        }
+        self.fig_margins.suptitle(
+            'Stability margins — Rate / Att / Vel / Pos (solid=no lag, dashed=with τ)',
+            fontsize=11, fontweight='bold', y=0.98,
+        )
+        self._margins_loop_axes = {}
+        for col, loop in enumerate(LOOP_IDS):
+            ax_mag = self.fig_margins.add_subplot(gs_mg[0, col])
+            ax_phase = self.fig_margins.add_subplot(gs_mg[1, col], sharex=ax_mag)
+            self._margins_loop_axes[loop] = {'ax_mag': ax_mag, 'ax_phase': ax_phase}
+        self.ax_margins_info = self.fig_margins.add_subplot(gs_mg[:, 4])
+        self.ax_margins_info.axis('off')
+        # Keep legacy aliases pointing at Rate (for any old callers)
+        self.ax_margins_mag = self._margins_loop_axes[LOOP_RATE]['ax_mag']
+        self.ax_margins_phase = self._margins_loop_axes[LOOP_RATE]['ax_phase']
+        margins_layout.addWidget(self.canvas_margins)
+        install_responsive_canvas(
+            self.canvas_margins, self.fig_margins, base_width_px=1300, base_height_px=720,
+            layout_mode='gridspec',
+        )
+        self.margins_axis_combo.currentIndexChanged.connect(self._on_margins_loop_axis_changed)
+        self._last_margins_result = None
+        self.plot_tabs.addTab(margins_widget, 'Stability margins')
+        draw_stability_margins_panels(self._margins_axes_dict(), None)
+        # Pull Tracking values once widgets exist (deferred — Tracking panel may
+        # still be initializing when this tab is built).
+        QTimer.singleShot(0, self._sync_margins_controls_from_tracking)
+
+        # ── Tab: NMP / flatness (3×2) ──
         self.fig_nmp = Figure(figsize=(12, 8))
         self.canvas_nmp = FigureCanvas(self.fig_nmp)
         self.canvas_nmp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -4774,6 +5016,7 @@ class MainWindow(QMainWindow):
             (self.fig_states, self.canvas_states),
             (self.fig_3d_tab, self.canvas_3d_tab),
             (self.fig_metrics, self.canvas_metrics),
+            (getattr(self, 'fig_margins', None), getattr(self, 'canvas_margins', None)),
             (self.fig_nmp, self.canvas_nmp),
         )
         for fig, canvas in pairs:
@@ -4801,6 +5044,379 @@ class MainWindow(QMainWindow):
             self.canvas_metrics.draw_idle()
         self._refresh_all_plot_layouts()
 
+    def _margins_selected_axis(self):
+        axis = AXIS_PITCH
+        if hasattr(self, 'margins_axis_combo'):
+            data = self.margins_axis_combo.currentData()
+            if data:
+                axis = data
+        return axis
+
+    def _margins_selected_loop_axis(self):
+        """Legacy (loop, axis) pair; loop is unused now (all four plotted)."""
+        return LOOP_RATE, self._margins_selected_axis()
+
+    def _margins_axes_dict(self):
+        return {
+            'ax_by_loop': getattr(self, '_margins_loop_axes', {}),
+            'ax_mag': getattr(self, 'ax_margins_mag', None),
+            'ax_phase': getattr(self, 'ax_margins_phase', None),
+            'ax_info': getattr(self, 'ax_margins_info', None),
+            'gridspec': getattr(self, '_margins_gridspec', None),
+            'visible_loops': self._margins_loop_visibility(),
+        }
+
+    def _margins_loop_visibility(self):
+        """Which cascade-loop Bode columns to show."""
+        cbs = getattr(self, '_margins_loop_show_cbs', None) or {}
+        return {
+            loop: (bool(cbs[loop].isChecked()) if loop in cbs else True)
+            for loop in LOOP_IDS
+        }
+
+    def _on_margins_loop_visibility_changed(self, _state=None):
+        """Redraw last Bode result with updated column visibility (no recompute)."""
+        if not hasattr(self, 'canvas_margins'):
+            return
+        result = getattr(self, '_last_margins_result', None)
+        draw_stability_margins_panels(self._margins_axes_dict(), result)
+        self.canvas_margins.draw_idle()
+        self._refresh_all_plot_layouts()
+
+    def _margins_primary_tau_key(self, axis=None):
+        """τ edited by the main spin: gimbal (XY) or yaw-torque (yaw)."""
+        if axis is None:
+            axis = self._margins_selected_axis()
+        return 'tau_yaw_torque' if axis == 'yaw' else 'tau_gimbal'
+
+    def _update_margins_gain_visibility(self):
+        """All cascade gains stay visible; τ_thrust only for Yaw/Z."""
+        if not hasattr(self, 'spin_margins_kp_rate'):
+            return
+        axis = self._margins_selected_axis()
+        for w in (
+            getattr(self, 'lbl_margins_rate', None),
+            self.spin_margins_kp_rate,
+            self.spin_margins_ki_rate,
+            self.spin_margins_kd_rate,
+            self.lbl_margins_kp_att,
+            self.spin_margins_kp_att,
+            getattr(self, 'lbl_margins_vel', None),
+            getattr(self, 'spin_margins_kp_vel', None),
+            getattr(self, 'spin_margins_ki_vel', None),
+            getattr(self, 'spin_margins_kd_vel', None),
+            getattr(self, 'lbl_margins_kp_pos', None),
+            getattr(self, 'spin_margins_kp_pos', None),
+        ):
+            if w is not None:
+                w.setVisible(True)
+
+        yaw = axis == 'yaw'
+        if hasattr(self, 'lbl_margins_tau'):
+            self.lbl_margins_tau.setText('τ_yaw [s]:' if yaw else 'τ_gimbal [s]:')
+        if hasattr(self, 'spin_margins_tau'):
+            self.spin_margins_tau.setToolTip(
+                'Yaw-torque lag for rate/attitude.' if yaw
+                else 'Gimbal lag for pitch/roll cascade (all four loops).'
+            )
+        thrust_vis = yaw
+        if hasattr(self, 'lbl_margins_tau_thrust'):
+            self.lbl_margins_tau_thrust.setVisible(thrust_vis)
+        if hasattr(self, 'spin_margins_tau_thrust'):
+            self.spin_margins_tau_thrust.setVisible(thrust_vis)
+
+        on = self.chk_margins_actuator.isChecked()
+        self.spin_margins_tau.setEnabled(on)
+        self.spin_margins_fc.setEnabled(on)
+        if hasattr(self, 'spin_margins_tau_thrust'):
+            self.spin_margins_tau_thrust.setEnabled(on and thrust_vis)
+
+    def _margins_tracking_params_snapshot(self):
+        """Live Tracking PX4 gains + actuator settings (for Load from Tracking)."""
+        cid = (
+            self._current_tracking_controller_id()
+            if hasattr(self, 'tracking_controller_combo') else CONTROLLER_PX4
+        )
+        if cid in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
+            return self._collect_tracking_params()
+        params = dict(
+            self._tracking_params_map_for(self._current_rocket_platform_id()).get(
+                CONTROLLER_PX4, default_params_for(CONTROLLER_PX4)
+            )
+        )
+        self._store_actuator_config()
+        params.update(self._actuator_params_for_sim())
+        return params
+
+    def _sync_margins_controls_from_tracking(self):
+        """Copy Tracking gains/τ into the Stability-margins spins (no Bode redraw)."""
+        if not hasattr(self, 'spin_margins_kp_rate'):
+            return
+        axis = self._margins_selected_axis()
+        raw = self._margins_tracking_params_snapshot()
+        from controllers.px4_params import normalize_px4_params
+        gains = normalize_px4_params(raw)
+        if axis == 'roll':
+            kp, ki, kd = gains['Kp_rate_roll'], gains['Ki_rate_roll'], gains['Kd_rate_roll']
+            kp_att = gains['Kp_att_roll_deg']
+            kp_v, ki_v, kd_v = gains['Kp_vel_xy'], gains['Ki_vel_xy'], gains['Kd_vel_xy']
+            kp_pos = gains['Kp_pos_xy']
+        elif axis == 'yaw':
+            kp, ki, kd = gains['Kp_rate_yaw'], gains['Ki_rate_yaw'], gains['Kd_rate_yaw']
+            kp_att = gains['Kp_att_yaw_deg']
+            kp_v, ki_v, kd_v = gains['Kp_vel_z'], gains['Ki_vel_z'], gains['Kd_vel_z']
+            kp_pos = gains['Kp_pos_z']
+        else:
+            kp, ki, kd = gains['Kp_rate_pitch'], gains['Ki_rate_pitch'], gains['Kd_rate_pitch']
+            kp_att = gains['Kp_att_pitch_deg']
+            kp_v, ki_v, kd_v = gains['Kp_vel_xy'], gains['Ki_vel_xy'], gains['Kd_vel_xy']
+            kp_pos = gains['Kp_pos_xy']
+        act = actuator_config_from_params(raw)
+        tau_primary = float(act.get(self._margins_primary_tau_key(axis), 0.05))
+        tau_thrust = float(act.get('tau_thrust', 0.05))
+        enabled = bool(act.get('act_dyn_enable', False))
+
+        self._margins_ctrl_guard = True
+        try:
+            self.spin_margins_kp_rate.setValue(float(kp))
+            self.spin_margins_ki_rate.setValue(float(ki))
+            self.spin_margins_kd_rate.setValue(float(kd))
+            self.spin_margins_kp_att.setValue(float(kp_att))
+            if hasattr(self, 'spin_margins_kp_vel'):
+                self.spin_margins_kp_vel.setValue(float(kp_v))
+                self.spin_margins_ki_vel.setValue(float(ki_v))
+                self.spin_margins_kd_vel.setValue(float(kd_v))
+            if hasattr(self, 'spin_margins_kp_pos'):
+                self.spin_margins_kp_pos.setValue(float(kp_pos))
+            self.chk_margins_actuator.setChecked(enabled or tau_primary > 0.0)
+            self.spin_margins_tau.setValue(max(float(tau_primary), TAU_MIN))
+            self.spin_margins_fc.setValue(tau_to_bandwidth_hz(float(self.spin_margins_tau.value())))
+            if hasattr(self, 'spin_margins_tau_thrust'):
+                self.spin_margins_tau_thrust.setValue(max(float(tau_thrust), TAU_MIN))
+        finally:
+            self._margins_ctrl_guard = False
+        self._update_margins_gain_visibility()
+
+    def _on_margins_loop_axis_changed(self, _index=None):
+        # Reload axis-specific gains/τ into spins only; Bode waits for Update.
+        self._sync_margins_controls_from_tracking()
+
+    def _on_margins_control_changed(self, _value=None):
+        if getattr(self, '_margins_ctrl_guard', False):
+            return
+        self._update_margins_gain_visibility()
+
+    def _on_margins_tau_changed(self, _value=None):
+        if getattr(self, '_margins_ctrl_guard', False):
+            return
+        self._margins_ctrl_guard = True
+        try:
+            tau = float(self.spin_margins_tau.value())
+            self.spin_margins_fc.setValue(tau_to_bandwidth_hz(tau))
+        finally:
+            self._margins_ctrl_guard = False
+        self._on_margins_control_changed()
+
+    def _on_margins_fc_changed(self, _value=None):
+        if getattr(self, '_margins_ctrl_guard', False):
+            return
+        self._margins_ctrl_guard = True
+        try:
+            tau = bandwidth_hz_to_tau(float(self.spin_margins_fc.value()))
+            self.spin_margins_tau.setValue(tau)
+        finally:
+            self._margins_ctrl_guard = False
+        self._on_margins_control_changed()
+
+    def _margins_params_from_controls(self):
+        """Build analyze params from the Stability-margins spins (all four loops)."""
+        axis = self._margins_selected_axis()
+        params = dict(self._margins_tracking_params_snapshot())
+        kp = float(self.spin_margins_kp_rate.value())
+        ki = float(self.spin_margins_ki_rate.value())
+        kd = float(self.spin_margins_kd_rate.value())
+        kp_att = float(self.spin_margins_kp_att.value())
+        kp_v = float(self.spin_margins_kp_vel.value()) if hasattr(self, 'spin_margins_kp_vel') else 0.0
+        ki_v = float(self.spin_margins_ki_vel.value()) if hasattr(self, 'spin_margins_ki_vel') else 0.0
+        kd_v = float(self.spin_margins_kd_vel.value()) if hasattr(self, 'spin_margins_kd_vel') else 0.0
+        kp_pos = float(self.spin_margins_kp_pos.value()) if hasattr(self, 'spin_margins_kp_pos') else 0.0
+        tau = float(self.spin_margins_tau.value())
+        use_act = bool(self.chk_margins_actuator.isChecked())
+
+        if axis == 'roll':
+            params.update({
+                'Kp_rate_roll': kp, 'Ki_rate_roll': ki, 'Kd_rate_roll': kd,
+                'Kp_att_roll_deg': kp_att,
+                'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                'Kp_att_rp_deg': kp_att,
+                'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                'Kp_pos_xy': kp_pos,
+            })
+        elif axis == 'yaw':
+            params.update({
+                'Kp_rate_yaw': kp, 'Ki_rate_yaw': ki, 'Kd_rate_yaw': kd,
+                'Kp_att_yaw_deg': kp_att,
+                'Kp_vel_z': kp_v, 'Ki_vel_z': ki_v, 'Kd_vel_z': kd_v,
+                'Kp_pos_z': kp_pos,
+            })
+        else:
+            params.update({
+                'Kp_rate_pitch': kp, 'Ki_rate_pitch': ki, 'Kd_rate_pitch': kd,
+                'Kp_att_pitch_deg': kp_att,
+                'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                'Kp_att_rp_deg': kp_att,
+                'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                'Kp_pos_xy': kp_pos,
+            })
+        params[self._margins_primary_tau_key(axis)] = tau
+        if hasattr(self, 'spin_margins_tau_thrust'):
+            params['tau_thrust'] = float(self.spin_margins_tau_thrust.value())
+        params['act_dyn_enable'] = use_act
+        params['_margins_axis'] = axis
+        return params
+
+    def _apply_margins_controls_to_tracking(self):
+        """Push margins spins back into Tracking controller + actuator widgets."""
+        if not hasattr(self, 'spin_margins_kp_rate'):
+            return
+        axis = self._margins_selected_axis()
+        kp = float(self.spin_margins_kp_rate.value())
+        ki = float(self.spin_margins_ki_rate.value())
+        kd = float(self.spin_margins_kd_rate.value())
+        kp_att = float(self.spin_margins_kp_att.value())
+        kp_v = float(self.spin_margins_kp_vel.value()) if hasattr(self, 'spin_margins_kp_vel') else None
+        ki_v = float(self.spin_margins_ki_vel.value()) if hasattr(self, 'spin_margins_ki_vel') else None
+        kd_v = float(self.spin_margins_kd_vel.value()) if hasattr(self, 'spin_margins_kd_vel') else None
+        kp_pos = float(self.spin_margins_kp_pos.value()) if hasattr(self, 'spin_margins_kp_pos') else None
+        tau = float(self.spin_margins_tau.value())
+        tau_thrust = (
+            float(self.spin_margins_tau_thrust.value())
+            if hasattr(self, 'spin_margins_tau_thrust') else None
+        )
+        use_act = bool(self.chk_margins_actuator.isChecked())
+
+        params_map = self._tracking_params_map_for(self._current_rocket_platform_id())
+        px4 = params_map.setdefault(CONTROLLER_PX4, default_params_for(CONTROLLER_PX4))
+        flat = params_map.setdefault(CONTROLLER_FLATNESS, default_params_for(CONTROLLER_FLATNESS))
+        for store in (px4, flat):
+            if axis == 'roll':
+                store.update({
+                    'Kp_rate_roll': kp, 'Ki_rate_roll': ki, 'Kd_rate_roll': kd,
+                    'Kp_att_roll_deg': kp_att,
+                })
+                if store.get('share_rp_gains', True):
+                    store.update({
+                        'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                        'Kp_att_rp_deg': kp_att,
+                        'Kp_rate_pitch': kp, 'Ki_rate_pitch': ki, 'Kd_rate_pitch': kd,
+                        'Kp_att_pitch_deg': kp_att,
+                    })
+                if kp_v is not None:
+                    store.update({
+                        'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                    })
+                if kp_pos is not None:
+                    store['Kp_pos_xy'] = kp_pos
+            elif axis == 'yaw':
+                store.update({
+                    'Kp_rate_yaw': kp, 'Ki_rate_yaw': ki, 'Kd_rate_yaw': kd,
+                    'Kp_att_yaw_deg': kp_att,
+                })
+                if kp_v is not None:
+                    store.update({
+                        'Kp_vel_z': kp_v, 'Ki_vel_z': ki_v, 'Kd_vel_z': kd_v,
+                    })
+                if kp_pos is not None:
+                    store['Kp_pos_z'] = kp_pos
+            else:
+                store.update({
+                    'Kp_rate_pitch': kp, 'Ki_rate_pitch': ki, 'Kd_rate_pitch': kd,
+                    'Kp_att_pitch_deg': kp_att,
+                })
+                if store.get('share_rp_gains', True):
+                    store.update({
+                        'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                        'Kp_att_rp_deg': kp_att,
+                        'Kp_rate_roll': kp, 'Ki_rate_roll': ki, 'Kd_rate_roll': kd,
+                        'Kp_att_roll_deg': kp_att,
+                    })
+                if kp_v is not None:
+                    store.update({
+                        'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                    })
+                if kp_pos is not None:
+                    store['Kp_pos_xy'] = kp_pos
+
+        cid = self._current_tracking_controller_id() if hasattr(self, 'tracking_controller_combo') else None
+        if cid in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
+            self._rebuild_tracking_param_widgets()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._rebuild_nmp_tracking_param_widgets()
+
+        if hasattr(self, 'act_dyn_enable_cb'):
+            self._act_dyn_updating = True
+            try:
+                self.act_dyn_enable_cb.setChecked(use_act)
+                keys_vals = [(self._margins_primary_tau_key(axis), tau)]
+                if axis == 'yaw' and tau_thrust is not None:
+                    keys_vals.append(('tau_thrust', tau_thrust))
+                act = self._tracking_config.setdefault(
+                    'actuator', default_actuator_tracking_config()
+                )
+                act['enabled'] = use_act
+                for key, val in keys_vals:
+                    if key in getattr(self, '_act_dyn_tau_spins', {}):
+                        self._act_dyn_tau_spins[key].setValue(val)
+                        if key in self._act_dyn_bw_spins:
+                            self._act_dyn_bw_spins[key].setValue(tau_to_bandwidth_hz(val))
+                    act[key] = val
+                self.act_dyn_lag_detail.setEnabled(use_act)
+                self.act_dyn_lag_detail.setVisible(use_act)
+            finally:
+                self._act_dyn_updating = False
+            self._store_actuator_config()
+
+    def _refresh_stability_margins_tab(self, apply_to_tracking=True):
+        """Recompute all four open-loop Bodes / PM from margins-tab spins."""
+        if not hasattr(self, 'ax_margins_mag'):
+            return
+        axis = self._margins_selected_axis()
+        try:
+            if not hasattr(self, 'spin_margins_kp_rate'):
+                params = self._margins_tracking_params_snapshot()
+            else:
+                params = self._margins_params_from_controls()
+                if apply_to_tracking:
+                    self._apply_margins_controls_to_tracking()
+            phy = self._physics_dict_for_tracking()
+            force_act = bool(params.get('act_dyn_enable', True))
+            result = analyze_all_loops(
+                phy, params, axis=axis, force_actuator=force_act,
+            )
+            self._last_margins_result = result
+        except Exception as e:
+            self._last_margins_result = None
+            draw_stability_margins_panels(self._margins_axes_dict(), None)
+            self.canvas_margins.draw_idle()
+            if hasattr(self, 'status_text'):
+                self.status_text.append(f'Stability margins error: {e}')
+            return
+        draw_stability_margins_panels(self._margins_axes_dict(), result)
+        self.canvas_margins.draw_idle()
+        self._refresh_all_plot_layouts()
+        if hasattr(self, 'status_text'):
+            parts = []
+            for loop in LOOP_IDS:
+                r = (result.get('by_loop') or {}).get(loop) or {}
+                wo = r.get('without') or {}
+                wa = r.get('with_actuator') or {}
+                pm0, pm1 = wo.get('pm_deg', float('nan')), wa.get('pm_deg', float('nan'))
+                if np.isfinite(pm0) and np.isfinite(pm1):
+                    parts.append(f'{loop[0].upper()}:{pm0:.0f}→{pm1:.0f}°')
+            self.status_text.append(
+                f"Margins ({result.get('axis')}): " + '  '.join(parts)
+            )
+
     def _states_series_visibility(self):
         """Which plan / sim / cascade series to draw on the States tab."""
         return {
@@ -4822,6 +5438,7 @@ class MainWindow(QMainWindow):
         result = getattr(self, '_last_tracking_result', None)
         if result is None or not hasattr(self, 'ax_trk_pos'):
             return
+        result = self._enrich_tracking_result_with_loop_margins(result)
         plan = getattr(self, 'last_trajectory', None)
         draw_tracking_state_panels(
             tracking_state_axes_dict(self),
@@ -4833,9 +5450,35 @@ class MainWindow(QMainWindow):
         self.canvas_states.draw_idle()
         self._refresh_all_plot_layouts()
 
+    def _enrich_tracking_result_with_loop_margins(self, result):
+        """Attach continuous Bode / PM tags used in States panel titles."""
+        if not result or not isinstance(result, dict):
+            return result
+        if result.get('loop_margins'):
+            return result
+        try:
+            params = self._collect_tracking_params()
+            phy = self._physics_dict_for_tracking()
+            force_act = bool(params.get('act_dyn_enable', False))
+            result['loop_margins'] = {
+                'pitch': analyze_all_loops(
+                    phy, params, axis='pitch', force_actuator=force_act,
+                ),
+                'yaw': analyze_all_loops(
+                    phy, params, axis='yaw', force_actuator=force_act,
+                ),
+            }
+        except Exception as e:
+            if hasattr(self, 'status_text'):
+                self.status_text.append(
+                    f'States loop-margin titles skipped: {e}'
+                )
+        return result
+
     def _draw_tracking_plot_tabs(self, result):
         """Update States, 3D, and Metrics tabs after numerical tracking."""
         plan = getattr(self, 'last_trajectory', None)
+        result = self._enrich_tracking_result_with_loop_margins(result)
         draw_tracking_state_panels(
             tracking_state_axes_dict(self),
             result,
