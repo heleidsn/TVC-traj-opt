@@ -77,6 +77,10 @@ _ACTUATOR_TRACKING_KEYS = (
     'act_dyn_enable',
     'thrust_quant_enable', 'thrust_resolution_N',
     'tau_gimbal', 'tau_thrust', 'tau_yaw_torque',
+    'mismatch_enable',
+    'scale_gimbal', 'bias_gimbal',
+    'scale_thrust', 'bias_thrust',
+    'scale_yaw_torque', 'bias_yaw_torque',
 )
 
 _LQR_SPECS = []

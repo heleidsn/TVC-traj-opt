@@ -139,6 +139,8 @@ from controllers.stability_margins import (
 from controllers.actuator_dynamics import (
     BW_MAX_HZ,
     BW_MIN_HZ,
+    SCALE_MAX,
+    SCALE_MIN,
     TAU_MAX,
     TAU_MIN,
     THRUST_RES_MAX,
@@ -2477,8 +2479,14 @@ class MainWindow(QMainWindow):
         ('tau_yaw_torque', 'Yaw torque'),
     )
 
+    _ACT_MISMATCH_ROWS = (
+        ('gimbal', 'Gimbal (th_p, th_r)', 'rad'),
+        ('thrust', 'Thrust', 'N'),
+        ('yaw_torque', 'Yaw torque', 'N·m'),
+    )
+
     def _create_actuator_dynamics_panel(self, parent_layout):
-        """Actuator lag and thrust quantization (numerical simulation only)."""
+        """Actuator lag, scale/bias mismatch, and thrust quantization."""
         self.actuator_dynamics_group = QGroupBox('Actuator dynamics')
         act_group = self.actuator_dynamics_group
         act_layout = QVBoxLayout(act_group)
@@ -2531,6 +2539,62 @@ class MainWindow(QMainWindow):
         lag_layout.addWidget(lag_hint)
         act_layout.addWidget(self.act_dyn_lag_detail)
 
+        # Scale / bias mismatch (error tolerance tests)
+        self.act_mismatch_enable_cb = QCheckBox('Enable scale / bias mismatch')
+        self.act_mismatch_enable_cb.setToolTip(
+            'Plant-side calibration error after lag:\n'
+            '  u_plant = scale · u_lag + bias\n'
+            'Gimbal scale/bias applies to both th_p and th_r.\n'
+            'Use for thrust / gimbal / yaw-torque error-tolerance sweeps.'
+        )
+        self.act_mismatch_enable_cb.stateChanged.connect(self._on_act_mismatch_enable_changed)
+        act_layout.addWidget(self.act_mismatch_enable_cb)
+
+        self.act_mismatch_detail = QWidget()
+        mm_layout = QVBoxLayout(self.act_mismatch_detail)
+        mm_layout.setContentsMargins(12, 0, 0, 0)
+        mm_layout.setSpacing(4)
+        mm_grid = QGridLayout()
+        mm_grid.setHorizontalSpacing(8)
+        mm_grid.setVerticalSpacing(4)
+        mm_grid.addWidget(QLabel(''), 0, 0)
+        mm_grid.addWidget(QLabel('scale [—]'), 0, 1)
+        mm_grid.addWidget(QLabel('bias'), 0, 2)
+        self._act_scale_spins = {}
+        self._act_bias_spins = {}
+        for row, (key, label, bias_unit) in enumerate(self._ACT_MISMATCH_ROWS, start=1):
+            mm_grid.addWidget(QLabel(label), row, 0)
+            scale_spin = QDoubleSpinBox()
+            scale_spin.setRange(SCALE_MIN, SCALE_MAX)
+            scale_spin.setDecimals(3)
+            scale_spin.setSingleStep(0.01)
+            scale_spin.setValue(1.0)
+            scale_spin.setToolTip(f'Multiplying scale for {label} (1.0 = ideal)')
+            scale_spin.valueChanged.connect(self._on_act_mismatch_spin_changed)
+            bias_spin = QDoubleSpinBox()
+            bias_lo, bias_hi = (-1.0, 1.0) if key == 'gimbal' else (
+                (-200.0, 200.0) if key == 'thrust' else (-50.0, 50.0)
+            )
+            bias_spin.setRange(bias_lo, bias_hi)
+            bias_spin.setDecimals(4 if key == 'gimbal' else 2)
+            bias_spin.setSingleStep(0.001 if key == 'gimbal' else 0.5)
+            bias_spin.setValue(0.0)
+            bias_spin.setToolTip(f'Additive bias for {label} [{bias_unit}]')
+            bias_spin.setSuffix(f' {bias_unit}')
+            bias_spin.valueChanged.connect(self._on_act_mismatch_spin_changed)
+            mm_grid.addWidget(scale_spin, row, 1)
+            mm_grid.addWidget(bias_spin, row, 2)
+            self._act_scale_spins[key] = scale_spin
+            self._act_bias_spins[key] = bias_spin
+        mm_layout.addLayout(mm_grid)
+        mm_hint = QLabel(
+            'Pipeline: cmd → lag → scale·u+bias → thrust quantization → plant'
+        )
+        mm_hint.setWordWrap(True)
+        mm_hint.setStyleSheet('color: #555;')
+        mm_layout.addWidget(mm_hint)
+        act_layout.addWidget(self.act_mismatch_detail)
+
         self.act_thrust_quant_cb = QCheckBox('Thrust quantization (discrete steps)')
         self.act_thrust_quant_cb.setToolTip(
             'Round commanded thrust to the nearest multiple of the resolution.\n'
@@ -2572,6 +2636,20 @@ class MainWindow(QMainWindow):
             return
         self._store_actuator_config()
         self._refresh_tab_scroll_areas()
+
+    def _on_act_mismatch_enable_changed(self, _state=None):
+        on = self.act_mismatch_enable_cb.isChecked()
+        self.act_mismatch_detail.setEnabled(on)
+        self.act_mismatch_detail.setVisible(on)
+        if getattr(self, '_act_dyn_updating', False):
+            return
+        self._store_actuator_config()
+        self._refresh_tab_scroll_areas()
+
+    def _on_act_mismatch_spin_changed(self, _value=None):
+        if getattr(self, '_act_dyn_updating', False):
+            return
+        self._store_actuator_config()
 
     def _on_act_thrust_quant_changed(self, _state=None):
         on = self.act_thrust_quant_cb.isChecked()
@@ -2630,6 +2708,11 @@ class MainWindow(QMainWindow):
                 bw_spin = self._act_dyn_bw_spins[key]
                 tau_spin.setValue(tau)
                 bw_spin.setValue(tau_to_bandwidth_hz(tau))
+            if hasattr(self, '_act_scale_spins'):
+                for key, spin in self._act_scale_spins.items():
+                    spin.setValue(float(act.get(f'scale_{key}', 1.0)))
+                for key, spin in self._act_bias_spins.items():
+                    spin.setValue(float(act.get(f'bias_{key}', 0.0)))
         finally:
             self._act_dyn_updating = False
 
@@ -2642,6 +2725,12 @@ class MainWindow(QMainWindow):
         act['thrust_resolution_N'] = float(self.act_thrust_resolution_spin.value())
         for key, tau_spin in self._act_dyn_tau_spins.items():
             act[key] = float(tau_spin.value())
+        if hasattr(self, 'act_mismatch_enable_cb'):
+            act['mismatch_enable'] = self.act_mismatch_enable_cb.isChecked()
+            for key, spin in self._act_scale_spins.items():
+                act[f'scale_{key}'] = float(spin.value())
+            for key, spin in self._act_bias_spins.items():
+                act[f'bias_{key}'] = float(spin.value())
 
     def _apply_actuator_config(self, cfg=None):
         if not hasattr(self, 'act_dyn_enable_cb'):
@@ -2661,6 +2750,10 @@ class MainWindow(QMainWindow):
         act['tau_gimbal'] = float(raw.get('tau_gimbal', 0.05))
         act['tau_thrust'] = float(raw.get('tau_thrust', 0.05))
         act['tau_yaw_torque'] = float(raw.get('tau_yaw_torque', 0.05))
+        act['mismatch_enable'] = bool(raw.get('mismatch_enable', False))
+        for key in ('gimbal', 'thrust', 'yaw_torque'):
+            act[f'scale_{key}'] = float(raw.get(f'scale_{key}', 1.0))
+            act[f'bias_{key}'] = float(raw.get(f'bias_{key}', 0.0))
         # Commit desired config first, then push into widgets under a guard so
         # checkbox/spin signals cannot overwrite with stale spin values.
         self._tracking_config['actuator'] = act
@@ -2673,6 +2766,12 @@ class MainWindow(QMainWindow):
             self.act_thrust_resolution_spin.setValue(act['thrust_resolution_N'])
             self.act_dyn_enable_cb.setChecked(act['enabled'])
             self.act_thrust_quant_cb.setChecked(act['thrust_quant_enabled'])
+            if hasattr(self, 'act_mismatch_enable_cb'):
+                self.act_mismatch_enable_cb.setChecked(act['mismatch_enable'])
+                for key, spin in self._act_scale_spins.items():
+                    spin.setValue(float(act.get(f'scale_{key}', 1.0)))
+                for key, spin in self._act_bias_spins.items():
+                    spin.setValue(float(act.get(f'bias_{key}', 0.0)))
         finally:
             self._act_dyn_updating = False
         # Re-assert stored config (signals may have run during setChecked).
@@ -2680,6 +2779,9 @@ class MainWindow(QMainWindow):
         self.act_dyn_lag_detail.setEnabled(act['enabled'])
         self.act_dyn_lag_detail.setVisible(act['enabled'])
         self.act_thrust_resolution_spin.setEnabled(act['thrust_quant_enabled'])
+        if hasattr(self, 'act_mismatch_detail'):
+            self.act_mismatch_detail.setEnabled(act['mismatch_enable'])
+            self.act_mismatch_detail.setVisible(act['mismatch_enable'])
 
     def _actuator_params_for_sim(self):
         act = self._tracking_config.get('actuator') or default_actuator_tracking_config()
@@ -2690,6 +2792,13 @@ class MainWindow(QMainWindow):
             'tau_gimbal': float(act.get('tau_gimbal', 0.05)),
             'tau_thrust': float(act.get('tau_thrust', 0.05)),
             'tau_yaw_torque': float(act.get('tau_yaw_torque', 0.05)),
+            'mismatch_enable': bool(act.get('mismatch_enable', False)),
+            'scale_gimbal': float(act.get('scale_gimbal', 1.0)),
+            'bias_gimbal': float(act.get('bias_gimbal', 0.0)),
+            'scale_thrust': float(act.get('scale_thrust', 1.0)),
+            'bias_thrust': float(act.get('bias_thrust', 0.0)),
+            'scale_yaw_torque': float(act.get('scale_yaw_torque', 1.0)),
+            'bias_yaw_torque': float(act.get('bias_yaw_torque', 0.0)),
         }
 
     def _migrate_actuator_from_controller_params(self, cfg):
@@ -2702,6 +2811,7 @@ class MainWindow(QMainWindow):
                 continue
             if not any(k in raw for k in (
                 'act_dyn_enable', 'act_dyn_gimbal', 'act_dyn_thrust', 'act_dyn_yaw', 'tau_gimbal',
+                'mismatch_enable', 'scale_thrust', 'bias_thrust',
             )):
                 continue
             act = default_actuator_tracking_config()
@@ -2712,6 +2822,10 @@ class MainWindow(QMainWindow):
             act['tau_gimbal'] = float(raw.get('tau_gimbal', 0.05))
             act['tau_thrust'] = float(raw.get('tau_thrust', 0.05))
             act['tau_yaw_torque'] = float(raw.get('tau_yaw_torque', 0.05))
+            act['mismatch_enable'] = bool(raw.get('mismatch_enable', False))
+            for key in ('gimbal', 'thrust', 'yaw_torque'):
+                act[f'scale_{key}'] = float(raw.get(f'scale_{key}', 1.0))
+                act[f'bias_{key}'] = float(raw.get(f'bias_{key}', 0.0))
             return act
         return default_actuator_tracking_config()
 

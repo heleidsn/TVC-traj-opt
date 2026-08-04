@@ -54,6 +54,33 @@ Both are now available in the numerical simulator (`ActuatorDynamics`) and in th
 
 *(Insert: thrust staircase plot + position tracking overlay with / without quantization.)*
 
+### 1.2.1 Thrust scale/bias mismatch → altitude static error; I fixes it
+
+In the simulator we can model commanded-vs-plant thrust mismatch as a persistent calibration error:
+
+\[
+T_\mathrm{plant} = \mathrm{scale}\cdot T_\mathrm{lag} + \mathrm{bias}.
+\]
+
+For small tilt near hover, vertical dynamics are approximately:
+
+\[
+m\ddot{z} \approx T_\mathrm{plant} - mg,
+\]
+so a nonzero bias (and/or a scale error that breaks the assumed hover-thrust mapping) behaves like a **constant DC disturbance** in the vertical channel.
+
+In the current controller (PX4-style cascade implemented in `PX4CascadeTracker`), the Z path is:
+
+* Position outer loop: **P only** (`Kp_pos_z`)
+* Velocity Z loop: **PID** with an integral term (`Ki_vel_z`)
+
+Therefore:
+
+* If the velocity-loop integral is weak/disabled (`Ki_vel_z` small or 0), the controller cannot fully reject a constant thrust disturbance, and the system settles at a shifted equilibrium → **static altitude/position error** appears.
+* Increasing `Ki_vel_z` adds integral action (vertical loop becomes effectively “type-1” for the DC disturbance), allowing the integrator to accumulate the velocity error until the commanded thrust is adjusted to the mismatch-compensated value → **steady-state error is driven back to ~0** (matching your observation).
+
+**Takeaway:** thrust scale/bias mismatch primarily shows up as a **steady-state vertical equilibrium error**; an integrator in the velocity (height) loop is the correct mechanism to remove it (at the cost of slower convergence and potential windup if saturations occur).
+
 ---
 
 ## 1.3 Thrust dynamics — first-order simplification & bandwidth sweep
