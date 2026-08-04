@@ -9,12 +9,13 @@
 
 1. Motivation & simulation setup  
 2. Thrust uncertainty / quantization (error tolerance)  
-3. Actuator bandwidth vs. stability margins — **rate loop example** (1 / 3 / 5 Hz)  
-4. Retuning under slow actuators (1 Hz) — what you gain and what you lose  
-5. Takeaway: faster actuators enable higher control bandwidth  
-6. Why thrust BW can be lower than TVC/attitude BW (plant order + cascade)  
-7. Online trajectory replanning on Jetson  
-8. Summary & next steps  
+3. Thrust channel: first-order model (local closed loop) & bandwidth sweep (1 → 0.2 Hz)  
+4. Actuator bandwidth vs. stability margins — **rate / gimbal example** (1 / 3 / 5 Hz)  
+5. Retuning under slow actuators (1 Hz) — what you gain and what you lose  
+6. Takeaway: faster actuators enable higher control bandwidth  
+7. Why thrust BW can be lower than TVC/attitude BW (plant order + cascade)  
+8. Online trajectory replanning on Jetson  
+9. Summary & next steps  
 
 ---
 
@@ -55,26 +56,63 @@ Both are now available in the numerical simulator (`ActuatorDynamics`) and in th
 
 ---
 
-## 1.3 Actuator bandwidth — first-order lag model
+## 1.3 Thrust dynamics — first-order simplification & bandwidth sweep
 
-Each channel (gimbal, thrust, yaw torque) is modeled as:
+### Why a first-order model is used here
+
+A small liquid rocket engine typically has its **own local closed-loop control** (valve / chamber-pressure / thrust regulation).  
+From the **vehicle-level** cascade (position → velocity → thrust command), that inner loop compresses much of the fast valve–plumbing–combustion physics into an **equivalent low-pass response**.
+
+Therefore, in this study we **do not** model the full engine physics. We approximate the thrust channel seen by the flight controller as a **first-order lag**:
+
+\[
+G_T(s)=\frac{1}{\tau_T s+1},\qquad
+f_{c,T}=\frac{1}{2\pi\tau_T}.
+\]
+
+This is a standard control-oriented reduction: adequate when the vehicle vertical loops are much slower than the engine’s local loop, and when step responses show little overshoot.
+
+### Closed-loop tracking sweep (thrust bandwidth)
+
+With the vehicle controller gains fixed, we enabled thrust lag only and swept bandwidth:
+
+| Thrust \(f_{c,T}\) | \(\tau_T\) (approx.) | Closed-loop tracking observation |
+|--------------------|----------------------|----------------------------------|
+| **1.0 Hz** | ≈ 0.159 s | Acceptable — no clear oscillation |
+| **0.5 Hz** | ≈ 0.318 s | Still acceptable |
+| **0.3 Hz** | ≈ 0.531 s | Degraded / sluggish, not yet strongly oscillatory |
+| **0.2 Hz** | ≈ 0.796 s | **Clear control oscillation** appears |
+
+**Slide message:**  
+> Because the engine already has a local closed loop, vehicle-level thrust is modeled as **first-order**.  
+> Under our cascade gains, vertical tracking stays usable down through ~0.3 Hz; **obvious oscillation shows up at ~0.2 Hz**.  
+> This supports the claim that **thrust can tolerate much lower bandwidth than the TVC/attitude path** (cf. §1.8).
+
+*(Insert: altitude / \(v_z\) / thrust cmd-vs-act time histories for 1.0, 0.5, 0.3, 0.2 Hz.)*
+
+---
+
+## 1.4 Actuator bandwidth — first-order lag model (all channels)
+
+Each channel (gimbal, thrust, yaw torque) uses the same first-order form in simulation:
 
 \[
 G_\mathrm{act}(s)=\frac{1}{\tau s+1},\qquad
 f_c=\frac{1}{2\pi\tau}\quad\text{(−3 dB bandwidth)}
 \]
 
-| \(f_c\) | \(\tau\) |
-|---------|----------|
-| 1 Hz | ≈ 0.159 s |
-| 3 Hz | ≈ 0.053 s |
-| 5 Hz | ≈ 0.032 s |
+| \(f_c\) | \(\tau\) | Typical use in this work |
+|---------|----------|---------------------------|
+| 5 Hz | ≈ 0.032 s | Fast gimbal reference |
+| 3 Hz | ≈ 0.053 s | Mid gimbal |
+| 1 Hz | ≈ 0.159 s | Slow gimbal / nominal thrust start of sweep |
+| 0.5–0.2 Hz | ≈ 0.32–0.80 s | **Thrust-only stress test** (see §1.3) |
 
-Lag adds **extra phase lag** near the loop gain crossover → **phase margin (PM) drops**.
+Lag adds **extra phase lag** near the loop gain crossover → **phase margin (PM) drops** (especially critical on the **rate / gimbal** channel).
 
 ---
 
-## 1.4 Rate loop example — PM loss vs. actuator bandwidth
+## 1.5 Rate loop example — PM loss vs. actuator bandwidth
 
 ### Ideal rate open-loop (after plant / allocation cancellation)
 
@@ -109,7 +147,7 @@ L_\mathrm{rate}(s)=\frac{K_p}{s(\tau s+1)}
 
 ---
 
-## 1.5 If the actuator is only ~1 Hz — retune gains to recover PM
+## 1.6 If the actuator is only ~1 Hz — retune gains to recover PM
 
 To restore adequate PM under \(f_c=1\,\mathrm{Hz}\), **reduce rate \(K_p\)** (move \(\omega_{\mathrm{gc}}\) down, away from the lag corner).
 
@@ -133,7 +171,7 @@ To restore adequate PM under \(f_c=1\,\mathrm{Hz}\), **reduce rate \(K_p\)** (mo
 
 ---
 
-## 1.6 Cascade implication — we want actuators as fast as possible
+## 1.7 Cascade implication — we want actuators as fast as possible
 
 Design rule of thumb for nested loops:
 
@@ -163,7 +201,7 @@ If gimbal \(f_c\) is low:
 
 ---
 
-## 1.7 Why thrust can run at lower bandwidth than TVC / attitude
+## 1.8 Why thrust can run at lower bandwidth than TVC / attitude
 
 ### Plant order (actuator → position)
 
@@ -189,16 +227,19 @@ If gimbal \(f_c\) is low:
 
 **Caveat:** Raising Vel\(_z\) / Pos\(_z\) aggressively will also demand higher thrust bandwidth — the structural relief is not unlimited.
 
+**Link to §1.3:** The closed-loop sweep (usable to ~0.3 Hz, oscillatory at **0.2 Hz**) is consistent with a low-bandwidth vertical path: thrust \(f_c\) can sit far below gimbal \(f_c\) before the vehicle-level controller breaks.
+
 ---
 
-## 1.8 Part 1 — summary bullets (copy onto closing slide)
+## 1.9 Part 1 — summary bullets (copy onto closing slide)
 
 1. Simulate with **thrust quantization + first-order actuator lag**.  
 2. Quantization: tolerable on tested trajectories; **calibration bias** is the critical uncertainty.  
-3. Rate loop: slower \(f_c\) (1 vs 3 vs 5 Hz) → large **PM loss** at fixed gains.  
-4. At 1 Hz, recovering PM requires **lower \(K_p\)** → whole cascade slows down.  
-5. Prefer **faster actuators** to unlock higher cascade bandwidth.  
-6. Thrust BW requirement is **structurally lower** than TVC/attitude BW (2nd-order vertical vs 4th-order horizontal cascade).
+3. **Thrust:** engine local closed loop → model as **first-order**; sweep \(f_{c,T}=1 / 0.5 / 0.3 / 0.2\,\mathrm{Hz}\); **clear oscillation at 0.2 Hz**.  
+4. Rate / gimbal: slower \(f_c\) (1 vs 3 vs 5 Hz) → large **PM loss** at fixed gains.  
+5. At slow gimbal BW, recovering PM requires **lower \(K_p\)** → whole cascade slows down.  
+6. Prefer **faster actuators** to unlock higher cascade bandwidth.  
+7. Thrust BW requirement is **structurally lower** than TVC/attitude BW (2nd-order vertical vs 4th-order horizontal cascade).
 
 ---
 
@@ -267,7 +308,9 @@ Desktop vs Jetson:
 | Theme | Key result |
 |-------|------------|
 | Thrust uncertainty | Quantization OK for gentle trajs; **calibrate** thrust |
-| Actuator BW | 1 Hz gimbal destroys rate PM unless gains drop |
+| Thrust dynamics model | Engine local CL → **1st-order** \(G_T=1/(\tau_T s+1)\) |
+| Thrust BW sweep | 1 / 0.5 / 0.3 Hz OK; **oscillation at 0.2 Hz** |
+| Gimbal / rate BW | 1 Hz gimbal destroys rate PM unless gains drop |
 | Retuning | Lower gains recover PM but **slow the whole cascade** |
 | Design preference | **Faster actuators → higher control bandwidth** |
 | Thrust vs TVC BW | Vertical 2nd-order vs horizontal 4th-order cascade |
