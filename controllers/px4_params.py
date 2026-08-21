@@ -276,6 +276,10 @@ def normalize_px4_params(raw: Dict[str, Any]) -> Dict[str, Any]:
         'Ki_rate_roll': kirr, 'Ki_rate_pitch': kirp,
         'Kd_rate_roll': kdrr, 'Kd_rate_pitch': kdrp,
     })
+    if 'nmp_vel_limit_m_s' in p:
+        out['vel_limit_m_s'] = float(p['nmp_vel_limit_m_s'])
+    if 'nmp_rate_limit_deg_s' in p:
+        out['rate_limit_rad_s'] = float(p['nmp_rate_limit_deg_s']) * _DEG
     return out
 
 

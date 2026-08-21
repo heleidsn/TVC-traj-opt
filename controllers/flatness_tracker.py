@@ -63,6 +63,17 @@ class FlatnessCascadeTracker:
         """Numerical derivatives of stored flat samples via ``np.gradient``."""
         t = np.asarray(self._flat['t'], dtype=float)
         t_q = float(np.clip(t_query, t[0], t[-1]))
+        if bool(self._flat.get('piecewise_constant', False)):
+            return {
+                'xi_x': float(np.interp(t_q, t, np.asarray(self._flat['xi_x'], dtype=float))),
+                'dxi_x': 0.0, 'ddxi_x': 0.0, 'dddxi_x': 0.0, 'ddddxi_x': 0.0,
+                'xi_y': float(np.interp(t_q, t, np.asarray(self._flat['xi_y'], dtype=float))),
+                'dxi_y': 0.0, 'ddxi_y': 0.0, 'dddxi_y': 0.0, 'ddddxi_y': 0.0,
+                'z': float(np.interp(t_q, t, np.asarray(self._flat['z'], dtype=float))),
+                'dz': 0.0, 'ddz': 0.0,
+                'psi': float(np.interp(t_q, t, np.asarray(self._flat['psi'], dtype=float))),
+                'dpsi': 0.0, 'ddpsi': 0.0,
+            }
 
         def series_deriv(key, order):
             v = np.asarray(self._flat[key], dtype=float)
@@ -180,6 +191,15 @@ class FlatnessCascadeTracker:
         """
         Cascade on ξ with optional flatness feedforward.
 
+        The position/velocity loop closes once, on the measured ξ (not COM);
+        its acceleration command goes straight into the attitude/rate/actuator
+        stage. It must NOT be re-run through ``PX4CascadeTracker.compute``,
+        which would re-close a second position loop on the *measured COM* —
+        that second, COM-based loop dominates the first (its error is nearly
+        identical to plain COM tracking error, since the ξ-COM gap is only a
+        few cm), which is why ξ mode used to look almost indistinguishable
+        from COM mode.
+
         Returns (u_lqr, cascade_signals) like :class:`PX4CascadeTracker`.
         """
         del acc_ref
@@ -200,43 +220,28 @@ class FlatnessCascadeTracker:
             d['xi_y'] - meas['xi_y'],
             d['z'] - meas['z'],
         ], dtype=float)
-        # Nominal dynamics are in flatness feedforward; feedback only closes ξ error.
-        acc_ff = np.zeros(3, dtype=float)
-
-        g = self.cascade.gains
         dt = max(float(dt), 1e-6)
-        qx, qy, qz = x12[6:9]
-        p, q_rate, r = x12[9:12]
-        pitch = float(2.0 * qy)
-        roll = float(2.0 * qx)
-        yaw = float(2.0 * qz)
-        yaw_sp = float(d['psi'])
-
-        ax = self.cascade._pos_vel_axis(
+        g = self.cascade.gains
+        acc_ff = np.array([d['ddxi_x'], d['ddxi_y'], d['ddz']], dtype=float)
+        ddxi_x_cmd = self.cascade._pos_vel_axis(
             0, pos_err[0], meas['dxi_x'], d['dxi_x'], acc_ff[0], dt, xy=True,
         )
-        ay = self.cascade._pos_vel_axis(
+        ddxi_y_cmd = self.cascade._pos_vel_axis(
             1, pos_err[1], meas['dxi_y'], d['dxi_y'], acc_ff[1], dt, xy=True,
         )
-        az = self.cascade._pos_vel_axis(
+        ddz_cmd = self.cascade._pos_vel_axis(
             2, pos_err[2], meas['dz'], d['dz'], acc_ff[2], dt, xy=False,
         )
-
-        roll_sp, pitch_sp = self.cascade._tilt_sp_from_acc(ax, ay, g['tilt_max'])
-        angacc_x, rate_sp_p = self.cascade._att_rate_axis(
-            'roll', roll_sp - roll, p, dt,
-            g['Kp_att_roll_deg'],
-            (g['Kp_rate_roll'], g['Ki_rate_roll'], g['Kd_rate_roll']),
-        )
-        angacc_y, rate_sp_q = self.cascade._att_rate_axis(
-            'pitch', pitch_sp - pitch, q_rate, dt,
-            g['Kp_att_pitch_deg'],
-            (g['Kp_rate_pitch'], g['Ki_rate_pitch'], g['Kd_rate_pitch']),
-        )
-        angacc_z, rate_sp_r = self.cascade._att_rate_axis(
-            'yaw', yaw_sp - yaw, r, dt,
-            g['Kp_att_yaw_deg'],
-            (g['Kp_rate_yaw'], g['Ki_rate_yaw'], g['Kd_rate_yaw']),
+        # Flatness inversion at the *commanded* (feedback-inclusive) acceleration
+        # gives the snap-based non-minimum-phase feedforward term (u_opt_ff);
+        # the COM state it also returns is not used — attitude comes from
+        # ddxi/ddz directly below.
+        _, u_opt_ff = flat_state_control_at(
+            self.fp,
+            d['xi_x'], d['dxi_x'], ddxi_x_cmd, d.get('dddxi_x', 0.0), d.get('ddddxi_x', 0.0),
+            d['xi_y'], d['dxi_y'], ddxi_y_cmd, d.get('dddxi_y', 0.0), d.get('ddddxi_y', 0.0),
+            d['z'], d['dz'], ddz_cmd,
+            d['psi'], d['dpsi'], d.get('ddpsi', 0.0),
         )
 
         vel_sp = np.array([
@@ -244,19 +249,31 @@ class FlatnessCascadeTracker:
             g['Kp_pos_xy'] * pos_err[1] + d['dxi_y'],
             g['Kp_pos_z'] * pos_err[2] + d['dz'],
         ], dtype=float)
-        signals = {
-            'pos': np.array([d['xi_x'], d['xi_y'], d['z']], dtype=float),
-            'vel': vel_sp,
-            'att_rad': np.array([roll_sp, pitch_sp, yaw_sp], dtype=float),
-            'rate_rad_s': np.array([rate_sp_p, rate_sp_q, rate_sp_r], dtype=float),
-        }
+        vel_lim = g.get('vel_limit_m_s')
+        if vel_lim is not None and float(vel_lim) > 0.0:
+            vel_sp = np.clip(vel_sp, -float(vel_lim), float(vel_lim))
 
-        if use_ff and u_ff is None:
-            u_ff = self.planned_feedforward_lqr_at(ref, t_q)
+        if use_ff:
+            u_ff = control_opt_to_lqr(u_opt_ff, self.mass, self.g)
 
+        roll = float(2.0 * x12[6])
+        pitch = float(2.0 * x12[7])
+        yaw = float(2.0 * np.arcsin(np.clip(x12[8], -1.0, 1.0)))
+        p, q_rate, r = float(x12[9]), float(x12[10]), float(x12[11])
+
+        angacc_x, angacc_y, angacc_z, az, att_sp, rate_sp = self.cascade._attitude_from_acc(
+            roll, pitch, yaw, p, q_rate, r,
+            ddxi_x_cmd, ddxi_y_cmd, ddz_cmd, float(d['psi']), dt,
+        )
         u = self.cascade._actuators_from_angacc(
             angacc_x, angacc_y, angacc_z, az, u_ff=u_ff, use_ff=use_ff,
         )
+        signals = {
+            'pos': np.array([d['xi_x'], d['xi_y'], d['z']], dtype=float),
+            'vel': vel_sp,
+            'att_rad': att_sp,
+            'rate_rad_s': rate_sp,
+        }
         return u, signals
 
 

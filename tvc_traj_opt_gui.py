@@ -40,6 +40,11 @@ LEFT_STATUS_TEXT_HEIGHT = 72
 DEFAULT_TRAJ_CSV_DIR = os.path.join(ROOT_DIR, 'trajs')
 DEFAULT_TRAJ_CSV_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'latest.csv')
 DEFAULT_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'saved_waypoints.json')
+NMP_SAVED_WAYPOINTS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'nmp_saved_waypoints.json')
+NMP_MODEL_PARAMS_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'nmp_model_params.json')
+NMP_MODEL_PARAM_KEYS = (
+    'mass', 'Ixx', 'Iyy', 'Izz', 'r_thrust_z', 'body_length', 'com_from_bottom',
+)
 CONTROLLERS_DIR = os.path.join(ROOT_DIR, 'controllers')
 DEFAULT_TRACKING_PARAMS_PATH = os.path.join(CONTROLLERS_DIR, 'tracking_params.json')
 DEFAULT_TRACKING_GIF_PATH = os.path.join(DEFAULT_TRAJ_CSV_DIR, 'tracking_anim.gif')
@@ -121,13 +126,26 @@ from tvc_traj_gui_tracking import (
     tracking_summary_text,
 )
 from tvc_traj_gui_nmp import build_nmp_series, draw_nmp_panels, nmp_axes_dict
+from tvc_traj_gui_margins import draw_stability_margins_panels
+from controllers.stability_margins import (
+    AXIS_PITCH,
+    LOOP_ATTITUDE,
+    LOOP_IDS,
+    LOOP_POSITION,
+    LOOP_RATE,
+    LOOP_VELOCITY,
+    analyze_all_loops,
+)
 from controllers.actuator_dynamics import (
     BW_MAX_HZ,
     BW_MIN_HZ,
+    SCALE_MAX,
+    SCALE_MIN,
     TAU_MAX,
     TAU_MIN,
     THRUST_RES_MAX,
     THRUST_RES_MIN,
+    actuator_config_from_params,
     bandwidth_hz_to_tau,
     default_actuator_tracking_config,
     default_thrust_resolution_for_platform,
@@ -144,14 +162,17 @@ from controllers.params import (
     SIM_NUMERICAL,
     SIM_SITL,
     all_default_tracking_config,
+    default_controller_params_map,
     default_numerical_sim_config,
     default_params_for,
     migrate_numerical_sim_config,
-    strip_legacy_tracking_options,
+    migrate_params_by_platform,
+    params_map_for_platform,
 )
 from controllers.param_groups import param_groups_for
 from controllers.px4_params import migrate_px4_params
 from controllers.simulator import run_tracking_simulation
+from controllers.waypoint_ref import build_waypoint_flight_reference
 from controllers.acados_nmpc_tracker import acados_nmpc_available
 from controllers.px4_tune import (
     TUNE_LEVEL_LABELS,
@@ -168,6 +189,7 @@ from tvc_rocket_platforms import (
     normalize_platform_id,
     constraint_spin_ranges,
     physics_spin_ranges,
+    rocket_visual_geometry,
     sitl_launch_kwargs,
     platform_description,
     platform_label,
@@ -577,6 +599,50 @@ class _SavedCostLogger:
 def nominal_segment_duration(dt, N):
     """Default leg duration [s] when adding a waypoint (dt × N)."""
     return float(dt) * int(N)
+
+
+def _load_nmp_waypoints_from_file(path):
+    """Return normalized waypoint rows from a saved NMP waypoints JSON file, or None."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = data.get('waypoints', data if isinstance(data, list) else [])
+    if not raw:
+        return None
+    return [_normalize_waypoint_row(w) for w in raw]
+
+
+def _load_nmp_model_overrides():
+    """Return {platform_id: {mass, Ixx, Iyy, Izz, r_thrust_z, body_length,
+    com_from_bottom}} saved overrides for the NMP tab, or {}."""
+    if not os.path.isfile(NMP_MODEL_PARAMS_PATH):
+        return {}
+    try:
+        with open(NMP_MODEL_PARAMS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for pid in (PLATFORM_PROXY, PLATFORM_REAL):
+        entry = data.get(pid)
+        if not isinstance(entry, dict):
+            continue
+        row = {}
+        for key in NMP_MODEL_PARAM_KEYS:
+            if key in entry:
+                try:
+                    row[key] = float(entry[key])
+                except (TypeError, ValueError):
+                    pass
+        if row:
+            out[pid] = row
+    return out
 
 
 def waypoints_to_json_list(waypoints):
@@ -1260,7 +1326,7 @@ class TrackingSimulationThread(QThread):
 
     def __init__(
         self, xs, us, time_states, controller_id, params, phy_gui,
-        flat_outputs=None, flatness_physics=None,
+        flat_outputs=None, flatness_physics=None, x0=None,
     ):
         super().__init__()
         self.xs = xs
@@ -1271,6 +1337,7 @@ class TrackingSimulationThread(QThread):
         self.phy_gui = dict(phy_gui)
         self.flat_outputs = flat_outputs
         self.flatness_physics = flatness_physics
+        self.x0 = x0
 
     def run(self):
         try:
@@ -1281,6 +1348,7 @@ class TrackingSimulationThread(QThread):
                 self.controller_id,
                 self.params,
                 self.phy_gui,
+                x0=self.x0,
                 flat_outputs=self.flat_outputs,
                 flatness_physics=self.flatness_physics,
             )
@@ -1342,16 +1410,18 @@ class NmpPlanningThread(QThread):
 
 
 class TrackingGifThread(QThread):
-    """Background 3D tracking GIF renderer."""
+    """Background tracking GIF renderer (3D or 2D)."""
 
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, result, plan, output_path):
+    def __init__(self, result, plan, output_path, view_mode='3d', playback_speed=1.0):
         super().__init__()
         self.result = result
         self.plan = plan
         self.output_path = output_path
+        self.view_mode = view_mode
+        self.playback_speed = float(playback_speed)
 
     def run(self):
         try:
@@ -1360,6 +1430,8 @@ class TrackingGifThread(QThread):
                 self.result,
                 self.plan,
                 output_path=self.output_path,
+                view_mode=self.view_mode,
+                playback_speed=self.playback_speed,
             )
             self.finished.emit(path)
         except Exception as e:
@@ -1408,15 +1480,21 @@ class MainWindow(QMainWindow):
         self._tracking_gif_thread = None
         self._tracking_gif_movie = None
         self._tracking_gif_path = DEFAULT_TRACKING_GIF_PATH
+        self._tracking_gif_regen_pending = False
         self._last_tracking_result = None
         self.nmp_last_trajectory = None
         self._nmp_plan_thread = None
-        self.nmp_waypoints = [
+        self._nmp_tracking_sim_thread = None
+        self._nmp_last_tracking_result = None
+        self._nmp_active_tracking_traj = None
+        self.nmp_waypoints = _load_nmp_waypoints_from_file(NMP_SAVED_WAYPOINTS_PATH) or [
             [0.0, 0.0, 0.0, 0.0, 0.0],
             [1.0, 0.0, 1.0, 0.0, 5.0],
         ]
         self._nmp_waypoint_table_updating = False
         self._nmp_platform_guard = False
+        self._cached_nmp_platform_id = PLATFORM_PROXY
+        self._nmp_model_overrides = _load_nmp_model_overrides()
         self.init_ui()
         self._update_params_file_label()
         if os.path.isfile(self.params_file_path):
@@ -2364,11 +2442,15 @@ class MainWindow(QMainWindow):
         section_layout.addWidget(inner)
         parent_layout.addWidget(section)
 
-        state = {'open': bool(expanded)}
+        state = {'open': bool(expanded), 'title': str(title)}
 
         def _sync_header():
             arrow = '▾' if state['open'] else '▸'
-            header_btn.setText(f'{arrow}  {title}')
+            header_btn.setText(f'{arrow}  {state["title"]}')
+
+        def _set_title(new_title):
+            state['title'] = str(new_title)
+            _sync_header()
 
         def _toggle():
             state['open'] = not state['open']
@@ -2376,11 +2458,18 @@ class MainWindow(QMainWindow):
             inner.setMaximumHeight(16777215 if state['open'] else 0)
             _sync_header()
             self._refresh_tab_scroll_areas()
+            if state['open']:
+                # Nested scroll areas report a stale sizeHint the instant they're
+                # unhidden (Qt hasn't laid them out while hidden); redo the geometry
+                # pass once the event loop catches up so the section doesn't stay
+                # clipped on its first expansion.
+                QTimer.singleShot(0, self._refresh_tab_scroll_areas)
 
         header_btn.clicked.connect(_toggle)
         _sync_header()
         inner.setVisible(expanded)
         inner.setMaximumHeight(16777215 if expanded else 0)
+        section._tvc_set_title = _set_title
 
         return section, inner_layout
 
@@ -2390,8 +2479,14 @@ class MainWindow(QMainWindow):
         ('tau_yaw_torque', 'Yaw torque'),
     )
 
+    _ACT_MISMATCH_ROWS = (
+        ('gimbal', 'Gimbal (th_p, th_r)', 'rad'),
+        ('thrust', 'Thrust', 'N'),
+        ('yaw_torque', 'Yaw torque', 'N·m'),
+    )
+
     def _create_actuator_dynamics_panel(self, parent_layout):
-        """Actuator lag and thrust quantization (numerical simulation only)."""
+        """Actuator lag, scale/bias mismatch, and thrust quantization."""
         self.actuator_dynamics_group = QGroupBox('Actuator dynamics')
         act_group = self.actuator_dynamics_group
         act_layout = QVBoxLayout(act_group)
@@ -2444,6 +2539,62 @@ class MainWindow(QMainWindow):
         lag_layout.addWidget(lag_hint)
         act_layout.addWidget(self.act_dyn_lag_detail)
 
+        # Scale / bias mismatch (error tolerance tests)
+        self.act_mismatch_enable_cb = QCheckBox('Enable scale / bias mismatch')
+        self.act_mismatch_enable_cb.setToolTip(
+            'Plant-side calibration error after lag:\n'
+            '  u_plant = scale · u_lag + bias\n'
+            'Gimbal scale/bias applies to both th_p and th_r.\n'
+            'Use for thrust / gimbal / yaw-torque error-tolerance sweeps.'
+        )
+        self.act_mismatch_enable_cb.stateChanged.connect(self._on_act_mismatch_enable_changed)
+        act_layout.addWidget(self.act_mismatch_enable_cb)
+
+        self.act_mismatch_detail = QWidget()
+        mm_layout = QVBoxLayout(self.act_mismatch_detail)
+        mm_layout.setContentsMargins(12, 0, 0, 0)
+        mm_layout.setSpacing(4)
+        mm_grid = QGridLayout()
+        mm_grid.setHorizontalSpacing(8)
+        mm_grid.setVerticalSpacing(4)
+        mm_grid.addWidget(QLabel(''), 0, 0)
+        mm_grid.addWidget(QLabel('scale [—]'), 0, 1)
+        mm_grid.addWidget(QLabel('bias'), 0, 2)
+        self._act_scale_spins = {}
+        self._act_bias_spins = {}
+        for row, (key, label, bias_unit) in enumerate(self._ACT_MISMATCH_ROWS, start=1):
+            mm_grid.addWidget(QLabel(label), row, 0)
+            scale_spin = QDoubleSpinBox()
+            scale_spin.setRange(SCALE_MIN, SCALE_MAX)
+            scale_spin.setDecimals(3)
+            scale_spin.setSingleStep(0.01)
+            scale_spin.setValue(1.0)
+            scale_spin.setToolTip(f'Multiplying scale for {label} (1.0 = ideal)')
+            scale_spin.valueChanged.connect(self._on_act_mismatch_spin_changed)
+            bias_spin = QDoubleSpinBox()
+            bias_lo, bias_hi = (-1.0, 1.0) if key == 'gimbal' else (
+                (-200.0, 200.0) if key == 'thrust' else (-50.0, 50.0)
+            )
+            bias_spin.setRange(bias_lo, bias_hi)
+            bias_spin.setDecimals(4 if key == 'gimbal' else 2)
+            bias_spin.setSingleStep(0.001 if key == 'gimbal' else 0.5)
+            bias_spin.setValue(0.0)
+            bias_spin.setToolTip(f'Additive bias for {label} [{bias_unit}]')
+            bias_spin.setSuffix(f' {bias_unit}')
+            bias_spin.valueChanged.connect(self._on_act_mismatch_spin_changed)
+            mm_grid.addWidget(scale_spin, row, 1)
+            mm_grid.addWidget(bias_spin, row, 2)
+            self._act_scale_spins[key] = scale_spin
+            self._act_bias_spins[key] = bias_spin
+        mm_layout.addLayout(mm_grid)
+        mm_hint = QLabel(
+            'Pipeline: cmd → lag → scale·u+bias → thrust quantization → plant'
+        )
+        mm_hint.setWordWrap(True)
+        mm_hint.setStyleSheet('color: #555;')
+        mm_layout.addWidget(mm_hint)
+        act_layout.addWidget(self.act_mismatch_detail)
+
         self.act_thrust_quant_cb = QCheckBox('Thrust quantization (discrete steps)')
         self.act_thrust_quant_cb.setToolTip(
             'Round commanded thrust to the nearest multiple of the resolution.\n'
@@ -2481,23 +2632,41 @@ class MainWindow(QMainWindow):
         enabled = self.act_dyn_enable_cb.isChecked()
         self.act_dyn_lag_detail.setEnabled(enabled)
         self.act_dyn_lag_detail.setVisible(enabled)
+        if getattr(self, '_act_dyn_updating', False):
+            return
         self._store_actuator_config()
         self._refresh_tab_scroll_areas()
+
+    def _on_act_mismatch_enable_changed(self, _state=None):
+        on = self.act_mismatch_enable_cb.isChecked()
+        self.act_mismatch_detail.setEnabled(on)
+        self.act_mismatch_detail.setVisible(on)
+        if getattr(self, '_act_dyn_updating', False):
+            return
+        self._store_actuator_config()
+        self._refresh_tab_scroll_areas()
+
+    def _on_act_mismatch_spin_changed(self, _value=None):
+        if getattr(self, '_act_dyn_updating', False):
+            return
+        self._store_actuator_config()
 
     def _on_act_thrust_quant_changed(self, _state=None):
         on = self.act_thrust_quant_cb.isChecked()
         self.act_thrust_resolution_spin.setEnabled(on)
+        if getattr(self, '_act_dyn_updating', False):
+            return
         self._store_actuator_config()
         self._refresh_tab_scroll_areas()
 
     def _on_act_thrust_resolution_changed(self, _value=None):
-        if self._act_dyn_updating:
+        if getattr(self, '_act_dyn_updating', False):
             return
         act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
         act['thrust_resolution_N'] = float(self.act_thrust_resolution_spin.value())
 
     def _on_act_dyn_tau_changed(self, key):
-        if self._act_dyn_updating:
+        if getattr(self, '_act_dyn_updating', False):
             return
         tau_spin = self._act_dyn_tau_spins.get(key)
         bw_spin = self._act_dyn_bw_spins.get(key)
@@ -2507,11 +2676,13 @@ class MainWindow(QMainWindow):
         act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
         act[key] = tau
         self._act_dyn_updating = True
-        bw_spin.setValue(tau_to_bandwidth_hz(tau))
-        self._act_dyn_updating = False
+        try:
+            bw_spin.setValue(tau_to_bandwidth_hz(tau))
+        finally:
+            self._act_dyn_updating = False
 
     def _on_act_dyn_bw_changed(self, key):
-        if self._act_dyn_updating:
+        if getattr(self, '_act_dyn_updating', False):
             return
         tau_spin = self._act_dyn_tau_spins.get(key)
         bw_spin = self._act_dyn_bw_spins.get(key)
@@ -2521,20 +2692,29 @@ class MainWindow(QMainWindow):
         act = self._tracking_config.setdefault('actuator', default_actuator_tracking_config())
         act[key] = tau
         self._act_dyn_updating = True
-        tau_spin.setValue(tau)
-        self._act_dyn_updating = False
+        try:
+            tau_spin.setValue(tau)
+        finally:
+            self._act_dyn_updating = False
 
     def _refresh_act_dyn_spins(self):
         if not hasattr(self, '_act_dyn_tau_spins'):
             return
-        self._act_dyn_updating = True
         act = self._tracking_config.get('actuator') or default_actuator_tracking_config()
-        for key, tau_spin in self._act_dyn_tau_spins.items():
-            tau = float(act.get(key, 0.05))
-            bw_spin = self._act_dyn_bw_spins[key]
-            tau_spin.setValue(tau)
-            bw_spin.setValue(tau_to_bandwidth_hz(tau))
-        self._act_dyn_updating = False
+        self._act_dyn_updating = True
+        try:
+            for key, tau_spin in self._act_dyn_tau_spins.items():
+                tau = float(act.get(key, 0.05))
+                bw_spin = self._act_dyn_bw_spins[key]
+                tau_spin.setValue(tau)
+                bw_spin.setValue(tau_to_bandwidth_hz(tau))
+            if hasattr(self, '_act_scale_spins'):
+                for key, spin in self._act_scale_spins.items():
+                    spin.setValue(float(act.get(f'scale_{key}', 1.0)))
+                for key, spin in self._act_bias_spins.items():
+                    spin.setValue(float(act.get(f'bias_{key}', 0.0)))
+        finally:
+            self._act_dyn_updating = False
 
     def _store_actuator_config(self):
         if not hasattr(self, 'act_dyn_enable_cb'):
@@ -2545,6 +2725,12 @@ class MainWindow(QMainWindow):
         act['thrust_resolution_N'] = float(self.act_thrust_resolution_spin.value())
         for key, tau_spin in self._act_dyn_tau_spins.items():
             act[key] = float(tau_spin.value())
+        if hasattr(self, 'act_mismatch_enable_cb'):
+            act['mismatch_enable'] = self.act_mismatch_enable_cb.isChecked()
+            for key, spin in self._act_scale_spins.items():
+                act[f'scale_{key}'] = float(spin.value())
+            for key, spin in self._act_bias_spins.items():
+                act[f'bias_{key}'] = float(spin.value())
 
     def _apply_actuator_config(self, cfg=None):
         if not hasattr(self, 'act_dyn_enable_cb'):
@@ -2564,16 +2750,38 @@ class MainWindow(QMainWindow):
         act['tau_gimbal'] = float(raw.get('tau_gimbal', 0.05))
         act['tau_thrust'] = float(raw.get('tau_thrust', 0.05))
         act['tau_yaw_torque'] = float(raw.get('tau_yaw_torque', 0.05))
+        act['mismatch_enable'] = bool(raw.get('mismatch_enable', False))
+        for key in ('gimbal', 'thrust', 'yaw_torque'):
+            act[f'scale_{key}'] = float(raw.get(f'scale_{key}', 1.0))
+            act[f'bias_{key}'] = float(raw.get(f'bias_{key}', 0.0))
+        # Commit desired config first, then push into widgets under a guard so
+        # checkbox/spin signals cannot overwrite with stale spin values.
         self._tracking_config['actuator'] = act
         self._act_dyn_updating = True
-        self.act_dyn_enable_cb.setChecked(act['enabled'])
-        self.act_thrust_quant_cb.setChecked(act['thrust_quant_enabled'])
-        self.act_thrust_resolution_spin.setValue(act['thrust_resolution_N'])
-        self._act_dyn_updating = False
-        self._refresh_act_dyn_spins()
+        try:
+            for key, tau_spin in self._act_dyn_tau_spins.items():
+                tau = float(act.get(key, 0.05))
+                self._act_dyn_bw_spins[key].setValue(tau_to_bandwidth_hz(tau))
+                tau_spin.setValue(tau)
+            self.act_thrust_resolution_spin.setValue(act['thrust_resolution_N'])
+            self.act_dyn_enable_cb.setChecked(act['enabled'])
+            self.act_thrust_quant_cb.setChecked(act['thrust_quant_enabled'])
+            if hasattr(self, 'act_mismatch_enable_cb'):
+                self.act_mismatch_enable_cb.setChecked(act['mismatch_enable'])
+                for key, spin in self._act_scale_spins.items():
+                    spin.setValue(float(act.get(f'scale_{key}', 1.0)))
+                for key, spin in self._act_bias_spins.items():
+                    spin.setValue(float(act.get(f'bias_{key}', 0.0)))
+        finally:
+            self._act_dyn_updating = False
+        # Re-assert stored config (signals may have run during setChecked).
+        self._tracking_config['actuator'] = dict(act)
         self.act_dyn_lag_detail.setEnabled(act['enabled'])
         self.act_dyn_lag_detail.setVisible(act['enabled'])
         self.act_thrust_resolution_spin.setEnabled(act['thrust_quant_enabled'])
+        if hasattr(self, 'act_mismatch_detail'):
+            self.act_mismatch_detail.setEnabled(act['mismatch_enable'])
+            self.act_mismatch_detail.setVisible(act['mismatch_enable'])
 
     def _actuator_params_for_sim(self):
         act = self._tracking_config.get('actuator') or default_actuator_tracking_config()
@@ -2584,6 +2792,13 @@ class MainWindow(QMainWindow):
             'tau_gimbal': float(act.get('tau_gimbal', 0.05)),
             'tau_thrust': float(act.get('tau_thrust', 0.05)),
             'tau_yaw_torque': float(act.get('tau_yaw_torque', 0.05)),
+            'mismatch_enable': bool(act.get('mismatch_enable', False)),
+            'scale_gimbal': float(act.get('scale_gimbal', 1.0)),
+            'bias_gimbal': float(act.get('bias_gimbal', 0.0)),
+            'scale_thrust': float(act.get('scale_thrust', 1.0)),
+            'bias_thrust': float(act.get('bias_thrust', 0.0)),
+            'scale_yaw_torque': float(act.get('scale_yaw_torque', 1.0)),
+            'bias_yaw_torque': float(act.get('bias_yaw_torque', 0.0)),
         }
 
     def _migrate_actuator_from_controller_params(self, cfg):
@@ -2596,6 +2811,7 @@ class MainWindow(QMainWindow):
                 continue
             if not any(k in raw for k in (
                 'act_dyn_enable', 'act_dyn_gimbal', 'act_dyn_thrust', 'act_dyn_yaw', 'tau_gimbal',
+                'mismatch_enable', 'scale_thrust', 'bias_thrust',
             )):
                 continue
             act = default_actuator_tracking_config()
@@ -2606,6 +2822,10 @@ class MainWindow(QMainWindow):
             act['tau_gimbal'] = float(raw.get('tau_gimbal', 0.05))
             act['tau_thrust'] = float(raw.get('tau_thrust', 0.05))
             act['tau_yaw_torque'] = float(raw.get('tau_yaw_torque', 0.05))
+            act['mismatch_enable'] = bool(raw.get('mismatch_enable', False))
+            for key in ('gimbal', 'thrust', 'yaw_torque'):
+                act[f'scale_{key}'] = float(raw.get(f'scale_{key}', 1.0))
+                act[f'bias_{key}'] = float(raw.get(f'bias_{key}', 0.0))
             return act
         return default_actuator_tracking_config()
 
@@ -2781,7 +3001,8 @@ class MainWindow(QMainWindow):
             expanded=False,
         )
         self.px4_tune_group.setToolTip(
-            'Click the section title (▸/▾) to expand or collapse cascade step-response tuning.'
+            'Click the section title (▸/▾) to expand or collapse cascade step-response tuning.\n'
+            'Uses the same Actuator dynamics panel above (first-order lag / thrust quantization).'
         )
 
         level_row = QGridLayout()
@@ -2849,14 +3070,16 @@ class MainWindow(QMainWindow):
         self.btn_run_px4_tune = QPushButton('Run cascade tune sim')
         self.btn_run_px4_tune.setToolTip(
             'Hover step response at the selected cascade level.\n'
-            'Outer loops are bypassed; only the active level and inner loops run.'
+            'Outer loops are bypassed; only the active level and inner loops run.\n'
+            'Plant input includes Actuator dynamics (τ / thrust quantization) when enabled above.'
         )
         self.btn_run_px4_tune.clicked.connect(self.run_px4_cascade_tune_sim)
         tune_outer.addWidget(self.btn_run_px4_tune)
 
         self.lbl_px4_tune_result = QLabel(
             'Tune: rate → attitude → velocity → position. '
-            'States tab shows dashed cmd = inner-loop setpoints.'
+            'Uses Actuator dynamics when enabled. '
+            'States tab: dashed cmd = inner-loop setpoints; controls show cmd vs act.'
         )
         self.lbl_px4_tune_result.setWordWrap(True)
         self.lbl_px4_tune_result.setStyleSheet('color: #555;')
@@ -3054,8 +3277,15 @@ class MainWindow(QMainWindow):
             expanded=False,
         )
         self.tracking_params_group.setToolTip(
-            'Click the section title (▸/▾) to expand or collapse controller gains.'
+            'Click the section title (▸/▾) to expand or collapse controller gains.\n'
+            'Gains are stored separately per rocket platform (Proxy vs Real).'
         )
+        self.lbl_tracking_params_platform = QLabel()
+        self.lbl_tracking_params_platform.setWordWrap(True)
+        self.lbl_tracking_params_platform.setStyleSheet(
+            'color: #1565c0; font-weight: bold;'
+        )
+        param_outer.addWidget(self.lbl_tracking_params_platform)
         self.tracking_params_scroll = QScrollArea()
         self.tracking_params_scroll.setWidgetResizable(True)
         self.tracking_params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -3276,6 +3506,62 @@ class MainWindow(QMainWindow):
         plat_row.addWidget(self.nmp_real_radio)
         plat_row.addStretch(1)
         model_layout.addLayout(plat_row)
+        model_param_grid = QGridLayout()
+        model_param_grid.setHorizontalSpacing(8)
+        model_param_grid.setVerticalSpacing(4)
+
+        def _add_model_spin(row, col, label, tooltip):
+            model_param_grid.addWidget(QLabel(label), row, col * 2)
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setSingleStep(0.001)
+            spin.setToolTip(tooltip)
+            spin.valueChanged.connect(self._on_nmp_model_param_changed)
+            model_param_grid.addWidget(spin, row, col * 2 + 1)
+            return spin
+
+        self.nmp_mass_spin = _add_model_spin(
+            0, 0, 'Mass [kg]:', 'Vehicle mass used for planning/tracking/GIF.',
+        )
+        self.nmp_ixx_spin = _add_model_spin(
+            0, 1, 'Ixx [kg·m²]:', 'Roll-axis moment of inertia.',
+        )
+        self.nmp_iyy_spin = _add_model_spin(
+            1, 0, 'Iyy [kg·m²]:', 'Pitch-axis moment of inertia.',
+        )
+        self.nmp_izz_spin = _add_model_spin(
+            1, 1, 'Izz [kg·m²]:', 'Yaw-axis moment of inertia.',
+        )
+        self.nmp_body_len_spin = _add_model_spin(
+            2, 0, 'Body length [m]:',
+            'Total rocket length (bottom to nose tip), for the GIF/3D rocket model.',
+        )
+        self.nmp_com_from_bottom_spin = _add_model_spin(
+            2, 1, 'COM from bottom [m]:',
+            'Distance from the rocket\'s bottom to the center of mass, for the GIF/3D rocket model.',
+        )
+        self.nmp_r_thrust_dist_spin = _add_model_spin(
+            3, 0, 'Thrust point below COM [m]:',
+            'Distance from COM to the TVC gimbal/thrust point.',
+        )
+        model_layout.addLayout(model_param_grid)
+
+        model_btn_row = QHBoxLayout()
+        self.btn_nmp_save_model_params = QPushButton('Save model')
+        self.btn_nmp_save_model_params.setToolTip(
+            'Save mass/inertia/geometry above as the default for the selected '
+            f'platform.\n{NMP_MODEL_PARAMS_PATH}'
+        )
+        self.btn_nmp_save_model_params.clicked.connect(self.save_nmp_model_params)
+        self.btn_nmp_reset_model_params = QPushButton('Reset to platform default')
+        self.btn_nmp_reset_model_params.setToolTip(
+            'Discard any saved override and reload the built-in default for this platform.'
+        )
+        self.btn_nmp_reset_model_params.clicked.connect(self.reset_nmp_model_params)
+        model_btn_row.addWidget(self.btn_nmp_save_model_params)
+        model_btn_row.addWidget(self.btn_nmp_reset_model_params)
+        model_btn_row.addStretch(1)
+        model_layout.addLayout(model_btn_row)
         self.lbl_nmp_model_desc = QLabel(platform_description(PLATFORM_PROXY))
         self.lbl_nmp_model_desc.setWordWrap(True)
         self.lbl_nmp_model_desc.setStyleSheet('color: #555;')
@@ -3295,7 +3581,21 @@ class MainWindow(QMainWindow):
         self.nmp_waypoint_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.nmp_waypoint_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.nmp_waypoint_table.setAlternatingRowColors(True)
-        self.nmp_waypoint_table.setMinimumHeight(120)
+        self.nmp_waypoint_table.setMinimumHeight(88)
+        self.nmp_waypoint_table.setMaximumHeight(130)
+        nmp_wp_hdr = self.nmp_waypoint_table.horizontalHeader()
+        nmp_wp_hdr.setSectionResizeMode(QHeaderView.Interactive)
+        nmp_wp_widths = {
+            WP_COL_IDX: 28,
+            WP_COL_X: 54,
+            WP_COL_Y: 54,
+            WP_COL_Z: 54,
+            WP_COL_YAW: 58,
+            WP_COL_LEG_DT: 54,
+            WP_COL_T_ARR: 54,
+        }
+        for col, width in nmp_wp_widths.items():
+            self.nmp_waypoint_table.setColumnWidth(col, width)
         self.nmp_waypoint_table.itemChanged.connect(self._on_nmp_waypoint_table_item_changed)
         wp_layout.addWidget(self.nmp_waypoint_table)
         wp_btn_row = QHBoxLayout()
@@ -3303,42 +3603,156 @@ class MainWindow(QMainWindow):
         self.btn_nmp_add_wp.clicked.connect(self.add_nmp_waypoint)
         self.btn_nmp_remove_wp = QPushButton('Remove')
         self.btn_nmp_remove_wp.clicked.connect(self.remove_nmp_waypoint)
+        self.btn_nmp_save_wp = QPushButton('Save')
+        self.btn_nmp_save_wp.setToolTip(
+            'Save these waypoints so the NMP tab opens with them next time.\n'
+            f'{NMP_SAVED_WAYPOINTS_PATH}'
+        )
+        self.btn_nmp_save_wp.clicked.connect(self.save_nmp_waypoints)
         wp_btn_row.addWidget(self.btn_nmp_add_wp)
         wp_btn_row.addWidget(self.btn_nmp_remove_wp)
+        wp_btn_row.addWidget(self.btn_nmp_save_wp)
         wp_btn_row.addStretch(1)
         wp_layout.addLayout(wp_btn_row)
-        layout.addWidget(wp_group)
-
-        plan_group = QGroupBox('3. Flatness planning (Method 8)')
-        plan_layout = QGridLayout(plan_group)
+        plan_row = QGridLayout()
         self.nmp_dt_spin = QDoubleSpinBox()
         self.nmp_dt_spin.setRange(0.01, 0.2)
         self.nmp_dt_spin.setValue(0.05)
         self.nmp_dt_spin.setDecimals(3)
         self.nmp_dt_spin.setSingleStep(0.01)
         self.nmp_dt_spin.setToolTip('Sample period for flat-output reconstruction [s].')
-        plan_layout.addWidget(QLabel('Sample dt [s]:'), 0, 0)
-        plan_layout.addWidget(self.nmp_dt_spin, 0, 1)
+        plan_row.addWidget(QLabel('Sample dt [s]:'), 0, 0)
+        plan_row.addWidget(self.nmp_dt_spin, 0, 1)
         self.btn_nmp_plan = QPushButton('Plan flat trajectory')
         self.btn_nmp_plan.setToolTip(
             'Min-snap on ξ_x, ξ_y, z, ψ between waypoints; reconstruct COM state and controls.'
         )
         self.btn_nmp_plan.clicked.connect(self.start_nmp_planning)
-        plan_layout.addWidget(self.btn_nmp_plan, 1, 0, 1, 2)
+        plan_row.addWidget(self.btn_nmp_plan, 1, 0, 1, 2)
         self.lbl_nmp_plan_status = QLabel('No NMP plan yet.')
         self.lbl_nmp_plan_status.setWordWrap(True)
         self.lbl_nmp_plan_status.setStyleSheet('color: #555;')
-        plan_layout.addWidget(self.lbl_nmp_plan_status, 2, 0, 1, 2)
-        self.btn_nmp_send_to_tracking = QPushButton('Use plan in Tracking tab')
-        self.btn_nmp_send_to_tracking.setEnabled(False)
-        self.btn_nmp_send_to_tracking.setToolTip(
-            'Copy the NMP plan to the main trajectory cache and Tracking → Current trajectory.'
+        plan_row.addWidget(self.lbl_nmp_plan_status, 2, 0, 1, 2)
+        wp_layout.addLayout(plan_row)
+        layout.addWidget(wp_group)
+
+        track_group = QGroupBox('3. Tracking (PX4 cascade)')
+        track_layout = QVBoxLayout(track_group)
+        track_intro = QLabel(
+            'Closed-loop waypoint tracking with PX4 cascade. Choose whether the '
+            'position loop tracks COM (center of mass) or ξ (center of oscillation).'
         )
-        self.btn_nmp_send_to_tracking.clicked.connect(self._nmp_send_plan_to_tracking)
-        plan_layout.addWidget(self.btn_nmp_send_to_tracking, 3, 0, 1, 2)
-        layout.addWidget(plan_group)
+        track_intro.setWordWrap(True)
+        track_intro.setStyleSheet('color: #444;')
+        track_layout.addWidget(track_intro)
+        ref_row = QHBoxLayout()
+        ref_row.addWidget(QLabel('Reference:'))
+        self.nmp_ref_planned_radio = QRadioButton('Flat planned trajectory')
+        self.nmp_ref_waypoint_radio = QRadioButton('Direct waypoint flight')
+        self.nmp_ref_planned_radio.setChecked(True)
+        self.nmp_ref_planned_radio.setToolTip(
+            'Track the min-snap flat trajectory from “Plan flat trajectory”.'
+        )
+        self.nmp_ref_waypoint_radio.setToolTip(
+            'No planning: GotoSetpoint-style holds — switch target at each arrival time.'
+        )
+        self._nmp_ref_mode_group = QButtonGroup(self)
+        self._nmp_ref_mode_group.addButton(self.nmp_ref_planned_radio, 0)
+        self._nmp_ref_mode_group.addButton(self.nmp_ref_waypoint_radio, 1)
+        self.nmp_ref_planned_radio.toggled.connect(self._on_nmp_tracking_timing_changed)
+        self.nmp_ref_waypoint_radio.toggled.connect(self._on_nmp_tracking_timing_changed)
+        ref_row.addWidget(self.nmp_ref_planned_radio)
+        ref_row.addWidget(self.nmp_ref_waypoint_radio)
+        ref_row.addStretch(1)
+        track_layout.addLayout(ref_row)
+        plot_mode_row = QHBoxLayout()
+        plot_mode_row.addWidget(QLabel('NMP plot:'))
+        self.nmp_plot_all_radio = QRadioButton('All state')
+        self.nmp_plot_2d_radio = QRadioButton('2D (x-only)')
+        self.nmp_plot_all_radio.setChecked(True)
+        self.nmp_plot_all_radio.setToolTip('Show x/y/z states and all attitude/gimbal channels.')
+        self.nmp_plot_2d_radio.setToolTip(
+            'Hide y-axis channels (y, vy, roll, p, roll gimbal) for x-direction motion.'
+        )
+        self._nmp_plot_mode_group = QButtonGroup(self)
+        self._nmp_plot_mode_group.addButton(self.nmp_plot_all_radio, 0)
+        self._nmp_plot_mode_group.addButton(self.nmp_plot_2d_radio, 1)
+        self.nmp_plot_all_radio.toggled.connect(self._on_nmp_plot_mode_changed)
+        plot_mode_row.addWidget(self.nmp_plot_all_radio)
+        plot_mode_row.addWidget(self.nmp_plot_2d_radio)
+        plot_mode_row.addStretch(1)
+        track_layout.addLayout(plot_mode_row)
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel('Control point:'))
+        self.nmp_ctrl_com_radio = QRadioButton('COM (center of mass)')
+        self.nmp_ctrl_xi_radio = QRadioButton('ξ (oscillation point)')
+        self.nmp_ctrl_com_radio.setChecked(True)
+        self.nmp_ctrl_com_radio.setToolTip('PX4 cascade on COM position (default).')
+        self.nmp_ctrl_xi_radio.setToolTip(
+            'Flatness cascade: outer loop on ξ_x/ξ_y, inner loop still PX4 cascade.'
+        )
+        self._nmp_ctrl_point_group = QButtonGroup(self)
+        self._nmp_ctrl_point_group.addButton(self.nmp_ctrl_com_radio, 0)
+        self._nmp_ctrl_point_group.addButton(self.nmp_ctrl_xi_radio, 1)
+        self.nmp_ctrl_com_radio.toggled.connect(self._on_nmp_control_point_changed)
+        self.nmp_ctrl_xi_radio.toggled.connect(self._on_nmp_control_point_changed)
+        ctrl_row.addWidget(self.nmp_ctrl_com_radio)
+        ctrl_row.addWidget(self.nmp_ctrl_xi_radio)
+        ctrl_row.addStretch(1)
+        track_layout.addLayout(ctrl_row)
+        self.nmp_params_group, nmp_param_outer = self._make_collapsible_group(
+            'Controller parameters',
+            track_layout,
+            expanded=False,
+        )
+        self.nmp_params_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.lbl_nmp_params_platform = QLabel()
+        self.lbl_nmp_params_platform.setWordWrap(True)
+        self.lbl_nmp_params_platform.setStyleSheet(
+            'color: #1565c0; font-weight: bold;'
+        )
+        nmp_param_outer.addWidget(self.lbl_nmp_params_platform)
+        self._create_nmp_tracking_timing_panel(nmp_param_outer)
+        nmp_param_io = QHBoxLayout()
+        self.btn_save_nmp_tracking_params = QPushButton('Save params')
+        self.btn_save_nmp_tracking_params.setToolTip(
+            f'Save NMP controller/timing parameters to {DEFAULT_TRACKING_PARAMS_PATH}'
+        )
+        self.btn_save_nmp_tracking_params.clicked.connect(self.save_tracking_params)
+        nmp_param_io.addWidget(self.btn_save_nmp_tracking_params)
+        nmp_param_io.addStretch(1)
+        nmp_param_outer.addLayout(nmp_param_io)
+        self.nmp_params_scroll = QScrollArea()
+        self.nmp_params_scroll.setWidgetResizable(True)
+        self.nmp_params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nmp_params_scroll.setMinimumHeight(240)
+        self.nmp_params_scroll.setMaximumHeight(420)
+        self.nmp_params_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.nmp_params_grid_host = QWidget()
+        self.nmp_params_groups_layout = QVBoxLayout(self.nmp_params_grid_host)
+        self.nmp_params_groups_layout.setSpacing(5)
+        self.nmp_params_groups_layout.setContentsMargins(2, 2, 2, 2)
+        self.nmp_params_scroll.setWidget(self.nmp_params_grid_host)
+        nmp_param_outer.addWidget(self.nmp_params_scroll)
+        self._rebuild_nmp_tracking_param_widgets()
+        self.btn_nmp_run_tracking = QPushButton('Run tracking sim')
+        self.btn_nmp_run_tracking.setToolTip(
+            'Numerical closed-loop tracking with PX4 cascade '
+            '(planned trajectory or direct waypoint flight).'
+        )
+        self.btn_nmp_run_tracking.clicked.connect(self.run_nmp_tracking_sim)
+        track_layout.addWidget(self.btn_nmp_run_tracking)
+        self.lbl_nmp_tracking_status = QLabel(
+            'Choose reference mode, then run tracking sim '
+            '(planned mode needs “Plan flat trajectory” first).'
+        )
+        self.lbl_nmp_tracking_status.setWordWrap(True)
+        self.lbl_nmp_tracking_status.setStyleSheet('color: #555;')
+        track_layout.addWidget(self.lbl_nmp_tracking_status)
+        layout.addWidget(track_group)
 
         layout.addStretch(1)
+        self._apply_nmp_model_params_for_platform(PLATFORM_PROXY)
         self._populate_nmp_waypoint_table()
         self._refresh_nmp_model_info()
         QTimer.singleShot(0, self._refresh_tab_scroll_areas)
@@ -3349,9 +3763,111 @@ class MainWindow(QMainWindow):
             return PLATFORM_REAL
         return PLATFORM_PROXY
 
+    def _nmp_model_params_builtin_default(self, platform_id):
+        """Built-in (non-override) mass/inertia/geometry defaults for a platform."""
+        phy = default_physics(platform_id)
+        geo = rocket_visual_geometry(platform_id)
+        return {
+            'mass': float(phy['mass']),
+            'Ixx': float(phy['Ixx']),
+            'Iyy': float(phy['Iyy']),
+            'Izz': float(phy['Izz']),
+            'r_thrust_z': abs(float(phy['r_thrust_z'])),
+            'body_length': float(geo['nose_tip_z'] - geo['body_bottom_z']),
+            'com_from_bottom': float(-geo['body_bottom_z']),
+        }
+
+    def _nmp_model_params_default(self, platform_id):
+        """Saved override merged over the platform's built-in default."""
+        row = self._nmp_model_params_builtin_default(platform_id)
+        row.update(self._nmp_model_overrides.get(platform_id, {}))
+        return row
+
+    def _apply_nmp_model_params_for_platform(self, platform_id):
+        if not hasattr(self, 'nmp_mass_spin'):
+            return
+        values = self._nmp_model_params_default(platform_id)
+        mass_lo, mass_hi, mass_dec = physics_spin_ranges(platform_id)['mass']
+        inertia_lo, inertia_hi, inertia_dec = physics_spin_ranges(platform_id)['inertia']
+        _, thrust_hi, thrust_dec = physics_spin_ranges(platform_id)['r_thrust']
+        specs = (
+            (self.nmp_mass_spin, 'mass', mass_lo, mass_hi, mass_dec),
+            (self.nmp_ixx_spin, 'Ixx', inertia_lo, inertia_hi, inertia_dec),
+            (self.nmp_iyy_spin, 'Iyy', inertia_lo, inertia_hi, inertia_dec),
+            (self.nmp_izz_spin, 'Izz', inertia_lo, inertia_hi, inertia_dec),
+            (self.nmp_body_len_spin, 'body_length', 0.05, 10.0, 3),
+            (self.nmp_com_from_bottom_spin, 'com_from_bottom', 0.0, 10.0, 3),
+            (self.nmp_r_thrust_dist_spin, 'r_thrust_z', 0.0, abs(float(thrust_hi)), thrust_dec),
+        )
+        for spin, key, lo, hi, dec in specs:
+            spin.blockSignals(True)
+            spin.setDecimals(dec)
+            spin.setSingleStep(10 ** (-dec))
+            spin.setRange(float(lo), float(hi))
+            spin.setValue(float(values[key]))
+            spin.blockSignals(False)
+
+    def _on_nmp_model_param_changed(self, _value=None):
+        self._refresh_nmp_model_info()
+
+    def _nmp_model_params_from_spins(self):
+        return {
+            'mass': float(self.nmp_mass_spin.value()),
+            'Ixx': float(self.nmp_ixx_spin.value()),
+            'Iyy': float(self.nmp_iyy_spin.value()),
+            'Izz': float(self.nmp_izz_spin.value()),
+            'r_thrust_z': abs(float(self.nmp_r_thrust_dist_spin.value())),
+            'body_length': float(self.nmp_body_len_spin.value()),
+            'com_from_bottom': float(self.nmp_com_from_bottom_spin.value()),
+        }
+
+    def save_nmp_model_params(self):
+        pid = self._current_nmp_platform_id()
+        self._nmp_model_overrides[pid] = self._nmp_model_params_from_spins()
+        os.makedirs(os.path.dirname(NMP_MODEL_PARAMS_PATH), exist_ok=True)
+        try:
+            with open(NMP_MODEL_PARAMS_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self._nmp_model_overrides, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, 'NMP', f'Could not save model parameters:\n{e}')
+            return
+        if hasattr(self, 'status_text'):
+            self.status_text.append(
+                f'NMP: saved model parameters for {platform_label(pid)} to:\n  '
+                f'{NMP_MODEL_PARAMS_PATH}'
+            )
+
+    def reset_nmp_model_params(self):
+        pid = self._current_nmp_platform_id()
+        self._nmp_model_overrides.pop(pid, None)
+        self._apply_nmp_model_params_for_platform(pid)
+        self._refresh_nmp_model_info()
+        if hasattr(self, 'status_text'):
+            self.status_text.append(f'NMP: reset {platform_label(pid)} model to built-in default.')
+
+    def _nmp_rocket_geometry_dict(self):
+        if not hasattr(self, 'nmp_body_len_spin'):
+            return None
+        body_length = float(self.nmp_body_len_spin.value())
+        com_from_bottom = float(self.nmp_com_from_bottom_spin.value())
+        body_bottom_z = -com_from_bottom
+        base_geo = rocket_visual_geometry(self._current_nmp_platform_id())
+        return {
+            'body_bottom_z': body_bottom_z,
+            'nose_tip_z': body_bottom_z + body_length,
+            'fin_z': body_bottom_z + 0.33 * body_length,
+            'shaft_lw': base_geo.get('shaft_lw', 4.5),
+            'fin_lw': base_geo.get('fin_lw', 2.6),
+        }
+
     def _nmp_physics_dict(self):
         phy = dict(default_physics(self._current_nmp_platform_id()))
         phy['g'] = 9.81
+        if hasattr(self, 'nmp_mass_spin'):
+            phy.update(self._nmp_model_params_from_spins())
+            phy['r_thrust_z'] = -abs(phy['r_thrust_z'])
+            phy.pop('body_length', None)
+            phy.pop('com_from_bottom', None)
         return phy
 
     def _nmp_bounds_dict(self):
@@ -3367,9 +3883,16 @@ class MainWindow(QMainWindow):
     def _on_nmp_platform_changed(self, _button=None):
         if self._nmp_platform_guard:
             return
+        previous_id = getattr(self, '_cached_nmp_platform_id', PLATFORM_PROXY)
         pid = self._current_nmp_platform_id()
+        if previous_id != pid:
+            self._store_nmp_tracking_params_for_controller()
+            self._cached_nmp_platform_id = pid
+            self._rebuild_nmp_tracking_param_widgets()
         self.lbl_nmp_model_desc.setText(platform_description(pid))
+        self._apply_nmp_model_params_for_platform(pid)
         self._refresh_nmp_model_info()
+        self._refresh_tracking_params_platform_labels()
         if hasattr(self, 'status_text'):
             self.status_text.append(f'NMP model: {platform_label(pid)}')
 
@@ -3401,9 +3924,9 @@ class MainWindow(QMainWindow):
                 self.nmp_waypoint_table.setItem(
                     i, WP_COL_IDX, self._make_waypoint_table_item(i, editable=False),
                 )
-                self.nmp_waypoint_table.setItem(i, WP_COL_X, self._make_waypoint_table_item(f'{x:.3f}'))
-                self.nmp_waypoint_table.setItem(i, WP_COL_Y, self._make_waypoint_table_item(f'{y:.3f}'))
-                self.nmp_waypoint_table.setItem(i, WP_COL_Z, self._make_waypoint_table_item(f'{z:.3f}'))
+                self.nmp_waypoint_table.setItem(i, WP_COL_X, self._make_waypoint_table_item(f'{x:.1f}'))
+                self.nmp_waypoint_table.setItem(i, WP_COL_Y, self._make_waypoint_table_item(f'{y:.1f}'))
+                self.nmp_waypoint_table.setItem(i, WP_COL_Z, self._make_waypoint_table_item(f'{z:.1f}'))
                 self.nmp_waypoint_table.setItem(i, WP_COL_YAW, self._make_waypoint_table_item(f'{yaw:.1f}'))
                 if i == 0:
                     self.nmp_waypoint_table.setItem(
@@ -3411,11 +3934,11 @@ class MainWindow(QMainWindow):
                     )
                 else:
                     self.nmp_waypoint_table.setItem(
-                        i, WP_COL_LEG_DT, self._make_waypoint_table_item(f'{leg:.3f}'),
+                        i, WP_COL_LEG_DT, self._make_waypoint_table_item(f'{leg:.1f}'),
                     )
                 self.nmp_waypoint_table.setItem(
                     i, WP_COL_T_ARR,
-                    self._make_waypoint_table_item(f'{t_arr:.3f}', editable=(i > 0)),
+                    self._make_waypoint_table_item(f'{t_arr:.1f}', editable=(i > 0)),
                 )
         finally:
             self.nmp_waypoint_table.blockSignals(False)
@@ -3448,6 +3971,8 @@ class MainWindow(QMainWindow):
             return
         self._sync_nmp_waypoints_from_table()
         self._populate_nmp_waypoint_table()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
 
     def add_nmp_waypoint(self):
         self._sync_nmp_waypoints_from_table()
@@ -3459,6 +3984,8 @@ class MainWindow(QMainWindow):
             last[0], last[1], last[2] + 0.5, last[3], last[4] + dt_leg,
         ])
         self._populate_nmp_waypoint_table()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
 
     def remove_nmp_waypoint(self):
         self._sync_nmp_waypoints_from_table()
@@ -3471,6 +3998,23 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.nmp_waypoints):
             del self.nmp_waypoints[row]
         self._populate_nmp_waypoint_table()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
+
+    def save_nmp_waypoints(self):
+        """Persist current NMP waypoints so they auto-load next time the GUI starts."""
+        self._sync_nmp_waypoints_from_table()
+        os.makedirs(os.path.dirname(NMP_SAVED_WAYPOINTS_PATH), exist_ok=True)
+        try:
+            with open(NMP_SAVED_WAYPOINTS_PATH, 'w', encoding='utf-8') as f:
+                json.dump({'waypoints': waypoints_to_json_list(self.nmp_waypoints)}, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, 'NMP', f'Could not save waypoints:\n{e}')
+            return
+        if hasattr(self, 'status_text'):
+            self.status_text.append(
+                f'NMP: saved {len(self.nmp_waypoints)} waypoints to:\n  {NMP_SAVED_WAYPOINTS_PATH}'
+            )
 
     def start_nmp_planning(self):
         if self._nmp_plan_thread and self._nmp_plan_thread.isRunning():
@@ -3543,10 +4087,12 @@ class MainWindow(QMainWindow):
         self.lbl_nmp_plan_status.setText(
             f'Plan OK: {n_pts} samples, duration {dur:.2f} s, compute {elapsed:.2f} s.'
         )
-        self.btn_nmp_send_to_tracking.setEnabled(True)
+        self._nmp_last_tracking_result = None
         self.status_text.append(
             f'NMP plan ready — {n_pts} points, {dur:.2f} s ({platform_label(self._current_nmp_platform_id())}).'
         )
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
         self._draw_nmp_plot_tab()
         if hasattr(self, 'plot_tabs'):
             for i in range(self.plot_tabs.count()):
@@ -3554,40 +4100,497 @@ class MainWindow(QMainWindow):
                     self.plot_tabs.setCurrentIndex(i)
                     break
 
-    def _nmp_send_plan_to_tracking(self):
-        if not self.nmp_last_trajectory or self.nmp_last_trajectory.get('xs') is None:
-            QMessageBox.warning(self, 'NMP', 'No NMP plan to export.')
-            return
-        traj = self.nmp_last_trajectory
-        self.last_trajectory = dict(traj)
-        self.last_trajectory['method'] = 7
-        if hasattr(self, 'tracking_source_combo'):
-            self.tracking_source_combo.setCurrentIndex(0)
-            self._on_tracking_source_changed(0)
-        self.status_text.append('NMP plan copied to Tracking → Current trajectory.')
-        QMessageBox.information(
-            self, 'NMP',
-            'Trajectory copied to the main cache.\n'
-            'Tracking → Source: Current trajectory; use PX4 cascade for closed-loop sim.',
+    def _current_nmp_tracking_ref_mode(self):
+        if hasattr(self, 'nmp_ref_waypoint_radio') and self.nmp_ref_waypoint_radio.isChecked():
+            return 'waypoint'
+        return 'planned'
+
+    def _current_nmp_plot_mode(self):
+        if hasattr(self, 'nmp_plot_2d_radio') and self.nmp_plot_2d_radio.isChecked():
+            return '2d'
+        return 'all'
+
+    def _on_nmp_plot_mode_changed(self, _checked=False):
+        self._draw_nmp_plot_tab()
+
+    def _nmp_flatness_physics_dict(self):
+        """Live model params (mass/inertia/thrust point) from the Model section.
+
+        Always reflects the current spinboxes, not a stale planned-trajectory
+        snapshot, so waypoint-mode direct flight uses whatever model is
+        currently configured.
+        """
+        phy = self._nmp_physics_dict()
+        return {
+            'mass': phy['mass'],
+            'Ixx': phy['Ixx'],
+            'Iyy': phy['Iyy'],
+            'Izz': phy['Izz'],
+            'r_thrust_z': phy['r_thrust_z'],
+            'g': phy.get('g', 9.81),
+        }
+
+    def _create_nmp_tracking_timing_panel(self, parent_layout):
+        """NMP-specific plant step, control period, and simulation horizon."""
+        timing_group = QGroupBox('Tracking timing')
+        grid = QGridLayout(timing_group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+
+        cfg = dict(
+            self._tracking_config.get('nmp_numerical_sim')
+            or self._tracking_config.get('numerical_sim')
+            or default_numerical_sim_config()
         )
+
+        self.nmp_sim_dt_spin = QDoubleSpinBox()
+        self.nmp_sim_dt_spin.setRange(0.001, 0.05)
+        self.nmp_sim_dt_spin.setDecimals(4)
+        self.nmp_sim_dt_spin.setSingleStep(0.001)
+        self.nmp_sim_dt_spin.setToolTip('Plant integration step [s] for NMP tracking simulation.')
+        self.nmp_sim_dt_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.nmp_control_dt_spin = QDoubleSpinBox()
+        self.nmp_control_dt_spin.setRange(0.005, 0.2)
+        self.nmp_control_dt_spin.setDecimals(4)
+        self.nmp_control_dt_spin.setSingleStep(0.005)
+        self.nmp_control_dt_spin.setToolTip('Controller update period [s] for both COM and ξ tracking.')
+        self.nmp_control_dt_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.nmp_terminal_hold_spin = QDoubleSpinBox()
+        self.nmp_terminal_hold_spin.setRange(0.0, 120.0)
+        self.nmp_terminal_hold_spin.setDecimals(2)
+        self.nmp_terminal_hold_spin.setSingleStep(0.5)
+        self.nmp_terminal_hold_spin.setToolTip(
+            'Extra hover time after the selected NMP reference ends. Ignored when Total duration > 0.'
+        )
+        self.nmp_terminal_hold_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.nmp_total_duration_spin = QDoubleSpinBox()
+        self.nmp_total_duration_spin.setRange(0.0, 600.0)
+        self.nmp_total_duration_spin.setDecimals(2)
+        self.nmp_total_duration_spin.setSingleStep(1.0)
+        self.nmp_total_duration_spin.setSpecialValueText('Auto (reference + hold)')
+        self.nmp_total_duration_spin.setToolTip(
+            'Fixed NMP tracking simulation length from t=0 [s]. 0 = automatic: '
+            'selected reference duration + terminal hold.'
+        )
+        self.nmp_total_duration_spin.valueChanged.connect(self._on_nmp_tracking_timing_changed)
+
+        self.lbl_nmp_control_hz = QLabel()
+        self.lbl_nmp_control_hz.setStyleSheet('color: #555;')
+        self.lbl_nmp_substeps = QLabel()
+        self.lbl_nmp_substeps.setStyleSheet('color: #555;')
+        self.lbl_nmp_sim_duration = QLabel()
+        self.lbl_nmp_sim_duration.setStyleSheet('color: #555;')
+        self.lbl_nmp_sim_duration.setWordWrap(True)
+
+        grid.addWidget(QLabel('sim_dt [s]:'), 0, 0)
+        grid.addWidget(self.nmp_sim_dt_spin, 0, 1)
+        grid.addWidget(QLabel('control_dt [s]:'), 0, 2)
+        grid.addWidget(self.nmp_control_dt_spin, 0, 3)
+        grid.addWidget(QLabel('hold [s]:'), 1, 0)
+        grid.addWidget(self.nmp_terminal_hold_spin, 1, 1)
+        grid.addWidget(QLabel('total [s]:'), 1, 2)
+        grid.addWidget(self.nmp_total_duration_spin, 1, 3)
+        grid.addWidget(self.lbl_nmp_control_hz, 2, 0, 1, 2)
+        grid.addWidget(self.lbl_nmp_substeps, 2, 2, 1, 2)
+        grid.addWidget(self.lbl_nmp_sim_duration, 3, 0, 1, 4)
+
+        parent_layout.addWidget(timing_group)
+        self._nmp_sim_timing_guard = True
+        self.nmp_sim_dt_spin.setValue(float(cfg.get('sim_dt', 0.005)))
+        self.nmp_control_dt_spin.setValue(float(cfg.get('control_dt', 0.02)))
+        self.nmp_terminal_hold_spin.setValue(float(cfg.get('terminal_hold_duration_s', 3.0)))
+        self.nmp_total_duration_spin.setValue(float(cfg.get('total_duration_s', 0.0)))
+        self._nmp_sim_timing_guard = False
+        self._on_nmp_tracking_timing_changed()
+
+    def _nmp_reference_duration_s(self):
+        """Selected NMP reference span [s], used only for timing preview."""
+        if self._current_nmp_tracking_ref_mode() == 'waypoint':
+            self._sync_nmp_waypoints_from_table()
+            if len(self.nmp_waypoints) >= 2:
+                return max(
+                    float(self.nmp_waypoints[-1][4]) - float(self.nmp_waypoints[0][4]),
+                    0.0,
+                )
+            return None
+        traj = getattr(self, 'nmp_last_trajectory', None)
+        if traj and traj.get('xs') is not None:
+            ts = traj.get('time_states')
+            if ts is not None and len(ts) >= 2:
+                arr = np.asarray(ts, dtype=float)
+                return max(float(arr[-1] - arr[0]), 0.0)
+            dt = traj.get('dt')
+            xs = traj.get('xs')
+            if dt is not None and xs is not None and len(xs) >= 2:
+                return max(float((len(xs) - 1) * float(dt)), 0.0)
+        return None
+
+    def _on_nmp_tracking_timing_changed(self, _value=None):
+        if getattr(self, '_nmp_sim_timing_guard', False):
+            return
+        sim_dt = float(self.nmp_sim_dt_spin.value())
+        control_dt = float(self.nmp_control_dt_spin.value())
+        if control_dt < sim_dt:
+            self._nmp_sim_timing_guard = True
+            self.nmp_control_dt_spin.setValue(sim_dt)
+            self._nmp_sim_timing_guard = False
+            control_dt = sim_dt
+        ratio = max(1, int(round(control_dt / sim_dt)))
+        aligned_control_dt = ratio * sim_dt
+        if abs(aligned_control_dt - control_dt) > 1e-9:
+            self._nmp_sim_timing_guard = True
+            self.nmp_control_dt_spin.setValue(aligned_control_dt)
+            self._nmp_sim_timing_guard = False
+            control_dt = aligned_control_dt
+        hz = 1.0 / control_dt if control_dt > 0 else 0.0
+        self.lbl_nmp_control_hz.setText(f'Control rate: {hz:.1f} Hz')
+        self.lbl_nmp_substeps.setText(f'Plant substeps per control update: {ratio}')
+
+        hold = float(self.nmp_terminal_hold_spin.value())
+        total = float(self.nmp_total_duration_spin.value())
+        ref_s = self._nmp_reference_duration_s()
+        if total > 0.0:
+            dur_txt = f'Simulation length: {total:.2f} s (fixed total)'
+        elif ref_s is not None:
+            dur_txt = (
+                f'Simulation length: {ref_s + hold:.2f} s '
+                f'(reference {ref_s:.2f} s + hold {hold:.2f} s)'
+            )
+        else:
+            dur_txt = (
+                f'Simulation length: selected reference duration + {hold:.2f} s hold '
+                f'(plan a trajectory or use waypoint mode)'
+            )
+        self.lbl_nmp_sim_duration.setText(dur_txt)
+        self._tracking_config['nmp_numerical_sim'] = {
+            'sim_dt': sim_dt,
+            'control_dt': control_dt,
+            'terminal_hold_duration_s': hold,
+            'total_duration_s': total,
+        }
+
+    def _nmp_tracking_sim_params_for_sim(self):
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
+        cfg = self._tracking_config.get('nmp_numerical_sim') or default_numerical_sim_config()
+        return {
+            'sim_dt': float(cfg.get('sim_dt', 0.005)),
+            'control_dt': float(cfg.get('control_dt', 0.02)),
+            'terminal_hold_duration_s': float(cfg.get('terminal_hold_duration_s', 3.0)),
+            'total_duration_s': float(cfg.get('total_duration_s', 0.0)),
+        }
+
+    def _nmp_tracking_reference_pack(self):
+        """Return arrays + metadata for the selected NMP tracking reference."""
+        ref_mode = self._current_nmp_tracking_ref_mode()
+        if ref_mode == 'waypoint':
+            self._sync_nmp_waypoints_from_table()
+            if len(self.nmp_waypoints) < 2:
+                raise ValueError('Need at least 2 waypoints for direct flight.')
+            for i in range(len(self.nmp_waypoints) - 1):
+                if self.nmp_waypoints[i][4] >= self.nmp_waypoints[i + 1][4]:
+                    raise ValueError(
+                        f'Arrival time must increase between waypoints {i} and {i + 1}.',
+                    )
+            pack = build_waypoint_flight_reference(
+                self.nmp_waypoints,
+                self._nmp_flatness_physics_dict(),
+                dt=self.nmp_dt_spin.value(),
+                terminal_hold_s=0.0,
+            )
+            traj = {
+                'xs': pack['xs'],
+                'us': pack['us'],
+                'time_states': pack['time_states'],
+                'dt': pack['dt'],
+                'flat_outputs': pack['flat_outputs'],
+                'flatness_physics': pack['flatness_physics'],
+                'platform_id': self._current_nmp_platform_id(),
+                'method_name': pack['method_name'],
+                'waypoint_mode': True,
+            }
+            return (
+                np.asarray(pack['xs'], dtype=float),
+                np.asarray(pack['us'], dtype=float) if pack.get('us') is not None else None,
+                np.asarray(pack['time_states'], dtype=float),
+                pack.get('flat_outputs'),
+                pack.get('flatness_physics'),
+                pack.get('x0'),
+                traj,
+                'waypoint',
+            )
+
+        traj = getattr(self, 'nmp_last_trajectory', None)
+        if not traj or traj.get('xs') is None:
+            raise ValueError('Plan a flat trajectory first, or switch to direct waypoint flight.')
+        xs, us, time_states = self._nmp_trajectory_arrays_for_tracking()
+        if xs is None:
+            raise ValueError('No planned trajectory available.')
+        return (
+            xs, us, time_states,
+            traj.get('flat_outputs'),
+            traj.get('flatness_physics'),
+            None,
+            traj,
+            'planned',
+        )
+
+    def _current_nmp_controller_id(self):
+        if hasattr(self, 'nmp_ctrl_xi_radio') and self.nmp_ctrl_xi_radio.isChecked():
+            return CONTROLLER_FLATNESS
+        return CONTROLLER_PX4
+
+    def _on_nmp_control_point_changed(self, _checked=False):
+        if not hasattr(self, 'nmp_params_groups_layout'):
+            return
+        self._store_nmp_tracking_params_for_controller()
+        self._rebuild_nmp_tracking_param_widgets()
+
+    def _make_nmp_tracking_param_widget(self, spec, params, controller_id):
+        w = self._make_tracking_param_widget(spec, params, controller_id)
+        if spec.get('checkbox') and spec.get('key') == 'share_rp_gains':
+            try:
+                w.stateChanged.disconnect()
+            except TypeError:
+                pass
+            w.stateChanged.connect(self._on_nmp_share_rp_changed)
+        return w
+
+    def _populate_nmp_tracking_param_group(self, grid, specs, params, controller_id):
+        row = 0
+        col_slot = 0
+        for spec in specs:
+            key = spec['key']
+            if spec.get('full_width'):
+                if col_slot == 1:
+                    row += 1
+                    col_slot = 0
+                w = self._make_nmp_tracking_param_widget(spec, params, controller_id)
+                if spec.get('checkbox'):
+                    w.setText(spec['label'])
+                    grid.addWidget(w, row, 0, 1, 4)
+                else:
+                    grid.addWidget(QLabel(spec['label']), row, 0)
+                    grid.addWidget(w, row, 1, 1, 3)
+                self._nmp_tracking_param_widgets[key] = w
+                row += 1
+                continue
+
+            base_col = col_slot * 2
+            grid.addWidget(QLabel(spec['label']), row, base_col)
+            w = self._make_nmp_tracking_param_widget(spec, params, controller_id)
+            grid.addWidget(w, row, base_col + 1)
+            self._nmp_tracking_param_widgets[key] = w
+            if col_slot == 1:
+                row += 1
+                col_slot = 0
+            else:
+                col_slot = 1
+        if col_slot == 1:
+            row += 1
+        return row
+
+    def _store_nmp_tracking_params_for_controller(self, controller_id=None):
+        cid = controller_id or getattr(
+            self, '_nmp_param_controller_id', self._current_nmp_controller_id()
+        )
+        if cid not in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
+            return
+        platform_id = (
+            getattr(self, '_cached_nmp_platform_id', None)
+            or self._current_nmp_platform_id()
+        )
+        params_map = self._tracking_params_map_for(platform_id)
+        stored = params_map.setdefault(cid, default_params_for(cid))
+        for key, widget in getattr(self, '_nmp_tracking_param_widgets', {}).items():
+            if isinstance(widget, QCheckBox):
+                stored[key] = widget.isChecked()
+            elif isinstance(widget, QSpinBox):
+                stored[key] = int(widget.value())
+            else:
+                stored[key] = float(widget.value())
+        if cid == CONTROLLER_PX4:
+            params_map[cid] = migrate_px4_params(stored)
+
+    def _rebuild_nmp_tracking_param_widgets(self):
+        if not hasattr(self, 'nmp_params_groups_layout'):
+            return
+        while self.nmp_params_groups_layout.count():
+            item = self.nmp_params_groups_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._nmp_tracking_param_widgets = {}
+
+        cid = self._current_nmp_controller_id()
+        self._nmp_param_controller_id = cid
+        platform_id = self._current_nmp_platform_id()
+        self._cached_nmp_platform_id = platform_id
+        params_map = self._tracking_params_map_for(platform_id)
+        params = params_map.setdefault(cid, default_params_for(cid))
+        if cid == CONTROLLER_PX4:
+            params.update(migrate_px4_params(params))
+            params_map[cid] = params
+        px4_extra = params if cid in (CONTROLLER_PX4, CONTROLLER_FLATNESS) else None
+        for group in param_groups_for(cid, px4_params=px4_extra):
+            box = QGroupBox(group.get('title', 'Parameters'))
+            grid = QGridLayout(box)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(3)
+            self._populate_nmp_tracking_param_group(
+                grid, group.get('specs') or [], params, cid
+            )
+            self.nmp_params_groups_layout.addWidget(box)
+        self.nmp_params_groups_layout.addStretch(1)
+        self._refresh_tracking_params_platform_labels()
+        QTimer.singleShot(0, self._refresh_tab_scroll_areas)
+
+    def _on_nmp_share_rp_changed(self, _state=None):
+        self._store_nmp_tracking_params_for_controller()
+        self._rebuild_nmp_tracking_param_widgets()
+
+    def _nmp_physics_for_tracking(self):
+        phy = dict(self._nmp_physics_dict())
+        phy['platform_id'] = self._current_nmp_platform_id()
+        phy['rocket_geometry'] = self._nmp_rocket_geometry_dict()
+        return phy
+
+    def _collect_nmp_tracking_params(self):
+        cid = self._current_nmp_controller_id()
+        self._store_nmp_tracking_params_for_controller(cid)
+        params = dict(default_params_for(cid))
+        if hasattr(self, '_tracking_config'):
+            saved = self._tracking_params_map_for(self._current_nmp_platform_id()).get(cid)
+            if saved:
+                params.update(saved)
+        if hasattr(self, '_store_actuator_config'):
+            self._store_actuator_config()
+        if hasattr(self, '_actuator_params_for_sim'):
+            params.update(self._actuator_params_for_sim())
+        params.update(self._nmp_tracking_sim_params_for_sim())
+        bounds = self._nmp_bounds_dict()
+        params.update(bounds)
+        return params
+
+    def _nmp_trajectory_arrays_for_tracking(self):
+        traj = getattr(self, 'nmp_last_trajectory', None)
+        if not traj or traj.get('xs') is None:
+            return None, None, None
+        xs = np.asarray(traj['xs'], dtype=float)
+        us = traj.get('us')
+        if us is not None:
+            us = np.asarray(us, dtype=float)
+        ts = traj.get('time_states')
+        if ts is not None and len(ts) == len(xs):
+            t_list = np.asarray(ts, dtype=float)
+        else:
+            dt = float(traj.get('dt', 0.05))
+            t_list = np.arange(len(xs), dtype=float) * dt
+        if us is not None and us.shape[0] == xs.shape[0]:
+            us = us[:-1]
+        elif us is not None and us.shape[0] != max(xs.shape[0] - 1, 0):
+            us = None
+        return xs, us, t_list
+
+    def run_nmp_tracking_sim(self):
+        if self._nmp_tracking_sim_thread is not None and self._nmp_tracking_sim_thread.isRunning():
+            return
+        try:
+            xs, us, time_states, flat_outputs, flatness_physics, x0, traj, ref_mode = (
+                self._nmp_tracking_reference_pack()
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, 'NMP', str(exc))
+            return
+        cid = self._current_nmp_controller_id()
+        params = self._collect_nmp_tracking_params()
+        ctrl_label = 'ξ (oscillation)' if cid == CONTROLLER_FLATNESS else 'COM'
+        ref_label = 'waypoints' if ref_mode == 'waypoint' else 'flat plan'
+        self.btn_nmp_run_tracking.setEnabled(False)
+        self.lbl_nmp_tracking_status.setText(
+            f'Running tracking sim — {ref_label}, PX4 cascade on {ctrl_label}…',
+        )
+        self.status_text.append(
+            f'NMP: tracking sim ({ref_label}, {ctrl_label})…',
+        )
+        self._nmp_active_tracking_traj = traj
+        self._nmp_tracking_sim_thread = TrackingSimulationThread(
+            xs, us, time_states, cid, params, self._nmp_physics_for_tracking(),
+            flat_outputs=flat_outputs, flatness_physics=flatness_physics, x0=x0,
+        )
+        self._nmp_tracking_sim_thread.finished.connect(self._on_nmp_tracking_sim_finished)
+        self._nmp_tracking_sim_thread.error.connect(self._on_nmp_tracking_sim_error)
+        self._nmp_tracking_sim_thread.start()
+
+    def _on_nmp_tracking_sim_finished(self, result):
+        self.btn_nmp_run_tracking.setEnabled(True)
+        self._nmp_last_tracking_result = result
+        self._last_tracking_result = result
+        summary = tracking_summary_text(result)
+        ctrl_label = 'ξ' if self._current_nmp_controller_id() == CONTROLLER_FLATNESS else 'COM'
+        ref_label = (
+            'waypoint flight'
+            if self._current_nmp_tracking_ref_mode() == 'waypoint'
+            else 'flat plan'
+        )
+        self.lbl_nmp_tracking_status.setText(
+            f'{summary}  |  ref: {ref_label}  |  control: {ctrl_label}',
+        )
+        self.status_text.append(f'NMP tracking: {summary}')
+        active_traj = getattr(self, '_nmp_active_tracking_traj', None) or self.nmp_last_trajectory
+        if active_traj:
+            self.last_trajectory = dict(active_traj)
+        if self._display_panels_ready():
+            self._draw_tracking_plot_tabs(result)
+            self._draw_nmp_plot_tab()
+            if hasattr(self, 'plot_tabs'):
+                for i in range(self.plot_tabs.count()):
+                    if self.plot_tabs.tabText(i) == 'NMP / Flatness':
+                        self.plot_tabs.setCurrentIndex(i)
+                        break
+
+    def _on_nmp_tracking_sim_error(self, msg):
+        self.btn_nmp_run_tracking.setEnabled(True)
+        self.lbl_nmp_tracking_status.setText('Tracking simulation failed.')
+        QMessageBox.critical(self, 'NMP tracking error', msg)
+        self.status_text.append(f'NMP tracking error: {msg}')
 
     def _draw_nmp_plot_tab(self):
         if not hasattr(self, 'canvas_nmp'):
             return
-        traj = getattr(self, 'nmp_last_trajectory', None)
+        traj = getattr(self, '_nmp_active_tracking_traj', None) or getattr(self, 'nmp_last_trajectory', None)
         phy = None
         if traj:
             phy = traj.get('flatness_physics') or self._nmp_physics_dict()
-        series = build_nmp_series(traj, phy=phy)
+        series = build_nmp_series(
+            traj,
+            phy=phy,
+            tracking_result=getattr(self, '_nmp_last_tracking_result', None),
+        )
         summary = ''
         if traj and series is not None:
             max_dx = float(np.max(np.abs(series['offset_x_meas']))) * 1000
             max_dy = float(np.max(np.abs(series['offset_y_meas']))) * 1000
+            ctrl = 'ξ' if self._current_nmp_controller_id() == CONTROLLER_FLATNESS else 'COM'
+            ref = (
+                'waypoint'
+                if traj.get('waypoint_mode') or self._current_nmp_tracking_ref_mode() == 'waypoint'
+                else 'planned'
+            )
             summary = (
                 f'Platform: {platform_label(traj.get("platform_id", self._current_nmp_platform_id()))}  |  '
-                f'max |x−ξ_x|={max_dx:.1f} mm  max |y−ξ_y|={max_dy:.1f} mm'
+                f'plan max |x−ξ_x|={max_dx:.1f} mm  max |y−ξ_y|={max_dy:.1f} mm  |  '
+                f'ref: {ref}  ctrl: {ctrl}'
             )
-        draw_nmp_panels(nmp_axes_dict(self), series, summary=summary)
+        draw_nmp_panels(
+            nmp_axes_dict(self),
+            series,
+            summary=summary,
+            mode=self._current_nmp_plot_mode(),
+        )
         self.canvas_nmp.draw_idle()
         self._refresh_all_plot_layouts()
 
@@ -3712,6 +4715,26 @@ class MainWindow(QMainWindow):
         states_widget = QWidget()
         states_layout = QVBoxLayout(states_widget)
         states_layout.setContentsMargins(0, 0, 0, 0)
+        states_series_row = QHBoxLayout()
+        states_series_row.setContentsMargins(4, 2, 4, 0)
+        states_series_row.addWidget(QLabel('Show:'))
+        self.chk_states_show_plan = QCheckBox('plan')
+        self.chk_states_show_sim = QCheckBox('sim')
+        self.chk_states_show_cascade = QCheckBox('cascade')
+        for chk in (
+            self.chk_states_show_plan,
+            self.chk_states_show_sim,
+            self.chk_states_show_cascade,
+        ):
+            chk.setChecked(True)
+            chk.setToolTip(
+                'Toggle which series appear on the States plots '
+                '(plan = reference, sim = plant, cascade = inner-loop setpoints).'
+            )
+            chk.stateChanged.connect(self._on_states_series_visibility_changed)
+            states_series_row.addWidget(chk)
+        states_series_row.addStretch(1)
+        states_layout.addLayout(states_series_row)
         states_layout.addWidget(self.canvas_states)
         install_responsive_canvas(
             self.canvas_states, self.fig_states, base_width_px=1100, base_height_px=900,
@@ -3743,6 +4766,45 @@ class MainWindow(QMainWindow):
         self.tracking_gif_status.setWordWrap(True)
         self.tracking_gif_status.setStyleSheet('color: #555;')
         gif_layout.addWidget(self.tracking_gif_status)
+        gif_view_row = QHBoxLayout()
+        gif_view_row.addWidget(QLabel('View:'))
+        self.tracking_gif_3d_radio = QRadioButton('3D')
+        self.tracking_gif_2d_radio = QRadioButton('2D (XZ)')
+        self.tracking_gif_3d_radio.setChecked(True)
+        self._tracking_gif_view_group = QButtonGroup(self)
+        self._tracking_gif_view_group.addButton(self.tracking_gif_3d_radio, 0)
+        self._tracking_gif_view_group.addButton(self.tracking_gif_2d_radio, 1)
+        self.tracking_gif_3d_radio.toggled.connect(self._on_tracking_gif_view_changed)
+        gif_view_row.addWidget(self.tracking_gif_3d_radio)
+        gif_view_row.addWidget(self.tracking_gif_2d_radio)
+        gif_view_row.addSpacing(16)
+        self.chk_tracking_gif_realtime = QCheckBox('Real-time playback')
+        self.chk_tracking_gif_realtime.setChecked(True)
+        self.chk_tracking_gif_realtime.setToolTip(
+            'Checked: GIF duration matches simulation time.\n'
+            'Unchecked: play faster using the speed multiplier.'
+        )
+        self.chk_tracking_gif_realtime.stateChanged.connect(
+            self._on_tracking_gif_playback_options_changed
+        )
+        gif_view_row.addWidget(self.chk_tracking_gif_realtime)
+        gif_view_row.addWidget(QLabel('Speed:'))
+        self.spin_tracking_gif_speed = QDoubleSpinBox()
+        self.spin_tracking_gif_speed.setRange(1.0, 50.0)
+        self.spin_tracking_gif_speed.setDecimals(1)
+        self.spin_tracking_gif_speed.setSingleStep(1.0)
+        self.spin_tracking_gif_speed.setValue(5.0)
+        self.spin_tracking_gif_speed.setSuffix('×')
+        self.spin_tracking_gif_speed.setToolTip(
+            'Playback speed when Real-time is off (simulation time / this factor).'
+        )
+        self.spin_tracking_gif_speed.setEnabled(False)
+        self.spin_tracking_gif_speed.valueChanged.connect(
+            self._on_tracking_gif_playback_options_changed
+        )
+        gif_view_row.addWidget(self.spin_tracking_gif_speed)
+        gif_view_row.addStretch(1)
+        gif_layout.addLayout(gif_view_row)
         self.tracking_gif_label = QLabel()
         self.tracking_gif_label.setAlignment(Qt.AlignCenter)
         self.tracking_gif_label.setMinimumHeight(320)
@@ -3791,7 +4853,216 @@ class MainWindow(QMainWindow):
         )
         self.plot_tabs.addTab(metrics_widget, 'Metrics')
 
-        # ── Tab 6: NMP / flatness (3×2) ──
+        # ── Tab: Stability margins (Bode / PM with vs without actuator) ──
+        margins_widget = QWidget()
+        margins_layout = QVBoxLayout(margins_widget)
+        margins_layout.setContentsMargins(4, 4, 4, 4)
+
+        margins_ctrl = QHBoxLayout()
+        margins_ctrl.addWidget(QLabel('Axis:'))
+        self.margins_axis_combo = QComboBox()
+        self.margins_axis_combo.addItem('Pitch / X', AXIS_PITCH)
+        self.margins_axis_combo.addItem('Roll / Y', 'roll')
+        self.margins_axis_combo.addItem('Yaw / Z', 'yaw')
+        self.margins_axis_combo.setToolTip(
+            'Plots all four cascade loops for this axis.\n'
+            'Pitch/Roll: horizontal via attitude.\n'
+            'Yaw: rate/att use yaw; Vel/Pos use vertical Z + thrust τ.'
+        )
+        margins_ctrl.addWidget(self.margins_axis_combo)
+        self.btn_margins_sync = QPushButton('Load from Tracking')
+        self.btn_margins_sync.setToolTip(
+            'Copy current Tracking controller gains + actuator τ into the spins below.\n'
+            'Does not redraw Bode — click Update Bode afterwards.'
+        )
+        self.btn_margins_sync.clicked.connect(self._sync_margins_controls_from_tracking)
+        margins_ctrl.addWidget(self.btn_margins_sync)
+        self.btn_update_margins = QPushButton('Update Bode')
+        self.btn_update_margins.setToolTip(
+            'Recompute all four loop Bodes from the spins and push them back to Tracking.'
+        )
+        self.btn_update_margins.clicked.connect(self._refresh_stability_margins_tab)
+        margins_ctrl.addWidget(self.btn_update_margins)
+        margins_ctrl.addStretch(1)
+        margins_layout.addLayout(margins_ctrl)
+
+        show_row = QHBoxLayout()
+        show_row.addWidget(QLabel('Show:'))
+        self._margins_loop_show_cbs = {}
+        for loop, label in (
+            (LOOP_RATE, 'Rate (角速度)'),
+            (LOOP_ATTITUDE, 'Attitude (角度)'),
+            (LOOP_VELOCITY, 'Velocity (速度)'),
+            (LOOP_POSITION, 'Position (位置)'),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.setToolTip(f'Show / hide the {label.split()[0]} Bode column')
+            cb.stateChanged.connect(self._on_margins_loop_visibility_changed)
+            self._margins_loop_show_cbs[loop] = cb
+            show_row.addWidget(cb)
+        show_row.addStretch(1)
+        margins_layout.addLayout(show_row)
+
+        # Editable gains + actuator τ used by the Bode (source of truth on this tab)
+        self._margins_ctrl_guard = False
+        gains_row = QHBoxLayout()
+        self.lbl_margins_rate = QLabel('Rate PID:')
+        gains_row.addWidget(self.lbl_margins_rate)
+        self.spin_margins_kp_rate = QDoubleSpinBox()
+        self.spin_margins_ki_rate = QDoubleSpinBox()
+        self.spin_margins_kd_rate = QDoubleSpinBox()
+        for spin, name, lo, hi, dec, default in (
+            (self.spin_margins_kp_rate, 'Kp', 0.0, 100.0, 2, 15.0),
+            (self.spin_margins_ki_rate, 'Ki', 0.0, 50.0, 2, 0.0),
+            (self.spin_margins_kd_rate, 'Kd', 0.0, 20.0, 3, 0.0),
+        ):
+            spin.setRange(lo, hi)
+            spin.setDecimals(dec)
+            spin.setSingleStep(10 ** (-dec))
+            spin.setValue(default)
+            spin.setPrefix(f'{name} ')
+            spin.setToolTip(f'Rate-loop {name} for the selected axis')
+            spin.valueChanged.connect(self._on_margins_control_changed)
+            gains_row.addWidget(spin)
+        gains_row.addSpacing(12)
+        self.lbl_margins_kp_att = QLabel('Att Kp:')
+        gains_row.addWidget(self.lbl_margins_kp_att)
+        self.spin_margins_kp_att = QDoubleSpinBox()
+        self.spin_margins_kp_att.setRange(0.0, 50.0)
+        self.spin_margins_kp_att.setDecimals(2)
+        self.spin_margins_kp_att.setSingleStep(0.1)
+        self.spin_margins_kp_att.setValue(6.5)
+        self.spin_margins_kp_att.setToolTip(
+            'Attitude P gain [1/deg] (SI effective gain = this value × err_rad).'
+        )
+        self.spin_margins_kp_att.valueChanged.connect(self._on_margins_control_changed)
+        gains_row.addWidget(self.spin_margins_kp_att)
+        gains_row.addStretch(1)
+        margins_layout.addLayout(gains_row)
+
+        outer_row = QHBoxLayout()
+        self.lbl_margins_vel = QLabel('Vel PID:')
+        outer_row.addWidget(self.lbl_margins_vel)
+        self.spin_margins_kp_vel = QDoubleSpinBox()
+        self.spin_margins_ki_vel = QDoubleSpinBox()
+        self.spin_margins_kd_vel = QDoubleSpinBox()
+        for spin, name, lo, hi, dec, default in (
+            (self.spin_margins_kp_vel, 'Kp', 0.0, 50.0, 2, 1.8),
+            (self.spin_margins_ki_vel, 'Ki', 0.0, 20.0, 2, 0.0),
+            (self.spin_margins_kd_vel, 'Kd', 0.0, 10.0, 3, 0.0),
+        ):
+            spin.setRange(lo, hi)
+            spin.setDecimals(dec)
+            spin.setSingleStep(10 ** (-dec))
+            spin.setValue(default)
+            spin.setPrefix(f'{name} ')
+            spin.setToolTip(f'Velocity-loop {name} (XY or Z depending on axis)')
+            spin.valueChanged.connect(self._on_margins_control_changed)
+            outer_row.addWidget(spin)
+        outer_row.addSpacing(12)
+        self.lbl_margins_kp_pos = QLabel('Pos Kp:')
+        outer_row.addWidget(self.lbl_margins_kp_pos)
+        self.spin_margins_kp_pos = QDoubleSpinBox()
+        self.spin_margins_kp_pos.setRange(0.0, 20.0)
+        self.spin_margins_kp_pos.setDecimals(2)
+        self.spin_margins_kp_pos.setSingleStep(0.05)
+        self.spin_margins_kp_pos.setValue(1.0)
+        self.spin_margins_kp_pos.setToolTip('Position P gain (XY or Z depending on axis)')
+        self.spin_margins_kp_pos.valueChanged.connect(self._on_margins_control_changed)
+        outer_row.addWidget(self.spin_margins_kp_pos)
+        outer_row.addStretch(1)
+        margins_layout.addLayout(outer_row)
+
+        act_row = QHBoxLayout()
+        self.chk_margins_actuator = QCheckBox('With actuator lag')
+        self.chk_margins_actuator.setChecked(True)
+        self.chk_margins_actuator.setToolTip(
+            'Dashed Bode uses first-order lag 1/(τs+1). Uncheck to compare only the ideal loop.'
+        )
+        self.chk_margins_actuator.stateChanged.connect(self._on_margins_control_changed)
+        act_row.addWidget(self.chk_margins_actuator)
+        self.lbl_margins_tau = QLabel('τ_gimbal [s]:')
+        act_row.addWidget(self.lbl_margins_tau)
+        self.spin_margins_tau = QDoubleSpinBox()
+        self.spin_margins_tau.setRange(TAU_MIN, TAU_MAX)
+        self.spin_margins_tau.setDecimals(3)
+        self.spin_margins_tau.setSingleStep(0.005)
+        self.spin_margins_tau.setValue(0.05)
+        self.spin_margins_tau.setToolTip('Gimbal τ (pitch/roll) or yaw-torque τ (yaw axis).')
+        self.spin_margins_tau.valueChanged.connect(self._on_margins_tau_changed)
+        act_row.addWidget(self.spin_margins_tau)
+        act_row.addWidget(QLabel('f_c [Hz]:'))
+        self.spin_margins_fc = QDoubleSpinBox()
+        self.spin_margins_fc.setRange(BW_MIN_HZ, BW_MAX_HZ)
+        self.spin_margins_fc.setDecimals(2)
+        self.spin_margins_fc.setSingleStep(0.1)
+        self.spin_margins_fc.setValue(tau_to_bandwidth_hz(0.05))
+        self.spin_margins_fc.setToolTip('−3 dB bandwidth; linked to τ = 1/(2π f_c).')
+        self.spin_margins_fc.valueChanged.connect(self._on_margins_fc_changed)
+        act_row.addWidget(self.spin_margins_fc)
+        self.lbl_margins_tau_thrust = QLabel('τ_thrust [s]:')
+        act_row.addWidget(self.lbl_margins_tau_thrust)
+        self.spin_margins_tau_thrust = QDoubleSpinBox()
+        self.spin_margins_tau_thrust.setRange(TAU_MIN, TAU_MAX)
+        self.spin_margins_tau_thrust.setDecimals(3)
+        self.spin_margins_tau_thrust.setSingleStep(0.005)
+        self.spin_margins_tau_thrust.setValue(0.05)
+        self.spin_margins_tau_thrust.setToolTip(
+            'Thrust τ for vertical Vel/Pos (Yaw/Z axis only).'
+        )
+        self.spin_margins_tau_thrust.valueChanged.connect(self._on_margins_control_changed)
+        act_row.addWidget(self.spin_margins_tau_thrust)
+        self.lbl_margins_act_hint = QLabel(
+            'Solid = no lag · Dashed = with τ  |  four loops shown together'
+        )
+        self.lbl_margins_act_hint.setStyleSheet('color: #555;')
+        act_row.addWidget(self.lbl_margins_act_hint)
+        act_row.addStretch(1)
+        margins_layout.addLayout(act_row)
+
+        self.fig_margins = Figure(figsize=(14, 7))
+        self.canvas_margins = FigureCanvas(self.fig_margins)
+        self.canvas_margins.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_margins.setMinimumSize(280, 220)
+        gs_mg = GridSpec(
+            2, 5, figure=self.fig_margins,
+            width_ratios=[1.0, 1.0, 1.0, 1.0, 0.95],
+            hspace=0.32, wspace=0.22,
+        )
+        self._margins_gridspec = gs_mg
+        self.fig_margins._tvc_gridspec_pads = {
+            'left': 0.05, 'right': 0.99, 'top': 0.90, 'bottom': 0.08,
+            'hspace': 0.32, 'wspace': 0.22,
+        }
+        self.fig_margins.suptitle(
+            'Stability margins — Rate / Att / Vel / Pos (solid=no lag, dashed=with τ)',
+            fontsize=11, fontweight='bold', y=0.98,
+        )
+        self._margins_loop_axes = {}
+        for col, loop in enumerate(LOOP_IDS):
+            ax_mag = self.fig_margins.add_subplot(gs_mg[0, col])
+            ax_phase = self.fig_margins.add_subplot(gs_mg[1, col], sharex=ax_mag)
+            self._margins_loop_axes[loop] = {'ax_mag': ax_mag, 'ax_phase': ax_phase}
+        self.ax_margins_info = self.fig_margins.add_subplot(gs_mg[:, 4])
+        self.ax_margins_info.axis('off')
+        # Keep legacy aliases pointing at Rate (for any old callers)
+        self.ax_margins_mag = self._margins_loop_axes[LOOP_RATE]['ax_mag']
+        self.ax_margins_phase = self._margins_loop_axes[LOOP_RATE]['ax_phase']
+        margins_layout.addWidget(self.canvas_margins)
+        install_responsive_canvas(
+            self.canvas_margins, self.fig_margins, base_width_px=1300, base_height_px=720,
+            layout_mode='gridspec',
+        )
+        self.margins_axis_combo.currentIndexChanged.connect(self._on_margins_loop_axis_changed)
+        self._last_margins_result = None
+        self.plot_tabs.addTab(margins_widget, 'Stability margins')
+        draw_stability_margins_panels(self._margins_axes_dict(), None)
+        # Pull Tracking values once widgets exist (deferred — Tracking panel may
+        # still be initializing when this tab is built).
+        QTimer.singleShot(0, self._sync_margins_controls_from_tracking)
+
+        # ── Tab: NMP / flatness (3×2) ──
         self.fig_nmp = Figure(figsize=(12, 8))
         self.canvas_nmp = FigureCanvas(self.fig_nmp)
         self.canvas_nmp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -3802,8 +5073,8 @@ class MainWindow(QMainWindow):
             'hspace': 0.38, 'wspace': 0.28,
         }
         self.ax_nmp_position = self.fig_nmp.add_subplot(gs_nmp[0, 0])
-        self.ax_nmp_velocity = self.fig_nmp.add_subplot(gs_nmp[0, 1])
-        self.ax_nmp_angle = self.fig_nmp.add_subplot(gs_nmp[1, 0])
+        self.ax_nmp_angle = self.fig_nmp.add_subplot(gs_nmp[0, 1])
+        self.ax_nmp_velocity = self.fig_nmp.add_subplot(gs_nmp[1, 0])
         self.ax_nmp_angvel = self.fig_nmp.add_subplot(gs_nmp[1, 1])
         self.ax_nmp_gimbal = self.fig_nmp.add_subplot(gs_nmp[2, 0])
         self.ax_nmp_thrust = self.fig_nmp.add_subplot(gs_nmp[2, 1])
@@ -3859,6 +5130,7 @@ class MainWindow(QMainWindow):
             (self.fig_states, self.canvas_states),
             (self.fig_3d_tab, self.canvas_3d_tab),
             (self.fig_metrics, self.canvas_metrics),
+            (getattr(self, 'fig_margins', None), getattr(self, 'canvas_margins', None)),
             (self.fig_nmp, self.canvas_nmp),
         )
         for fig, canvas in pairs:
@@ -3886,14 +5158,447 @@ class MainWindow(QMainWindow):
             self.canvas_metrics.draw_idle()
         self._refresh_all_plot_layouts()
 
-    def _draw_tracking_plot_tabs(self, result):
-        """Update States, 3D, and Metrics tabs after numerical tracking."""
+    def _margins_selected_axis(self):
+        axis = AXIS_PITCH
+        if hasattr(self, 'margins_axis_combo'):
+            data = self.margins_axis_combo.currentData()
+            if data:
+                axis = data
+        return axis
+
+    def _margins_selected_loop_axis(self):
+        """Legacy (loop, axis) pair; loop is unused now (all four plotted)."""
+        return LOOP_RATE, self._margins_selected_axis()
+
+    def _margins_axes_dict(self):
+        return {
+            'ax_by_loop': getattr(self, '_margins_loop_axes', {}),
+            'ax_mag': getattr(self, 'ax_margins_mag', None),
+            'ax_phase': getattr(self, 'ax_margins_phase', None),
+            'ax_info': getattr(self, 'ax_margins_info', None),
+            'gridspec': getattr(self, '_margins_gridspec', None),
+            'visible_loops': self._margins_loop_visibility(),
+        }
+
+    def _margins_loop_visibility(self):
+        """Which cascade-loop Bode columns to show."""
+        cbs = getattr(self, '_margins_loop_show_cbs', None) or {}
+        return {
+            loop: (bool(cbs[loop].isChecked()) if loop in cbs else True)
+            for loop in LOOP_IDS
+        }
+
+    def _on_margins_loop_visibility_changed(self, _state=None):
+        """Redraw last Bode result with updated column visibility (no recompute)."""
+        if not hasattr(self, 'canvas_margins'):
+            return
+        result = getattr(self, '_last_margins_result', None)
+        draw_stability_margins_panels(self._margins_axes_dict(), result)
+        self.canvas_margins.draw_idle()
+        self._refresh_all_plot_layouts()
+
+    def _margins_primary_tau_key(self, axis=None):
+        """τ edited by the main spin: gimbal (XY) or yaw-torque (yaw)."""
+        if axis is None:
+            axis = self._margins_selected_axis()
+        return 'tau_yaw_torque' if axis == 'yaw' else 'tau_gimbal'
+
+    def _update_margins_gain_visibility(self):
+        """All cascade gains stay visible; τ_thrust only for Yaw/Z."""
+        if not hasattr(self, 'spin_margins_kp_rate'):
+            return
+        axis = self._margins_selected_axis()
+        for w in (
+            getattr(self, 'lbl_margins_rate', None),
+            self.spin_margins_kp_rate,
+            self.spin_margins_ki_rate,
+            self.spin_margins_kd_rate,
+            self.lbl_margins_kp_att,
+            self.spin_margins_kp_att,
+            getattr(self, 'lbl_margins_vel', None),
+            getattr(self, 'spin_margins_kp_vel', None),
+            getattr(self, 'spin_margins_ki_vel', None),
+            getattr(self, 'spin_margins_kd_vel', None),
+            getattr(self, 'lbl_margins_kp_pos', None),
+            getattr(self, 'spin_margins_kp_pos', None),
+        ):
+            if w is not None:
+                w.setVisible(True)
+
+        yaw = axis == 'yaw'
+        if hasattr(self, 'lbl_margins_tau'):
+            self.lbl_margins_tau.setText('τ_yaw [s]:' if yaw else 'τ_gimbal [s]:')
+        if hasattr(self, 'spin_margins_tau'):
+            self.spin_margins_tau.setToolTip(
+                'Yaw-torque lag for rate/attitude.' if yaw
+                else 'Gimbal lag for pitch/roll cascade (all four loops).'
+            )
+        thrust_vis = yaw
+        if hasattr(self, 'lbl_margins_tau_thrust'):
+            self.lbl_margins_tau_thrust.setVisible(thrust_vis)
+        if hasattr(self, 'spin_margins_tau_thrust'):
+            self.spin_margins_tau_thrust.setVisible(thrust_vis)
+
+        on = self.chk_margins_actuator.isChecked()
+        self.spin_margins_tau.setEnabled(on)
+        self.spin_margins_fc.setEnabled(on)
+        if hasattr(self, 'spin_margins_tau_thrust'):
+            self.spin_margins_tau_thrust.setEnabled(on and thrust_vis)
+
+    def _margins_tracking_params_snapshot(self):
+        """Live Tracking PX4 gains + actuator settings (for Load from Tracking)."""
+        cid = (
+            self._current_tracking_controller_id()
+            if hasattr(self, 'tracking_controller_combo') else CONTROLLER_PX4
+        )
+        if cid in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
+            return self._collect_tracking_params()
+        params = dict(
+            self._tracking_params_map_for(self._current_rocket_platform_id()).get(
+                CONTROLLER_PX4, default_params_for(CONTROLLER_PX4)
+            )
+        )
+        self._store_actuator_config()
+        params.update(self._actuator_params_for_sim())
+        return params
+
+    def _sync_margins_controls_from_tracking(self):
+        """Copy Tracking gains/τ into the Stability-margins spins (no Bode redraw)."""
+        if not hasattr(self, 'spin_margins_kp_rate'):
+            return
+        axis = self._margins_selected_axis()
+        raw = self._margins_tracking_params_snapshot()
+        from controllers.px4_params import normalize_px4_params
+        gains = normalize_px4_params(raw)
+        if axis == 'roll':
+            kp, ki, kd = gains['Kp_rate_roll'], gains['Ki_rate_roll'], gains['Kd_rate_roll']
+            kp_att = gains['Kp_att_roll_deg']
+            kp_v, ki_v, kd_v = gains['Kp_vel_xy'], gains['Ki_vel_xy'], gains['Kd_vel_xy']
+            kp_pos = gains['Kp_pos_xy']
+        elif axis == 'yaw':
+            kp, ki, kd = gains['Kp_rate_yaw'], gains['Ki_rate_yaw'], gains['Kd_rate_yaw']
+            kp_att = gains['Kp_att_yaw_deg']
+            kp_v, ki_v, kd_v = gains['Kp_vel_z'], gains['Ki_vel_z'], gains['Kd_vel_z']
+            kp_pos = gains['Kp_pos_z']
+        else:
+            kp, ki, kd = gains['Kp_rate_pitch'], gains['Ki_rate_pitch'], gains['Kd_rate_pitch']
+            kp_att = gains['Kp_att_pitch_deg']
+            kp_v, ki_v, kd_v = gains['Kp_vel_xy'], gains['Ki_vel_xy'], gains['Kd_vel_xy']
+            kp_pos = gains['Kp_pos_xy']
+        act = actuator_config_from_params(raw)
+        tau_primary = float(act.get(self._margins_primary_tau_key(axis), 0.05))
+        tau_thrust = float(act.get('tau_thrust', 0.05))
+        enabled = bool(act.get('act_dyn_enable', False))
+
+        self._margins_ctrl_guard = True
+        try:
+            self.spin_margins_kp_rate.setValue(float(kp))
+            self.spin_margins_ki_rate.setValue(float(ki))
+            self.spin_margins_kd_rate.setValue(float(kd))
+            self.spin_margins_kp_att.setValue(float(kp_att))
+            if hasattr(self, 'spin_margins_kp_vel'):
+                self.spin_margins_kp_vel.setValue(float(kp_v))
+                self.spin_margins_ki_vel.setValue(float(ki_v))
+                self.spin_margins_kd_vel.setValue(float(kd_v))
+            if hasattr(self, 'spin_margins_kp_pos'):
+                self.spin_margins_kp_pos.setValue(float(kp_pos))
+            self.chk_margins_actuator.setChecked(enabled or tau_primary > 0.0)
+            self.spin_margins_tau.setValue(max(float(tau_primary), TAU_MIN))
+            self.spin_margins_fc.setValue(tau_to_bandwidth_hz(float(self.spin_margins_tau.value())))
+            if hasattr(self, 'spin_margins_tau_thrust'):
+                self.spin_margins_tau_thrust.setValue(max(float(tau_thrust), TAU_MIN))
+        finally:
+            self._margins_ctrl_guard = False
+        self._update_margins_gain_visibility()
+
+    def _on_margins_loop_axis_changed(self, _index=None):
+        # Reload axis-specific gains/τ into spins only; Bode waits for Update.
+        self._sync_margins_controls_from_tracking()
+
+    def _on_margins_control_changed(self, _value=None):
+        if getattr(self, '_margins_ctrl_guard', False):
+            return
+        self._update_margins_gain_visibility()
+
+    def _on_margins_tau_changed(self, _value=None):
+        if getattr(self, '_margins_ctrl_guard', False):
+            return
+        self._margins_ctrl_guard = True
+        try:
+            tau = float(self.spin_margins_tau.value())
+            self.spin_margins_fc.setValue(tau_to_bandwidth_hz(tau))
+        finally:
+            self._margins_ctrl_guard = False
+        self._on_margins_control_changed()
+
+    def _on_margins_fc_changed(self, _value=None):
+        if getattr(self, '_margins_ctrl_guard', False):
+            return
+        self._margins_ctrl_guard = True
+        try:
+            tau = bandwidth_hz_to_tau(float(self.spin_margins_fc.value()))
+            self.spin_margins_tau.setValue(tau)
+        finally:
+            self._margins_ctrl_guard = False
+        self._on_margins_control_changed()
+
+    def _margins_params_from_controls(self):
+        """Build analyze params from the Stability-margins spins (all four loops)."""
+        axis = self._margins_selected_axis()
+        params = dict(self._margins_tracking_params_snapshot())
+        kp = float(self.spin_margins_kp_rate.value())
+        ki = float(self.spin_margins_ki_rate.value())
+        kd = float(self.spin_margins_kd_rate.value())
+        kp_att = float(self.spin_margins_kp_att.value())
+        kp_v = float(self.spin_margins_kp_vel.value()) if hasattr(self, 'spin_margins_kp_vel') else 0.0
+        ki_v = float(self.spin_margins_ki_vel.value()) if hasattr(self, 'spin_margins_ki_vel') else 0.0
+        kd_v = float(self.spin_margins_kd_vel.value()) if hasattr(self, 'spin_margins_kd_vel') else 0.0
+        kp_pos = float(self.spin_margins_kp_pos.value()) if hasattr(self, 'spin_margins_kp_pos') else 0.0
+        tau = float(self.spin_margins_tau.value())
+        use_act = bool(self.chk_margins_actuator.isChecked())
+
+        if axis == 'roll':
+            params.update({
+                'Kp_rate_roll': kp, 'Ki_rate_roll': ki, 'Kd_rate_roll': kd,
+                'Kp_att_roll_deg': kp_att,
+                'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                'Kp_att_rp_deg': kp_att,
+                'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                'Kp_pos_xy': kp_pos,
+            })
+        elif axis == 'yaw':
+            params.update({
+                'Kp_rate_yaw': kp, 'Ki_rate_yaw': ki, 'Kd_rate_yaw': kd,
+                'Kp_att_yaw_deg': kp_att,
+                'Kp_vel_z': kp_v, 'Ki_vel_z': ki_v, 'Kd_vel_z': kd_v,
+                'Kp_pos_z': kp_pos,
+            })
+        else:
+            params.update({
+                'Kp_rate_pitch': kp, 'Ki_rate_pitch': ki, 'Kd_rate_pitch': kd,
+                'Kp_att_pitch_deg': kp_att,
+                'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                'Kp_att_rp_deg': kp_att,
+                'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                'Kp_pos_xy': kp_pos,
+            })
+        params[self._margins_primary_tau_key(axis)] = tau
+        if hasattr(self, 'spin_margins_tau_thrust'):
+            params['tau_thrust'] = float(self.spin_margins_tau_thrust.value())
+        params['act_dyn_enable'] = use_act
+        params['_margins_axis'] = axis
+        return params
+
+    def _apply_margins_controls_to_tracking(self):
+        """Push margins spins back into Tracking controller + actuator widgets."""
+        if not hasattr(self, 'spin_margins_kp_rate'):
+            return
+        axis = self._margins_selected_axis()
+        kp = float(self.spin_margins_kp_rate.value())
+        ki = float(self.spin_margins_ki_rate.value())
+        kd = float(self.spin_margins_kd_rate.value())
+        kp_att = float(self.spin_margins_kp_att.value())
+        kp_v = float(self.spin_margins_kp_vel.value()) if hasattr(self, 'spin_margins_kp_vel') else None
+        ki_v = float(self.spin_margins_ki_vel.value()) if hasattr(self, 'spin_margins_ki_vel') else None
+        kd_v = float(self.spin_margins_kd_vel.value()) if hasattr(self, 'spin_margins_kd_vel') else None
+        kp_pos = float(self.spin_margins_kp_pos.value()) if hasattr(self, 'spin_margins_kp_pos') else None
+        tau = float(self.spin_margins_tau.value())
+        tau_thrust = (
+            float(self.spin_margins_tau_thrust.value())
+            if hasattr(self, 'spin_margins_tau_thrust') else None
+        )
+        use_act = bool(self.chk_margins_actuator.isChecked())
+
+        params_map = self._tracking_params_map_for(self._current_rocket_platform_id())
+        px4 = params_map.setdefault(CONTROLLER_PX4, default_params_for(CONTROLLER_PX4))
+        flat = params_map.setdefault(CONTROLLER_FLATNESS, default_params_for(CONTROLLER_FLATNESS))
+        for store in (px4, flat):
+            if axis == 'roll':
+                store.update({
+                    'Kp_rate_roll': kp, 'Ki_rate_roll': ki, 'Kd_rate_roll': kd,
+                    'Kp_att_roll_deg': kp_att,
+                })
+                if store.get('share_rp_gains', True):
+                    store.update({
+                        'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                        'Kp_att_rp_deg': kp_att,
+                        'Kp_rate_pitch': kp, 'Ki_rate_pitch': ki, 'Kd_rate_pitch': kd,
+                        'Kp_att_pitch_deg': kp_att,
+                    })
+                if kp_v is not None:
+                    store.update({
+                        'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                    })
+                if kp_pos is not None:
+                    store['Kp_pos_xy'] = kp_pos
+            elif axis == 'yaw':
+                store.update({
+                    'Kp_rate_yaw': kp, 'Ki_rate_yaw': ki, 'Kd_rate_yaw': kd,
+                    'Kp_att_yaw_deg': kp_att,
+                })
+                if kp_v is not None:
+                    store.update({
+                        'Kp_vel_z': kp_v, 'Ki_vel_z': ki_v, 'Kd_vel_z': kd_v,
+                    })
+                if kp_pos is not None:
+                    store['Kp_pos_z'] = kp_pos
+            else:
+                store.update({
+                    'Kp_rate_pitch': kp, 'Ki_rate_pitch': ki, 'Kd_rate_pitch': kd,
+                    'Kp_att_pitch_deg': kp_att,
+                })
+                if store.get('share_rp_gains', True):
+                    store.update({
+                        'Kp_rate_rp': kp, 'Ki_rate_rp': ki, 'Kd_rate_rp': kd,
+                        'Kp_att_rp_deg': kp_att,
+                        'Kp_rate_roll': kp, 'Ki_rate_roll': ki, 'Kd_rate_roll': kd,
+                        'Kp_att_roll_deg': kp_att,
+                    })
+                if kp_v is not None:
+                    store.update({
+                        'Kp_vel_xy': kp_v, 'Ki_vel_xy': ki_v, 'Kd_vel_xy': kd_v,
+                    })
+                if kp_pos is not None:
+                    store['Kp_pos_xy'] = kp_pos
+
+        cid = self._current_tracking_controller_id() if hasattr(self, 'tracking_controller_combo') else None
+        if cid in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
+            self._rebuild_tracking_param_widgets()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._rebuild_nmp_tracking_param_widgets()
+
+        if hasattr(self, 'act_dyn_enable_cb'):
+            self._act_dyn_updating = True
+            try:
+                self.act_dyn_enable_cb.setChecked(use_act)
+                keys_vals = [(self._margins_primary_tau_key(axis), tau)]
+                if axis == 'yaw' and tau_thrust is not None:
+                    keys_vals.append(('tau_thrust', tau_thrust))
+                act = self._tracking_config.setdefault(
+                    'actuator', default_actuator_tracking_config()
+                )
+                act['enabled'] = use_act
+                for key, val in keys_vals:
+                    if key in getattr(self, '_act_dyn_tau_spins', {}):
+                        self._act_dyn_tau_spins[key].setValue(val)
+                        if key in self._act_dyn_bw_spins:
+                            self._act_dyn_bw_spins[key].setValue(tau_to_bandwidth_hz(val))
+                    act[key] = val
+                self.act_dyn_lag_detail.setEnabled(use_act)
+                self.act_dyn_lag_detail.setVisible(use_act)
+            finally:
+                self._act_dyn_updating = False
+            self._store_actuator_config()
+
+    def _refresh_stability_margins_tab(self, apply_to_tracking=True):
+        """Recompute all four open-loop Bodes / PM from margins-tab spins."""
+        if not hasattr(self, 'ax_margins_mag'):
+            return
+        axis = self._margins_selected_axis()
+        try:
+            if not hasattr(self, 'spin_margins_kp_rate'):
+                params = self._margins_tracking_params_snapshot()
+            else:
+                params = self._margins_params_from_controls()
+                if apply_to_tracking:
+                    self._apply_margins_controls_to_tracking()
+            phy = self._physics_dict_for_tracking()
+            force_act = bool(params.get('act_dyn_enable', True))
+            result = analyze_all_loops(
+                phy, params, axis=axis, force_actuator=force_act,
+            )
+            self._last_margins_result = result
+        except Exception as e:
+            self._last_margins_result = None
+            draw_stability_margins_panels(self._margins_axes_dict(), None)
+            self.canvas_margins.draw_idle()
+            if hasattr(self, 'status_text'):
+                self.status_text.append(f'Stability margins error: {e}')
+            return
+        draw_stability_margins_panels(self._margins_axes_dict(), result)
+        self.canvas_margins.draw_idle()
+        self._refresh_all_plot_layouts()
+        if hasattr(self, 'status_text'):
+            parts = []
+            for loop in LOOP_IDS:
+                r = (result.get('by_loop') or {}).get(loop) or {}
+                wo = r.get('without') or {}
+                wa = r.get('with_actuator') or {}
+                pm0, pm1 = wo.get('pm_deg', float('nan')), wa.get('pm_deg', float('nan'))
+                if np.isfinite(pm0) and np.isfinite(pm1):
+                    parts.append(f'{loop[0].upper()}:{pm0:.0f}→{pm1:.0f}°')
+            self.status_text.append(
+                f"Margins ({result.get('axis')}): " + '  '.join(parts)
+            )
+
+    def _states_series_visibility(self):
+        """Which plan / sim / cascade series to draw on the States tab."""
+        return {
+            'show_plan': (
+                bool(self.chk_states_show_plan.isChecked())
+                if hasattr(self, 'chk_states_show_plan') else True
+            ),
+            'show_sim': (
+                bool(self.chk_states_show_sim.isChecked())
+                if hasattr(self, 'chk_states_show_sim') else True
+            ),
+            'show_cascade': (
+                bool(self.chk_states_show_cascade.isChecked())
+                if hasattr(self, 'chk_states_show_cascade') else True
+            ),
+        }
+
+    def _on_states_series_visibility_changed(self, _state=None):
+        result = getattr(self, '_last_tracking_result', None)
+        if result is None or not hasattr(self, 'ax_trk_pos'):
+            return
+        result = self._enrich_tracking_result_with_loop_margins(result)
         plan = getattr(self, 'last_trajectory', None)
         draw_tracking_state_panels(
             tracking_state_axes_dict(self),
             result,
             plan,
             quat_to_euler_fn=quat_to_euler,
+            **self._states_series_visibility(),
+        )
+        self.canvas_states.draw_idle()
+        self._refresh_all_plot_layouts()
+
+    def _enrich_tracking_result_with_loop_margins(self, result):
+        """Attach continuous Bode / PM tags used in States panel titles."""
+        if not result or not isinstance(result, dict):
+            return result
+        if result.get('loop_margins'):
+            return result
+        try:
+            params = self._collect_tracking_params()
+            phy = self._physics_dict_for_tracking()
+            force_act = bool(params.get('act_dyn_enable', False))
+            result['loop_margins'] = {
+                'pitch': analyze_all_loops(
+                    phy, params, axis='pitch', force_actuator=force_act,
+                ),
+                'yaw': analyze_all_loops(
+                    phy, params, axis='yaw', force_actuator=force_act,
+                ),
+            }
+        except Exception as e:
+            if hasattr(self, 'status_text'):
+                self.status_text.append(
+                    f'States loop-margin titles skipped: {e}'
+                )
+        return result
+
+    def _draw_tracking_plot_tabs(self, result):
+        """Update States, 3D, and Metrics tabs after numerical tracking."""
+        plan = getattr(self, 'last_trajectory', None)
+        result = self._enrich_tracking_result_with_loop_margins(result)
+        draw_tracking_state_panels(
+            tracking_state_axes_dict(self),
+            result,
+            plan,
+            quat_to_euler_fn=quat_to_euler,
+            **self._states_series_visibility(),
         )
         draw_tracking_3d_panel(self.ax_3d_trk, result, plan)
         draw_tracking_metrics_panels(
@@ -3908,15 +5613,55 @@ class MainWindow(QMainWindow):
         self._refresh_all_plot_layouts()
         self._start_tracking_gif_generation(result)
 
+    def _current_tracking_gif_view_mode(self):
+        if hasattr(self, 'tracking_gif_2d_radio') and self.tracking_gif_2d_radio.isChecked():
+            return '2d'
+        return '3d'
+
+    def _tracking_gif_playback_speed(self):
+        """1.0 = real-time; >1 accelerates when Real-time checkbox is off."""
+        if (
+            hasattr(self, 'chk_tracking_gif_realtime')
+            and self.chk_tracking_gif_realtime.isChecked()
+        ):
+            return 1.0
+        if hasattr(self, 'spin_tracking_gif_speed'):
+            return float(self.spin_tracking_gif_speed.value())
+        return 1.0
+
+    def _on_tracking_gif_view_changed(self, _checked=False):
+        if self._last_tracking_result is not None:
+            self._start_tracking_gif_generation(self._last_tracking_result)
+
+    def _on_tracking_gif_playback_options_changed(self, _value=None):
+        if hasattr(self, 'spin_tracking_gif_speed') and hasattr(
+            self, 'chk_tracking_gif_realtime'
+        ):
+            self.spin_tracking_gif_speed.setEnabled(
+                not self.chk_tracking_gif_realtime.isChecked()
+            )
+        if self._last_tracking_result is not None:
+            self._start_tracking_gif_generation(self._last_tracking_result)
+
     def _start_tracking_gif_generation(self, result=None):
-        """Render 3D attitude GIF in a background thread."""
+        """Render tracking GIF in a background thread."""
         result = result or getattr(self, '_last_tracking_result', None)
         if result is None:
             return
         if self._tracking_gif_thread is not None and self._tracking_gif_thread.isRunning():
+            # Options changed while rendering — rebuild once the current job finishes.
+            self._tracking_gif_regen_pending = True
             return
+        self._tracking_gif_regen_pending = False
         plan = getattr(self, 'last_trajectory', None)
-        self.tracking_gif_status.setText('Generating 3D tracking GIF…')
+        view_mode = self._current_tracking_gif_view_mode()
+        speed = self._tracking_gif_playback_speed()
+        label = '2D' if view_mode == '2d' else '3D'
+        if speed <= 1.0 + 1e-9:
+            timing = 'real-time'
+        else:
+            timing = f'{speed:.1f}× speed'
+        self.tracking_gif_status.setText(f'Generating {label} tracking GIF ({timing})…')
         self.btn_regenerate_tracking_gif.setEnabled(False)
         self.btn_save_tracking_gif.setEnabled(False)
         if self._tracking_gif_movie is not None:
@@ -3924,6 +5669,7 @@ class MainWindow(QMainWindow):
             self._tracking_gif_movie = None
         self._tracking_gif_thread = TrackingGifThread(
             result, plan, DEFAULT_TRACKING_GIF_PATH,
+            view_mode=view_mode, playback_speed=speed,
         )
         self._tracking_gif_thread.finished.connect(self._on_tracking_gif_finished)
         self._tracking_gif_thread.error.connect(self._on_tracking_gif_error)
@@ -3957,8 +5703,15 @@ class MainWindow(QMainWindow):
             self.tracking_gif_label.setMovie(self._tracking_gif_movie)
             self._update_tracking_gif_scaled_size()
             self._tracking_gif_movie.start()
+            speed = self._tracking_gif_playback_speed()
+            if speed <= 1.0 + 1e-9:
+                timing = 'real-time'
+            else:
+                timing = f'{speed:.1f}× speed'
+            view = self._current_tracking_gif_view_mode().upper()
             self.tracking_gif_status.setText(
-                '3D tracking GIF — red: body +Z (nose), orange: thrust direction (length ∝ T)\n'
+                f'{view} tracking GIF ({timing}) — red: body +Z (nose), '
+                f'orange: thrust direction (length ∝ T)\n'
                 f'{self._tracking_gif_path}'
             )
             self.btn_save_tracking_gif.setEnabled(True)
@@ -3975,12 +5728,18 @@ class MainWindow(QMainWindow):
         self._display_tracking_gif(path)
         if hasattr(self, 'status_text'):
             self.status_text.append(f'Tracking GIF saved: {path}')
+        if getattr(self, '_tracking_gif_regen_pending', False):
+            self._tracking_gif_regen_pending = False
+            QTimer.singleShot(0, self._start_tracking_gif_generation)
 
     def _on_tracking_gif_error(self, msg):
         self.btn_regenerate_tracking_gif.setEnabled(True)
         self.tracking_gif_status.setText('GIF generation failed.')
         if hasattr(self, 'status_text'):
             self.status_text.append(f'Tracking GIF error: {msg.splitlines()[0]}')
+        if getattr(self, '_tracking_gif_regen_pending', False):
+            self._tracking_gif_regen_pending = False
+            QTimer.singleShot(0, self._start_tracking_gif_generation)
 
     def regenerate_tracking_gif(self):
         if getattr(self, '_last_tracking_result', None) is None:
@@ -5285,9 +7044,18 @@ class MainWindow(QMainWindow):
         self._platform_phys_cache[previous_id] = self._snapshot_platform_settings()
 
         new_id = self._current_rocket_platform_id()
+        if previous_id != new_id:
+            # Flush Tracking-tab gains into the previous platform slot before switching.
+            self._store_tracking_params_for_controller(
+                self._tracking_config.get('controller')
+                or self._current_tracking_controller_id()
+            )
         cached = self._platform_phys_cache.get(new_id)
         self._apply_platform_settings(new_id, settings=cached)
         self._cached_platform_id = new_id
+        if previous_id != new_id:
+            self._rebuild_tracking_param_widgets()
+            self._refresh_tracking_params_platform_labels()
         if hasattr(self, 'status_text'):
             self.status_text.append(f'Rocket platform: {platform_label(new_id)}')
         if not self._restore_optimization_for_current_context(quiet=True):
@@ -5444,6 +7212,11 @@ class MainWindow(QMainWindow):
         self._refresh_min_time_duration_group_visible(self.method_combo.currentIndex())
         self._cached_platform_id = self._current_rocket_platform_id()
         self._refresh_physics_platform_hint()
+        if hasattr(self, 'tracking_params_groups_layout'):
+            self._rebuild_tracking_param_widgets()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._rebuild_nmp_tracking_param_widgets()
+        self._refresh_tracking_params_platform_labels()
         if self._current_rocket_platform_id() == PLATFORM_REAL:
             plat_def = default_constraints(PLATFORM_REAL)
             if self.T_max.value() <= 100.0 + 1e-6:
@@ -5970,8 +7743,6 @@ class MainWindow(QMainWindow):
         if self.method_combo.currentIndex() == 7 and hasattr(self, 'canvas_nmp'):
             self.nmp_last_trajectory = dict(self.last_trajectory)
             self.nmp_last_trajectory['platform_id'] = self._current_rocket_platform_id()
-            if hasattr(self, 'btn_nmp_send_to_tracking'):
-                self.btn_nmp_send_to_tracking.setEnabled(True)
             if hasattr(self, 'lbl_nmp_plan_status'):
                 self.lbl_nmp_plan_status.setText(
                     'Plan loaded from Trajectory tab (Method 8).'
@@ -6661,6 +8432,58 @@ class MainWindow(QMainWindow):
         cid = self.tracking_controller_combo.itemData(idx)
         return cid if cid else CONTROLLER_PX4
 
+    def _ensure_tracking_params_by_platform(self):
+        """Ensure params_by_platform exists; keep flat params as a back-compat view."""
+        by_plat = self._tracking_config.get('params_by_platform')
+        if not isinstance(by_plat, dict) or not by_plat:
+            by_plat = migrate_params_by_platform(self._tracking_config)
+            self._tracking_config['params_by_platform'] = by_plat
+        for pid in (PLATFORM_PROXY, PLATFORM_REAL):
+            if pid not in by_plat or not isinstance(by_plat[pid], dict):
+                by_plat[pid] = default_controller_params_map()
+            for cid in CONTROLLER_IDS:
+                if cid not in by_plat[pid] or not isinstance(by_plat[pid][cid], dict):
+                    by_plat[pid][cid] = default_params_for(cid)
+        # Active view used by older code paths / JSON consumers.
+        active_pid = (
+            self._current_rocket_platform_id()
+            if hasattr(self, 'rocket_proxy_radio') else PLATFORM_PROXY
+        )
+        self._tracking_config['params'] = by_plat[normalize_platform_id(active_pid)]
+        return by_plat
+
+    def _tracking_params_map_for(self, platform_id):
+        """Controller-params map for the given rocket platform."""
+        by_plat = self._ensure_tracking_params_by_platform()
+        pid = normalize_platform_id(platform_id)
+        return by_plat.setdefault(pid, default_controller_params_map())
+
+    def _refresh_tracking_params_platform_labels(self):
+        """Show which platform the visible controller gains belong to."""
+        if hasattr(self, 'tracking_params_group') and hasattr(self, 'rocket_proxy_radio'):
+            pid = self._current_rocket_platform_id()
+            title = f'Controller parameters ({platform_label(pid)})'
+            set_title = getattr(self.tracking_params_group, '_tvc_set_title', None)
+            if callable(set_title):
+                set_title(title)
+            if hasattr(self, 'lbl_tracking_params_platform'):
+                self.lbl_tracking_params_platform.setText(
+                    f'Editing gains for: {platform_label(pid)}. '
+                    f'Proxy and Real keep separate parameter sets; '
+                    f'switch Rocket platform to edit the other.'
+                )
+        if hasattr(self, 'nmp_params_group') and hasattr(self, 'nmp_proxy_radio'):
+            nmp_pid = self._current_nmp_platform_id()
+            nmp_title = f'Controller parameters ({platform_label(nmp_pid)})'
+            set_nmp = getattr(self.nmp_params_group, '_tvc_set_title', None)
+            if callable(set_nmp):
+                set_nmp(nmp_title)
+            if hasattr(self, 'lbl_nmp_params_platform'):
+                self.lbl_nmp_params_platform.setText(
+                    f'Editing gains for: {platform_label(nmp_pid)}. '
+                    f'Shared with Tracking tab for the same platform.'
+                )
+
     def _on_tracking_controller_changed(self, _index=None):
         self._store_tracking_params_for_controller(self._tracking_config.get('controller'))
         cid = self._current_tracking_controller_id()
@@ -6697,9 +8520,14 @@ class MainWindow(QMainWindow):
     def _store_tracking_params_for_controller(self, controller_id):
         if not controller_id or controller_id not in CONTROLLER_IDS:
             return
-        if controller_id not in self._tracking_config.setdefault('params', {}):
-            self._tracking_config['params'][controller_id] = default_params_for(controller_id)
-        stored = self._tracking_config['params'][controller_id]
+        platform_id = (
+            getattr(self, '_cached_platform_id', None)
+            or self._current_rocket_platform_id()
+        )
+        params_map = self._tracking_params_map_for(platform_id)
+        if controller_id not in params_map:
+            params_map[controller_id] = default_params_for(controller_id)
+        stored = params_map[controller_id]
         for key, widget in self._tracking_param_widgets.items():
             if isinstance(widget, QCheckBox):
                 stored[key] = widget.isChecked()
@@ -6713,7 +8541,11 @@ class MainWindow(QMainWindow):
         self._store_tracking_params_for_controller(cid)
         self._store_actuator_config()
         self._store_numerical_sim_config()
-        params = dict(self._tracking_config['params'].get(cid, default_params_for(cid)))
+        params = dict(
+            self._tracking_params_map_for(self._current_rocket_platform_id()).get(
+                cid, default_params_for(cid)
+            )
+        )
         params.update(self._actuator_params_for_sim())
         params.update(self._numerical_sim_params_for_sim())
         params.update(self._constraints_for_tracking())
@@ -6789,12 +8621,12 @@ class MainWindow(QMainWindow):
         self._tracking_param_widgets = {}
 
         cid = self._current_tracking_controller_id()
-        params = self._tracking_config.setdefault('params', {}).setdefault(
-            cid, default_params_for(cid)
-        )
+        platform_id = self._current_rocket_platform_id()
+        params_map = self._tracking_params_map_for(platform_id)
+        params = params_map.setdefault(cid, default_params_for(cid))
         if cid == CONTROLLER_PX4:
             params.update(migrate_px4_params(params))
-            self._tracking_config['params'][cid] = params
+            params_map[cid] = params
         px4_extra = params if cid == CONTROLLER_PX4 else None
         groups = param_groups_for(cid, px4_params=px4_extra)
         for group in groups:
@@ -6807,6 +8639,7 @@ class MainWindow(QMainWindow):
             )
             self.tracking_params_groups_layout.addWidget(box)
         self.tracking_params_groups_layout.addStretch(1)
+        self._refresh_tracking_params_platform_labels()
         QTimer.singleShot(0, self._refresh_tab_scroll_areas)
 
     def _on_px4_share_rp_changed(self, _state=None):
@@ -6819,6 +8652,20 @@ class MainWindow(QMainWindow):
         self._store_tracking_params_for_controller(self._current_tracking_controller_id())
         self._store_actuator_config()
         self._store_numerical_sim_config()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._store_nmp_tracking_params_for_controller()
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._on_nmp_tracking_timing_changed()
+        by_plat = self._ensure_tracking_params_by_platform()
+        # Deep-copy so later UI edits do not mutate the saved snapshot.
+        params_by_platform = {
+            pid: {cid: dict(params) for cid, params in ctrl_map.items()}
+            for pid, ctrl_map in by_plat.items()
+        }
+        active_params = params_map_for_platform(
+            {'params_by_platform': params_by_platform},
+            self._current_rocket_platform_id(),
+        )
         out = {
             'controller': self._current_tracking_controller_id(),
             'sim_mode': (
@@ -6829,8 +8676,15 @@ class MainWindow(QMainWindow):
             'numerical_sim': dict(
                 self._tracking_config.get('numerical_sim') or default_numerical_sim_config()
             ),
+            'nmp_numerical_sim': dict(
+                self._tracking_config.get('nmp_numerical_sim')
+                or self._tracking_config.get('numerical_sim')
+                or default_numerical_sim_config()
+            ),
             'actuator': dict(self._tracking_config.get('actuator') or default_actuator_tracking_config()),
-            'params': dict(self._tracking_config.get('params', {})),
+            'params_by_platform': params_by_platform,
+            # Back-compat: flat params = currently selected Trajectory platform.
+            'params': {cid: dict(p) for cid, p in active_params.items()},
             'enable_online_planner': self._online_planner_enabled(),
             'online_planner_rate_hz': self._online_planner_rate_hz(),
             'show_gazebo_gui': self._show_gazebo_gui_enabled(),
@@ -6842,18 +8696,19 @@ class MainWindow(QMainWindow):
     def _apply_tracking_config(self, cfg):
         if not cfg:
             return
-        params_map = cfg.get('params') or {}
-        for cid in CONTROLLER_IDS:
-            if cid in params_map:
-                raw = dict(params_map[cid])
-                if cid == CONTROLLER_PX4:
-                    raw = migrate_px4_params(raw)
-                raw = strip_legacy_tracking_options(raw)
-                self._tracking_config.setdefault('params', {})[cid] = raw
+        by_plat = migrate_params_by_platform(cfg)
+        self._tracking_config['params_by_platform'] = by_plat
+        active_pid = (
+            self._current_rocket_platform_id()
+            if hasattr(self, 'rocket_proxy_radio') else PLATFORM_PROXY
+        )
+        self._tracking_config['params'] = by_plat[normalize_platform_id(active_pid)]
         actuator_cfg = cfg.get('actuator') or self._migrate_actuator_from_controller_params(cfg)
         self._tracking_config['actuator'] = dict(actuator_cfg)
         numerical_cfg = cfg.get('numerical_sim') or self._migrate_numerical_sim_from_controller_params(cfg)
         self._tracking_config['numerical_sim'] = dict(numerical_cfg)
+        nmp_numerical_cfg = cfg.get('nmp_numerical_sim') or numerical_cfg
+        self._tracking_config['nmp_numerical_sim'] = dict(nmp_numerical_cfg)
         controller = cfg.get('controller', CONTROLLER_PX4)
         if hasattr(self, 'tracking_controller_combo'):
             for i in range(self.tracking_controller_combo.count()):
@@ -6868,8 +8723,21 @@ class MainWindow(QMainWindow):
                 self.tracking_sim_numerical_radio.setChecked(True)
         self._tracking_config['controller'] = controller
         self._rebuild_tracking_param_widgets()
+        if hasattr(self, 'nmp_params_groups_layout'):
+            self._rebuild_nmp_tracking_param_widgets()
+        self._refresh_tracking_params_platform_labels()
         self._apply_actuator_config(self._tracking_config.get('actuator'))
         self._apply_numerical_sim_config(self._tracking_config.get('numerical_sim'))
+        if hasattr(self, 'nmp_sim_dt_spin'):
+            self._nmp_sim_timing_guard = True
+            self.nmp_sim_dt_spin.setValue(float(nmp_numerical_cfg.get('sim_dt', 0.005)))
+            self.nmp_control_dt_spin.setValue(float(nmp_numerical_cfg.get('control_dt', 0.02)))
+            self.nmp_terminal_hold_spin.setValue(
+                float(nmp_numerical_cfg.get('terminal_hold_duration_s', 3.0))
+            )
+            self.nmp_total_duration_spin.setValue(float(nmp_numerical_cfg.get('total_duration_s', 0.0)))
+            self._nmp_sim_timing_guard = False
+            self._on_nmp_tracking_timing_changed()
         if cfg.get('px4_tune'):
             self._apply_px4_tune_config(cfg['px4_tune'])
         if hasattr(self, 'chk_enable_online_planner'):

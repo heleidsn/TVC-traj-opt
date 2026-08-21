@@ -77,6 +77,10 @@ _ACTUATOR_TRACKING_KEYS = (
     'act_dyn_enable',
     'thrust_quant_enable', 'thrust_resolution_N',
     'tau_gimbal', 'tau_thrust', 'tau_yaw_torque',
+    'mismatch_enable',
+    'scale_gimbal', 'bias_gimbal',
+    'scale_thrust', 'bias_thrust',
+    'scale_yaw_torque', 'bias_yaw_torque',
 )
 
 _LQR_SPECS = []
@@ -135,6 +139,83 @@ def default_params_for(controller_id: str) -> Dict[str, float]:
     return out
 
 
+def default_controller_params_map() -> Dict[str, Dict[str, Any]]:
+    """Default params for every controller (one platform slot)."""
+    return {cid: default_params_for(cid) for cid in CONTROLLER_IDS}
+
+
+_TRACKING_PLATFORM_IDS = ('proxy', 'real')
+
+
+def default_params_by_platform() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Independent controller-gain sets for each rocket platform."""
+    return {pid: default_controller_params_map() for pid in _TRACKING_PLATFORM_IDS}
+
+
+def _normalize_tracking_platform_id(platform_id: str | None) -> str:
+    pid = str(platform_id or 'proxy').strip().lower()
+    if pid in ('real', 'flight'):
+        return 'real'
+    return 'proxy'
+
+
+def _merge_controller_params(controller_id: str, base: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    merged.update(dict(raw or {}))
+    if controller_id in (CONTROLLER_PX4, CONTROLLER_FLATNESS):
+        merged = migrate_px4_params(merged)
+    return strip_legacy_tracking_options(merged)
+
+
+def migrate_params_by_platform(cfg: Dict[str, Any] | None) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Build per-platform controller params from a tracking config dict.
+
+    New format: ``params_by_platform.{proxy|real}.{controller_id}``.
+    Legacy flat ``params`` is treated as the proxy set (historically tuned there);
+    real keeps independent defaults so both platforms no longer share gains.
+    """
+    out = default_params_by_platform()
+    raw_by = (cfg or {}).get('params_by_platform')
+    if isinstance(raw_by, dict) and raw_by:
+        for pid in _TRACKING_PLATFORM_IDS:
+            src = raw_by.get(pid)
+            if pid == 'real' and not isinstance(src, dict):
+                src = raw_by.get('flight')
+            if not isinstance(src, dict):
+                continue
+            for cid in CONTROLLER_IDS:
+                if cid in src and isinstance(src[cid], dict):
+                    out[pid][cid] = _merge_controller_params(cid, out[pid][cid], src[cid])
+        return out
+
+    legacy = (cfg or {}).get('params') or {}
+    if isinstance(legacy, dict):
+        for cid in CONTROLLER_IDS:
+            if cid in legacy and isinstance(legacy[cid], dict):
+                out['proxy'][cid] = _merge_controller_params(
+                    cid, out['proxy'][cid], legacy[cid],
+                )
+    return out
+
+
+def params_map_for_platform(
+    cfg: Dict[str, Any] | None,
+    platform_id: str | None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return the controller-params map for one platform (ensures defaults exist)."""
+    by_plat = (cfg or {}).get('params_by_platform')
+    if not isinstance(by_plat, dict) or not by_plat:
+        by_plat = migrate_params_by_platform(cfg)
+    pid = _normalize_tracking_platform_id(platform_id)
+    if pid not in by_plat or not isinstance(by_plat[pid], dict):
+        by_plat[pid] = default_controller_params_map()
+    for cid in CONTROLLER_IDS:
+        if cid not in by_plat[pid] or not isinstance(by_plat[pid][cid], dict):
+            by_plat[pid][cid] = default_params_for(cid)
+    return by_plat[pid]
+
+
 def default_numerical_sim_config() -> Dict[str, float]:
     """Plant step, controller period, and simulation horizon for numerical tracking."""
     return {
@@ -151,7 +232,6 @@ def strip_legacy_tracking_options(params: Dict[str, Any]) -> Dict[str, Any]:
     for key in _LEGACY_TRACKING_OPTION_KEYS:
         cleaned.pop(key, None)
     return cleaned
-
 
 def migrate_numerical_sim_config(cfg: Dict[str, Any] | None) -> Dict[str, float]:
     """Load numerical_sim block; lift legacy sim_dt from per-controller params."""
@@ -181,15 +261,14 @@ def migrate_numerical_sim_config(cfg: Dict[str, Any] | None) -> Dict[str, float]
 def all_default_tracking_config() -> Dict[str, Any]:
     """Full tracking section for JSON persistence."""
     from .actuator_dynamics import default_actuator_tracking_config
+    by_platform = default_params_by_platform()
     return {
         'controller': CONTROLLER_PX4,
         'sim_mode': SIM_NUMERICAL,
-        'enable_online_planner': True,
-        'online_planner_rate_hz': 10.0,
-        'show_gazebo_gui': False,
         'numerical_sim': default_numerical_sim_config(),
         'actuator': default_actuator_tracking_config(),
-        'params': {
-            cid: default_params_for(cid) for cid in CONTROLLER_IDS
-        },
+        # Independent gain sets per rocket platform (proxy vs real).
+        'params_by_platform': by_platform,
+        # Back-compat active view: same object as params_by_platform['proxy'].
+        'params': by_platform['proxy'],
     }

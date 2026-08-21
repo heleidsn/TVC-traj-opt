@@ -211,6 +211,15 @@ class PX4CascadeTracker:
             g['Kp_att_yaw_deg'],
             (g['Kp_rate_yaw'], g['Ki_rate_yaw'], g['Kd_rate_yaw']),
         )
+        vel_lim = g.get('vel_limit_m_s')
+        if vel_lim is not None and float(vel_lim) > 0.0:
+            vel_sp = np.clip(vel_sp, -float(vel_lim), float(vel_lim))
+        rate_lim = g.get('rate_limit_rad_s')
+        if rate_lim is not None and float(rate_lim) > 0.0:
+            rlim = float(rate_lim)
+            rate_sp_p = float(np.clip(rate_sp_p, -rlim, rlim))
+            rate_sp_q = float(np.clip(rate_sp_q, -rlim, rlim))
+            rate_sp_r = float(np.clip(rate_sp_r, -rlim, rlim))
         signals = {
             'pos': np.asarray(pos_ref, dtype=float).reshape(3),
             'vel': vel_sp,

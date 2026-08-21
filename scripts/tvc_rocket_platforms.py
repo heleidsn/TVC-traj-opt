@@ -64,7 +64,11 @@ def _proxy_physics() -> Dict[str, float]:
         "Izz": 0.01,
         "r_thrust_x": 0.0,
         "r_thrust_y": 0.0,
-        "r_thrust_z": -0.2,
+        # Matches DIST_COM_2_THRUST in tvc_params.yaml (the deployed/tuned LQR
+        # controller) and the gimbal/nozzle chain in models/tvc/tvc.urdf; the
+        # old -0.2 placed the thrust point inside the body, above its bottom
+        # face at -0.5.
+        "r_thrust_z": -0.5693,
     }
 
 
