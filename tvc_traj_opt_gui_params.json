@@ -54,8 +54,8 @@
     "controller": "px4_cascade",
     "sim_mode": "numerical",
     "numerical_sim": {
-      "sim_dt": 0.001,
-      "control_dt": 0.05,
+      "sim_dt": 0.005,
+      "control_dt": 0.01,
       "terminal_hold_duration_s": 3.0,
       "total_duration_s": 0.0
     },
@@ -66,12 +66,19 @@
       "total_duration_s": 0.0
     },
     "actuator": {
-      "enabled": false,
+      "enabled": true,
       "thrust_quant_enabled": false,
       "thrust_resolution_N": 10.0,
-      "tau_gimbal": 0.032,
-      "tau_thrust": 0.05,
-      "tau_yaw_torque": 0.05
+      "tau_gimbal": 0.053,
+      "tau_thrust": 0.159,
+      "tau_yaw_torque": 0.032,
+      "mismatch_enable": false,
+      "scale_gimbal": 1.0,
+      "bias_gimbal": 0.0,
+      "scale_thrust": 1.0,
+      "bias_thrust": 0.0,
+      "scale_yaw_torque": 1.0,
+      "bias_yaw_torque": 0.0
     },
     "params_by_platform": {
       "proxy": {
@@ -205,8 +212,8 @@
           "Kp_vel_z": 10.0,
           "Ki_vel_z": 0.0,
           "Kd_vel_z": 0.0,
-          "Kp_att_rp_deg": 6.5,
-          "Kp_rate_rp": 18.0,
+          "Kp_att_rp_deg": 3.0,
+          "Kp_rate_rp": 10.0,
           "Ki_rate_rp": 0.0,
           "Kd_rate_rp": 0.0,
           "Kp_att_yaw_deg": 4.0,
@@ -301,7 +308,15 @@
           "Kp_att_yaw_deg": 4.0,
           "Kp_rate_yaw": 12.0,
           "Ki_rate_yaw": 0.1,
-          "Kd_rate_yaw": 0.0
+          "Kd_rate_yaw": 0.0,
+          "Kp_att_roll_deg": 6.5,
+          "Kp_att_pitch_deg": 6.5,
+          "Kp_rate_roll": 18.0,
+          "Kp_rate_pitch": 18.0,
+          "Ki_rate_roll": 0.2,
+          "Ki_rate_pitch": 0.2,
+          "Kd_rate_roll": 0.01,
+          "Kd_rate_pitch": 0.01
         }
       }
     },
@@ -317,8 +332,8 @@
         "Kp_vel_z": 10.0,
         "Ki_vel_z": 0.0,
         "Kd_vel_z": 0.0,
-        "Kp_att_rp_deg": 6.5,
-        "Kp_rate_rp": 18.0,
+        "Kp_att_rp_deg": 3.0,
+        "Kp_rate_rp": 10.0,
         "Ki_rate_rp": 0.0,
         "Kd_rate_rp": 0.0,
         "Kp_att_yaw_deg": 4.0,
@@ -413,14 +428,22 @@
         "Kp_att_yaw_deg": 4.0,
         "Kp_rate_yaw": 12.0,
         "Ki_rate_yaw": 0.1,
-        "Kd_rate_yaw": 0.0
+        "Kd_rate_yaw": 0.0,
+        "Kp_att_roll_deg": 6.5,
+        "Kp_att_pitch_deg": 6.5,
+        "Kp_rate_roll": 18.0,
+        "Kp_rate_pitch": 18.0,
+        "Ki_rate_roll": 0.2,
+        "Ki_rate_pitch": 0.2,
+        "Kd_rate_roll": 0.01,
+        "Kd_rate_pitch": 0.01
       }
     },
     "enable_online_planner": true,
     "online_planner_rate_hz": 10.0,
     "show_gazebo_gui": false,
     "px4_tune": {
-      "level": "velocity",
+      "level": "attitude",
       "duration_s": 2.0,
       "setpoints": {
         "rate": {

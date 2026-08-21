@@ -17,9 +17,16 @@
     "enabled": true,
     "thrust_quant_enabled": false,
     "thrust_resolution_N": 10.0,
-    "tau_gimbal": 0.032,
+    "tau_gimbal": 0.053,
     "tau_thrust": 0.159,
-    "tau_yaw_torque": 0.032
+    "tau_yaw_torque": 0.032,
+    "mismatch_enable": false,
+    "scale_gimbal": 1.0,
+    "bias_gimbal": 0.0,
+    "scale_thrust": 1.0,
+    "bias_thrust": 0.0,
+    "scale_yaw_torque": 1.0,
+    "bias_yaw_torque": 0.0
   },
   "params_by_platform": {
     "proxy": {
@@ -153,7 +160,7 @@
         "Kp_vel_z": 10.0,
         "Ki_vel_z": 0.0,
         "Kd_vel_z": 0.0,
-        "Kp_att_rp_deg": 6.5,
+        "Kp_att_rp_deg": 3.0,
         "Kp_rate_rp": 10.0,
         "Ki_rate_rp": 0.0,
         "Kd_rate_rp": 0.0,
@@ -273,7 +280,7 @@
       "Kp_vel_z": 10.0,
       "Ki_vel_z": 0.0,
       "Kd_vel_z": 0.0,
-      "Kp_att_rp_deg": 6.5,
+      "Kp_att_rp_deg": 3.0,
       "Kp_rate_rp": 10.0,
       "Ki_rate_rp": 0.0,
       "Kd_rate_rp": 0.0,
